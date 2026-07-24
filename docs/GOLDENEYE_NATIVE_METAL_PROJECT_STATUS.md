@@ -1,101 +1,75 @@
 # GoldenEye Metal project status
 
-Last updated: July 22, 2026
+Last updated: July 24, 2026
 
-GoldenEye Metal runs the recompiled game code on Apple Silicon and translates the original Xenos
-GPU work directly to Metal. It does not use Vulkan or MoltenVK, and it is not a traditional
-full-system emulator. The compatibility runtime supplies the Xbox 360 services the game expects.
+GoldenEye Metal runs recompiled game code on Apple Silicon and translates the original Xenos GPU
+work directly to Metal. It does not use Vulkan or MoltenVK, and it is not a traditional full-system
+emulator.
 
 No game files are included. Players must provide a compatible backup they are legally allowed to
 use.
 
-## Where the project is now
+## Current state
 
-The game boots through the classification screen, gun-barrel sequence, RARE logo, main menu, Dam
-briefing, and playable Dam mission. Those scenes are produced from the game's real command stream,
-shaders, textures, geometry, render targets, resolves, and swaps.
+The game boots through the intro, main menu and Dam briefing, then plays the Dam mission using the
+real game command stream, shaders, textures and geometry.
 
-Working today:
+Working now:
 
-- Native Apple Silicon and Metal rendering at the game's internal 1280×720 resolution
-- Playable keyboard and mouse input
-- DualShock 4, DualSense, Xbox One, and Xbox Series controller support
+- Native Apple Silicon and Metal rendering
+- Keyboard, mouse and modern PlayStation/Xbox controllers
 - Original/remastered graphics switching
-- A native launcher that imports and verifies a local backup
-- Save backup, restore, reset, and crash recovery
-- Safe Mode and one-click diagnostic export
-- Fullscreen, V-Sync, scaling, filtering, anti-aliasing, colour controls, and performance overlays
-- Proper gameplay pause while host settings is open
-- Modern, Classic, and Southpaw controller layouts with button remapping
-- A guarded Testing page containing all 14 verified runtime cheats
-- Signed and notarized release packaging for macOS 14 or newer
+- Fullscreen, V-Sync, scaling, filtering, anti-aliasing and colour controls
+- Native launcher with game-data import and verification
+- Save management, crash recovery, Safe Mode and diagnostic export
+- Controller presets, remapping, rumble and live input testing
+- Proper pause while host settings are open
+- Testing page with all 14 verified runtime cheats
+- Signed and notarized macOS 14+ packaging
 
-This is still an experimental project, not a finished port. Dam is the main tested gameplay area;
-later levels and every multiplayer path have not yet received the same validation.
+This remains an experimental port. Dam is the main tested area; later missions and multiplayer have
+not had the same level of validation.
 
-## Native Metal path
+## Metal progress
 
-The production rendering path is:
+The production path is fully native ARM64 and Metal. Presentation no longer depends on full-frame
+CPU readback, replacement geometry or synthetic frames.
 
-```text
-game command stream
-  → Xenos shader translation
-  → Metal draws and render targets
-  → guest-visible resolve
-  → normal game swap and presentation
-```
+The current v0.3 work adds native D24S8/D24FS8 depth and stencil resolves, correct endian
+conversion, selected-sample handling for 1×/2×/4× MSAA, and normal depth-texture sampling. It also
+reconstructs GoldenEye's three-part post-processing restore as one native 1280×720 colour/depth
+input. Bogus near-maximum descriptors are still rejected; the restore is enabled only for the exact
+known producer and consumer sequence.
 
-Early diagnostic rendering and command-recovery shortcuts were useful during bring-up, but they
-are disabled for the current results. The visible menu and gameplay do not come from replacement
-shaders, synthetic geometry, forced frames, Vulkan translation, or stale captures.
-
-Major problems already solved include incorrect guest-memory aliasing, discarded processed index
-buffers, incomplete viewport/blend state, excessive synchronous Metal waits, full-frame CPU
-readback during presentation, false GPU-hang detection, unsafe texture descriptors, and two Dam
-cleanup crashes reported by early testers.
-
-## Performance
-
-Performance varies by scene and Mac.
-
-A repeatable Dam run on an M3 Ultra discarded eight warm-up windows and measured the next 48. It
-averaged **59.909 FPS**, with measured windows ranging from **57.357 to 60.148 FPS**. That run used
-the real Metal resolve and swap path with no full-frame CPU presentation uploads or resolve
-fallbacks.
-
-This is evidence that the project can approach 60 FPS, not a claim that the whole game is locked
-to 60. Less powerful Macs, including the base M5 MacBook Air, currently perform worse in some
-views. Reducing synchronization and scene-specific stalls remains a priority.
+Metal completion fences now use bounded event wakeups instead of blind polling, and CPU fence waits
+back off without weakening the real game dependency. A fresh Dam run on an M3 Ultra averaged
+59.6 FPS with a 57.4 FPS window 1% low and no missed fences, restore failures or timeouts.
+Lower-power Macs still need focused testing.
 
 ## Main limitations
 
-- Frame pacing and performance are not consistent across all views or Macs.
-- Depth-only rendering, shared guest depth/stencil behavior, and faithful Xbox 360 MSAA remain
-  incomplete.
-- Some broader scenes may still show missing, flickering, or incorrect graphics.
-- Physical USB and Bluetooth testing is not complete across every supported controller family.
-- Stability beyond Dam and across full campaign progression still needs wider testing.
-- Local split-screen exists, but reliable 2–4 player validation is still ongoing.
+- Performance and frame pacing vary by scene and Mac.
+- The reconstructed post-processing restore is currently matched to the verified Dam command
+  sequence; unknown variants fall back safely instead of being guessed.
+- Visual and stability coverage beyond Dam is still limited.
+- Physical controller testing is incomplete across every supported model.
+- Reliable 2–4 player split-screen validation is still ongoing.
 
 ## Next priorities
 
-1. Profile repeatable slow scenes on both high-end and lower-power Macs.
-2. Reduce the remaining GPU synchronization cost without changing rendered results.
-3. Complete physical keyboard, mouse, Sony, and Xbox controller testing.
-4. Finish shared depth/stencil, depth-only draws, and faithful MSAA behavior.
-5. Validate later missions and local split-screen from start to finish.
+1. Validate the restored post-processing path in more missions and graphics modes.
+2. Validate frame pacing and synchronization improvements on lower-power Macs.
+3. Expand repeatable mission and local-multiplayer validation beyond Dam.
 
 ## Milestones
 
 | Milestone | Status |
 | --- | --- |
-| Native Metal window and presentation | Complete |
-| Real game shaders and command stream | Complete for tested scenes |
-| Recognizable main menu | Complete |
-| Playable Dam mission | Complete, with ongoing fidelity and stability work |
-| Native launcher and local game-data import | Complete |
-| Keyboard, mouse, and modern controllers | Working; physical test coverage ongoing |
+| Native Metal presentation and real game shaders | Complete for tested scenes |
+| Main menu and playable Dam | Complete, with ongoing fidelity work |
+| Native launcher, input, saves and diagnostics | Complete |
+| Native depth/stencil resolve and normal depth sampling | Complete for tested paths |
 | Full-game fidelity and stable 60 FPS | Not complete |
 
-Build instructions, test coverage, profiling commands, and implementation notes live in
-[DEVELOPMENT.md](DEVELOPMENT.md). Player instructions are in [PLAYER_GUIDE.md](PLAYER_GUIDE.md).
+Build and test details are in [DEVELOPMENT.md](DEVELOPMENT.md). Player instructions are in
+[PLAYER_GUIDE.md](PLAYER_GUIDE.md).

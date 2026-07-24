@@ -3,8 +3,8 @@
 GoldenEye 007 gameplay on macOS, recompiled for Apple Silicon and rendered directly with Apple
 Metal.
 
-**[Download v0.2.0 for macOS (.dmg)](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.2.0/GoldenEye-Metal-0.2.0-macos-arm64.dmg)** ·
-[Release notes](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.2.0) ·
+**[Download v0.3.0 for macOS (.dmg)](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.3.0/GoldenEye-Metal-0.3.0-macos-arm64.dmg)** ·
+[Release notes](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.3.0) ·
 [Watch gameplay](https://youtu.be/VkbwbXw2tPw) ·
 [Discord](https://discord.gg/2AKEFgR7)
 
@@ -24,7 +24,7 @@ You need:
 
 To start playing:
 
-1. [Download the DMG](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.2.0/GoldenEye-Metal-0.2.0-macos-arm64.dmg).
+1. [Download the DMG](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.3.0/GoldenEye-Metal-0.3.0-macos-arm64.dmg).
 2. Open it and drag **GoldenEye Metal.app** into Applications.
 3. Launch the app. On first use, select your compatible local game backup and wait for the
    one-time import.
@@ -107,16 +107,16 @@ Metal renders the game internally at its native **1280x720**. Bilinear, Sharp, a
 can scale that image to the window or Retina display, but they do not increase the game's internal
 rendering resolution.
 
-Correct Dam captures have shown **46.5–60 FPS**, but this is not a claim of locked 60 FPS. The main
-work now is consistent performance across broader scenes, lower resolve/fence cost, physical
-controller acceptance testing, and improved depth/stencil and MSAA fidelity.
+A recent repeatable Dam run averaged **59.6 FPS** with a **57.4 FPS window 1% low**, but this is not
+a claim of locked 60 FPS on every Mac or scene. The main work now is broader mission coverage,
+lower-power Mac performance, physical controller acceptance testing, and local multiplayer.
 
 For implementation details, evidence, milestones, known gaps, and the exact next priorities, read
 the [native Metal technical status](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.md).
 
 | Platform | Status |
 | --- | --- |
-| Apple Silicon macOS | Active development; v0.2.0 reaches first-mission gameplay |
+| Apple Silicon macOS | Active development; v0.3.0 reaches first-mission gameplay |
 | Windows and Linux | Backend code exists, but this project's current changes are not verified there |
 
 ## Build and contribute

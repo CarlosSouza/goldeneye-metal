@@ -133,8 +133,11 @@ class GeApp : public rex::ReXApp {
         "[GE-GUARD-823DFB70-purecall-v1] active; protects packed-data dispatches at "
         "823DFBA8 and 823DFBD0");
     REXLOG_INFO(
-        "[GE-GUARD-823CFC00-v1] active; preserves cleanup callback ABI at "
-        "823CFC84");
+        "[GE-GUARD-823CFC00-v2] active; preserves cleanup callback ABI at "
+        "823CFC84 and 823CFCB8");
+    REXLOG_INFO(
+        "[GE-GUARD-823DACE0-v1] active; protects cleanup-list node loads at "
+        "823DAD08");
     if (auto* logger = rex::GetLoggerRaw(rex::log::core())) {
       logger->flush();
     }

@@ -1,22 +1,39 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
 
 #include <rex/graphics/shared_memory.h>
 #include <rex/graphics/trace_writer.h>
 #include <rex/memory.h>
+#include <rex/thread.h>
 
 namespace rex::graphics::metal {
 
+struct MetalSharedMemoryTestPeer;
+
 class MetalSharedMemory final : public SharedMemory {
  public:
+  enum class OrderedGuestMemoryWriteWaitResult {
+    kUnavailable,
+    kPending,
+    kCompleted,
+  };
+
   struct CompletionStagingStats {
     uint64_t allocations = 0;
     uint64_t reuses = 0;
+    uint64_t completion_wait_unavailable = 0;
+    uint64_t completion_wait_pending = 0;
+    uint64_t completion_wait_completed = 0;
+    uint64_t completion_event_wakeups = 0;
+    uint64_t completion_event_timeouts = 0;
+    uint64_t completion_event_failures = 0;
     size_t idle_buffers = 0;
     size_t in_flight_buffers = 0;
     size_t peak_in_flight_buffers = 0;
@@ -117,17 +134,20 @@ class MetalSharedMemory final : public SharedMemory {
       const std::vector<std::pair<uint32_t, uint32_t>>& publication_byte_ranges,
       const std::vector<OrderedGuestMemoryWrite>& completion_writes, const void* completion_data,
       size_t completion_data_length);
-  // Checks the newest queued ordered completion write overlapping the range
-  // and reaps it if Metal has completed it. This is deliberately non-blocking:
-  // WAIT_REG_MEM owns the bounded retry/deadline loop, so a stalled Metal
-  // command buffer must not trap the command-processor thread here.
-  bool WaitForGpuOrderedGuestMemoryWrite(uint32_t start, uint32_t length);
+  // Waits for at most timeout on the newest queued completion write
+  // overlapping the range. WAIT_REG_MEM supplies a short timeout and retains
+  // ownership of its packet deadline, so a stalled Metal command buffer can't
+  // trap the command-processor thread.
+  OrderedGuestMemoryWriteWaitResult WaitForGpuOrderedGuestMemoryWrite(
+      uint32_t start, uint32_t length, std::chrono::milliseconds timeout);
   CompletionStagingStats completion_staging_stats() const;
 
  protected:
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 
  private:
+  friend struct MetalSharedMemoryTestPeer;
+
   struct PendingUpload {
     void* command_buffer = nullptr;  // Owned id<MTLCommandBuffer>.
     void* staging_buffer = nullptr;  // Owned id<MTLBuffer>.
@@ -139,8 +159,7 @@ class MetalSharedMemory final : public SharedMemory {
 
   bool ReapPendingUploads(bool wait_for_all);
   bool CommitGuestCpuWriteAsGpuAfterSynchronization(
-      uint32_t start, uint32_t length,
-      const GuestCpuWriteCallback* guest_write = nullptr);
+      uint32_t start, uint32_t length, const GuestCpuWriteCallback* guest_write = nullptr);
   void InvalidateUploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges);
   void* AcquireCompletionStagingBuffer(size_t length, bool& recyclable);
   void RecycleCompletionStagingBuffer(void* buffer);
@@ -151,6 +170,8 @@ class MetalSharedMemory final : public SharedMemory {
   void* buffer_ = nullptr;               // Owned id<MTLBuffer>, MTLStorageModeShared.
   void* guest_memory_buffer_ = nullptr;  // Owned no-copy id<MTLBuffer>.
   void* command_queue_ = nullptr;        // Owned id<MTLCommandQueue>.
+  std::shared_ptr<rex::thread::Event> ordered_guest_memory_write_completion_event_;
+  bool ordered_guest_memory_write_completion_event_wait_available_ = true;
   HostResourceMutationCallback host_resource_mutation_callback_;
   GpuResourceMutationCallback gpu_resource_mutation_callback_;
   std::deque<PendingUpload> pending_uploads_;
@@ -158,6 +179,12 @@ class MetalSharedMemory final : public SharedMemory {
   std::vector<void*> idle_completion_staging_buffers_;
   uint64_t completion_staging_allocation_count_ = 0;
   uint64_t completion_staging_reuse_count_ = 0;
+  uint64_t completion_wait_unavailable_count_ = 0;
+  uint64_t completion_wait_pending_count_ = 0;
+  uint64_t completion_wait_completed_count_ = 0;
+  uint64_t completion_event_wakeup_count_ = 0;
+  uint64_t completion_event_timeout_count_ = 0;
+  uint64_t completion_event_failure_count_ = 0;
   size_t completion_staging_in_flight_count_ = 0;
   size_t completion_staging_peak_in_flight_count_ = 0;
 };

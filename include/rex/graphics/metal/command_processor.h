@@ -15,6 +15,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/metal/draw_renderer.h>
+#include <rex/graphics/metal/goldeneye_postprocess_alias.h>
 #include <rex/graphics/metal/graphics_system.h>
 #include <rex/graphics/metal/msl_compiler.h>
 #include <rex/graphics/metal/profile.h>
@@ -33,11 +34,9 @@ namespace rex::graphics::metal {
 // where the previous one ended, preventing incomplete or mixed-frame snapshots
 // from becoming sampleable.
 inline bool UpdateExactResolvedSurfaceRowCoverage(std::vector<uint8_t>& row_valid,
-                                                  uint32_t& valid_row_count,
-                                                  uint32_t total_rows, uint32_t first_row,
-                                                  uint32_t row_count) {
-  if (!total_rows || !row_count || first_row > total_rows ||
-      row_count > total_rows - first_row) {
+                                                  uint32_t& valid_row_count, uint32_t total_rows,
+                                                  uint32_t first_row, uint32_t row_count) {
+  if (!total_rows || !row_count || first_row > total_rows || row_count > total_rows - first_row) {
     return false;
   }
   if (!first_row) {
@@ -83,9 +82,11 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool WriteGpuCompletionMemory(uint32_t address, const void* data, size_t length) override;
   bool FlushGpuCompletionMemoryWrites() override;
   void PrepareForWait() override;
-  bool WaitForGpuCompletionMemoryWrite(uint32_t address, uint32_t length) override;
+  GpuCompletionMemoryWriteWaitResult WaitForGpuCompletionMemoryWrite(
+      uint32_t address, uint32_t length, std::chrono::milliseconds timeout) override;
   bool BeginWaitRegMemMemoryChange(uint32_t address, uint32_t length) override;
-  bool WaitForWaitRegMemMemoryChange(std::chrono::milliseconds timeout) override;
+  WaitRegMemMemoryChangeResult WaitForWaitRegMemMemoryChange(
+      std::chrono::milliseconds timeout) override;
   void EndWaitRegMemMemoryChange() override;
   void OnPrimaryBufferEnd() override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
@@ -171,6 +172,8 @@ class MetalCommandProcessor final : public CommandProcessor {
                                                    uint32_t color_format,
                                                    uint32_t min_surface_pitch,
                                                    xenos::MsaaSamples msaa_samples);
+  HostDepthStencilTarget* FindHostDepthStencilTargetForResolve(
+      const draw_util::ResolveEdramInfo& depth_edram_info, uint32_t depth_original_base);
   HostDepthStencilTarget* EnsureHostDepthStencilTarget(uint32_t depth_info, uint32_t surface_info);
   HostRenderTarget* EnsureHostRenderTarget(uint32_t rt_index);
   void* EnsureFullscreenPixelPipeline(MetalShader& pixel_shader, uint32_t sample_count = 1);
@@ -232,24 +235,57 @@ class MetalCommandProcessor final : public CommandProcessor {
                                        uint32_t write_height, xenos::Endian128 dest_endian,
                                        uint64_t expected_invalidation_epoch);
   bool EnsureExactResolvedSurfaceSnapshot(uint32_t width, uint32_t height);
-  void RememberCompatibleExactResolvedSurfaceFetch(
-      const xenos::xe_gpu_texture_fetch_t& fetch);
+  void RememberCompatibleExactResolvedSurfaceFetch(const xenos::xe_gpu_texture_fetch_t& fetch);
   bool HasCompatibleExactResolvedSurfaceFetch(uint32_t base, uint32_t pitch, uint32_t height,
                                               xenos::Endian128 endian) const;
-  bool PrepareExactResolvedSurfaceGpuBand(
-      uint32_t dest_base, uint32_t pitch, uint32_t surface_height, uint32_t snapshot_y,
-      uint32_t write_height, xenos::Endian128 dest_endian, uint64_t resolve_signature,
-      void*& texture_out, uint64_t& invalidation_epoch_out);
+  bool PrepareExactResolvedSurfaceGpuBand(uint32_t dest_base, uint32_t pitch,
+                                          uint32_t surface_height, uint32_t snapshot_y,
+                                          uint32_t write_height, xenos::Endian128 dest_endian,
+                                          uint64_t resolve_signature, void*& texture_out,
+                                          uint64_t& invalidation_epoch_out);
   void UpdateExactResolvedSurfaceGpuCache(uint32_t dest_base, uint32_t pitch,
                                           uint32_t surface_height, uint32_t snapshot_width,
                                           uint32_t snapshot_height, uint32_t snapshot_y,
                                           uint32_t write_height, xenos::Endian128 dest_endian,
                                           uint64_t resolve_signature,
                                           uint64_t expected_invalidation_epoch);
-  bool GetExactResolvedSurfaceTextureForFetch(
-      const xenos::xe_gpu_texture_fetch_t& fetch, void*& texture_out, uint32_t& width_out,
-      uint32_t& height_out, uint32_t& host_swizzle_out, uint8_t& swizzled_signs_out) const;
+  bool GetExactResolvedSurfaceTextureForFetch(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                              void*& texture_out, uint32_t& width_out,
+                                              uint32_t& height_out, uint32_t& host_swizzle_out,
+                                              uint8_t& swizzled_signs_out) const;
   void ReleaseExactResolvedSurfaceSnapshot();
+  bool EnsureResolvedDepthSnapshot(uint32_t width, uint32_t height);
+  bool PrepareResolvedDepthSnapshotGpuBand(
+      uint32_t base, uint32_t pitch, uint32_t tiled_extent, uint32_t snapshot_width,
+      uint32_t snapshot_height, uint32_t snapshot_y, uint32_t write_height,
+      xenos::DepthRenderTargetFormat format, xenos::Endian128 endian,
+      uint64_t resolve_signature, void*& texture_out,
+      uint64_t& invalidation_epoch_out);
+  void UpdateResolvedDepthSnapshotGpuCache(
+      uint32_t base, uint32_t pitch, uint32_t tiled_extent, uint32_t snapshot_width,
+      uint32_t snapshot_height, uint32_t snapshot_y, uint32_t write_height,
+      xenos::DepthRenderTargetFormat format, xenos::Endian128 endian,
+      uint64_t resolve_signature, uint64_t expected_invalidation_epoch);
+  bool GetResolvedDepthSnapshotTextureForFetch(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                               void*& texture_out, uint32_t& width_out,
+                                               uint32_t& height_out, uint32_t& host_swizzle_out,
+                                               uint8_t& swizzled_signs_out) const;
+  void InvalidateResolvedDepthSnapshot(uint32_t base_physical, uint32_t length);
+  void ReleaseResolvedDepthSnapshot();
+  bool EnsureGoldenEyePostprocessTextures(
+      void*& color_texture_out, void*& depth_texture_out,
+      void*& packed_depth_texture_out);
+  GoldenEyePostprocessBand GetGoldenEyePostprocessBand() const;
+  bool PublishGoldenEyePostprocessProducer(
+      const GoldenEyePostprocessProducer& producer);
+  bool GetGoldenEyePostprocessTextureForFetch(
+      uint64_t pixel_shader_hash, const xenos::xe_gpu_texture_fetch_t& fetch,
+      void*& texture_out,
+      uint32_t& width_out, uint32_t& height_out, uint32_t& host_swizzle_out,
+      uint8_t& swizzled_signs_out) const;
+  void InvalidateGoldenEyePostprocessAliases(uint32_t base_physical,
+                                             uint32_t length);
+  void ReleaseGoldenEyePostprocessTextures();
   static void WaitRegMemMemoryChangeWatchCallback(
       const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
@@ -424,6 +460,28 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t depth_info = 0;
     uint32_t surface_info = 0;
   };
+  struct ResolvedDepthSnapshot {
+    void* metal_texture = nullptr;
+    bool valid = false;
+    bool gpu_snapshot = false;
+    uint32_t base = 0;
+    uint32_t pitch = 0;
+    uint32_t tiled_extent = 0;
+    uint32_t texture_width = 0;
+    uint32_t texture_height = 0;
+    xenos::DepthRenderTargetFormat format = xenos::DepthRenderTargetFormat::kD24S8;
+    xenos::Endian128 endian = xenos::Endian128::kNone;
+    uint64_t resolve_signature = 0;
+    std::vector<uint8_t> gpu_snapshot_row_valid;
+    uint32_t gpu_snapshot_valid_row_count = 0;
+  };
+  struct GoldenEyePostprocessTextureSet {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    void* color_texture = nullptr;
+    void* depth_texture = nullptr;
+    void* packed_depth_texture = nullptr;
+  };
   struct PendingReadbackResolveSlice {
     uint32_t copy_dest_base = 0;
     uint32_t pitch = 0;
@@ -447,6 +505,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint32_t, RetainedResolvedFrame> retained_resolve_frames_by_base_;
   mutable std::recursive_mutex exact_resolved_surface_mutex_;
   ExactResolvedSurface exact_resolved_surface_;
+  mutable std::recursive_mutex resolved_depth_snapshot_mutex_;
+  ResolvedDepthSnapshot resolved_depth_snapshot_;
+  std::atomic<uint64_t> resolved_depth_snapshot_invalidation_epoch_{0};
+  mutable std::recursive_mutex goldeneye_postprocess_mutex_;
+  GoldenEyePostprocessTextureSet goldeneye_postprocess_textures_;
+  GoldenEyePostprocessGenerationTracker goldeneye_postprocess_tracker_;
   std::unique_ptr<rex::thread::Event> wait_reg_mem_memory_change_event_;
   SharedMemory::GlobalWatchHandle wait_reg_mem_memory_change_watch_ = nullptr;
   std::atomic<uint32_t> wait_reg_mem_memory_change_first_{UINT32_MAX};
@@ -456,6 +520,15 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::atomic<bool> exact_resolved_surface_expected_gpu_write_active_{false};
   std::atomic<uint32_t> exact_resolved_surface_expected_gpu_write_first_{0};
   std::atomic<uint32_t> exact_resolved_surface_expected_gpu_write_last_{0};
+  std::atomic<bool> resolved_depth_expected_gpu_write_active_{false};
+  std::atomic<uint32_t> resolved_depth_expected_gpu_write_first_{0};
+  std::atomic<uint32_t> resolved_depth_expected_gpu_write_last_{0};
+  std::atomic<bool>
+      goldeneye_postprocess_expected_gpu_write_active_{false};
+  std::atomic<uint32_t>
+      goldeneye_postprocess_expected_gpu_write_first_{0};
+  std::atomic<uint32_t>
+      goldeneye_postprocess_expected_gpu_write_last_{0};
   std::unordered_set<uint64_t> observed_exact_resolved_surface_fetches_;
   std::unordered_map<uint64_t, HostRenderTarget> host_render_targets_;
   std::unordered_map<uint64_t, HostDepthStencilTarget> host_depth_stencil_targets_;
@@ -522,6 +595,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t gpu_tiled_resolve_fallback_count_ = 0;
   uint64_t gpu_tiled_resolve_mirror_count_ = 0;
   uint64_t gpu_tiled_resolve_mirror_byte_count_ = 0;
+  uint64_t gpu_depth_resolve_count_ = 0;
+  uint64_t gpu_depth_resolve_pixel_count_ = 0;
+  uint64_t gpu_depth_resolve_fallback_count_ = 0;
+  uint64_t gpu_depth_snapshot_binding_count_ = 0;
+  uint64_t gpu_goldeneye_postprocess_snapshot_count_ = 0;
+  uint64_t gpu_goldeneye_postprocess_binding_count_ = 0;
   uint64_t gpu_resolved_texture_draw_count_ = 0;
   uint64_t gpu_resolved_texture_binding_count_ = 0;
   uint64_t gpu_publication_event_count_ = 0;
@@ -530,6 +609,9 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t gpu_publication_byte_count_ = 0;
   uint64_t gpu_completion_write_count_ = 0;
   uint64_t gpu_completion_batch_count_ = 0;
+  uint64_t wait_reg_mem_event_signal_count_ = 0;
+  uint64_t wait_reg_mem_event_timeout_count_ = 0;
+  uint64_t wait_reg_mem_event_unavailable_count_ = 0;
   uint32_t host_pixel_draws_this_swap_ = 0;
   uint32_t host_fallback_pixel_draws_this_swap_ = 0;
   uint32_t host_pixel_skipped_vertices_this_swap_ = 0;

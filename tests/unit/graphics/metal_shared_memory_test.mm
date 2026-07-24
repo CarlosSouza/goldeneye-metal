@@ -25,7 +25,27 @@
 #include <rex/memory.h>
 #include <rex/thread.h>
 
+namespace rex::graphics::metal {
+
+struct MetalSharedMemoryTestPeer {
+  static void SetCompletionEvent(MetalSharedMemory& shared_memory,
+                                 std::shared_ptr<rex::thread::Event> completion_event) {
+    shared_memory.ordered_guest_memory_write_completion_event_ = std::move(completion_event);
+    shared_memory.ordered_guest_memory_write_completion_event_wait_available_ = true;
+  }
+};
+
+}  // namespace rex::graphics::metal
+
 namespace {
+
+class UnsupportedWaitEvent final : public rex::thread::Event {
+ public:
+  void* native_handle() const override { return nullptr; }
+  void Set() override {}
+  void Reset() override {}
+  void Pulse() override {}
+};
 
 struct SharedEventSignalGuard {
   id<MTLSharedEvent> event = nil;
@@ -38,8 +58,7 @@ struct SharedEventSignalGuard {
 };
 
 struct CpuInvalidationProbe {
-  std::unique_ptr<rex::thread::Event> event =
-      rex::thread::Event::CreateAutoResetEvent(false);
+  std::unique_ptr<rex::thread::Event> event = rex::thread::Event::CreateAutoResetEvent(false);
   std::atomic<uint32_t> first{UINT32_MAX};
   std::atomic<uint32_t> last{0};
 
@@ -51,16 +70,14 @@ struct CpuInvalidationProbe {
   }
 
   static void Callback(const std::unique_lock<std::recursive_mutex>&, void* context,
-                       uint32_t address_first, uint32_t address_last,
-                       bool invalidated_by_gpu) {
+                       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
     auto* probe = static_cast<CpuInvalidationProbe*>(context);
     if (!probe || invalidated_by_gpu || address_last < address_first) {
       return;
     }
     uint32_t probe_first = probe->first.load(std::memory_order_acquire);
     uint32_t probe_last = probe->last.load(std::memory_order_relaxed);
-    if (probe_first != UINT32_MAX && address_first <= probe_last &&
-        address_last >= probe_first) {
+    if (probe_first != UINT32_MAX && address_first <= probe_last && address_last >= probe_first) {
       probe->event->Set();
     }
   }
@@ -69,8 +86,8 @@ struct CpuInvalidationProbe {
 struct GpuPublicationProbe {
   std::atomic<uint32_t> count{0};
 
-  static void Callback(const std::unique_lock<std::recursive_mutex>&, void* context,
-                       uint32_t, uint32_t, bool invalidated_by_gpu) {
+  static void Callback(const std::unique_lock<std::recursive_mutex>&, void* context, uint32_t,
+                       uint32_t, bool invalidated_by_gpu) {
     auto* probe = static_cast<GpuPublicationProbe*>(context);
     if (probe && invalidated_by_gpu) {
       probe->count.fetch_add(1, std::memory_order_release);
@@ -120,11 +137,11 @@ TEST_CASE("Metal ordered completion staging is recycled only after GPU completio
     SharedEventSignalGuard blocker_signal_guard{blocker_event};
 
     constexpr uint32_t kFirstValue = 0x12345678;
-    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(
-        kFirstTargetAddress, &kFirstValue, sizeof(kFirstValue)));
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kFirstTargetAddress, &kFirstValue,
+                                                            sizeof(kFirstValue)));
     constexpr uint32_t kSecondValue = 0x89ABCDEF;
-    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(
-        kSecondTargetAddress, &kSecondValue, sizeof(kSecondValue)));
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kSecondTargetAddress, &kSecondValue,
+                                                            sizeof(kSecondValue)));
 
     auto blocked_stats = shared_memory.completion_staging_stats();
     CHECK(blocked_stats.allocations == 2);
@@ -135,20 +152,43 @@ TEST_CASE("Metal ordered completion staging is recycled only after GPU completio
     CHECK(read_guest(kFirstTargetAddress) != kFirstValue);
     CHECK(read_guest(kSecondTargetAddress) != kSecondValue);
 
-    CHECK_FALSE(shared_memory.WaitForGpuOrderedGuestMemoryWrite(
-        kSecondTargetAddress + 0x1000, sizeof(uint32_t)));
+    using CompletionWaitResult =
+        rex::graphics::metal::MetalSharedMemory::OrderedGuestMemoryWriteWaitResult;
+    CHECK(shared_memory.WaitForGpuOrderedGuestMemoryWrite(
+              kSecondTargetAddress + 0x1000, sizeof(uint32_t), std::chrono::milliseconds(0)) ==
+          CompletionWaitResult::kUnavailable);
     auto targeted_wait_started = std::chrono::steady_clock::now();
-    bool targeted_wait_succeeded = shared_memory.WaitForGpuOrderedGuestMemoryWrite(
-        kFirstTargetAddress, sizeof(uint32_t));
-    auto targeted_wait_duration =
-        std::chrono::steady_clock::now() - targeted_wait_started;
+    CompletionWaitResult targeted_wait_result = shared_memory.WaitForGpuOrderedGuestMemoryWrite(
+        kFirstTargetAddress, sizeof(uint32_t), std::chrono::milliseconds(1));
+    auto targeted_wait_duration = std::chrono::steady_clock::now() - targeted_wait_started;
     // The command processor owns WAIT_REG_MEM's bounded retry loop. A queued
     // Metal write that is still blocked must be reported as pending promptly,
     // never waited here without a shutdown/deadline check.
-    CHECK_FALSE(targeted_wait_succeeded);
+    CHECK(targeted_wait_result == CompletionWaitResult::kPending);
     CHECK(targeted_wait_duration < std::chrono::milliseconds(250));
-    blocker_event.signaledValue = 1;
+
+    // The completion handler must wake the bounded host wait without requiring
+    // the command processor to poll Metal command-buffer status every 1 ms.
+    std::thread unblocker([blocker_event]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      blocker_event.signaledValue = 1;
+    });
+    targeted_wait_started = std::chrono::steady_clock::now();
+    targeted_wait_result = shared_memory.WaitForGpuOrderedGuestMemoryWrite(
+        kFirstTargetAddress, sizeof(uint32_t), std::chrono::milliseconds(2000));
+    targeted_wait_duration = std::chrono::steady_clock::now() - targeted_wait_started;
+    unblocker.join();
     blocker_signal_guard.event = nil;
+    CHECK(targeted_wait_result == CompletionWaitResult::kCompleted);
+    CHECK(targeted_wait_duration < std::chrono::milliseconds(1000));
+    auto wait_stats = shared_memory.completion_staging_stats();
+    CHECK(wait_stats.completion_wait_unavailable == 1);
+    CHECK(wait_stats.completion_wait_pending == 1);
+    CHECK(wait_stats.completion_wait_completed == 1);
+    // A heavily descheduled test thread may observe completion before entering
+    // the event wait. Both zero and one consumed wake are correct in that race.
+    CHECK(wait_stats.completion_event_wakeups <= 1);
+    CHECK(wait_stats.completion_event_timeouts == 1);
     REQUIRE(shared_memory.WaitForPendingUploads());
     [blocker_event release];
     CHECK(read_guest(kFirstTargetAddress) == kFirstValue);
@@ -163,8 +203,8 @@ TEST_CASE("Metal ordered completion staging is recycled only after GPU completio
     CHECK(completed_stats.in_flight_buffers == 0);
 
     constexpr uint32_t kReusedValue = 0x10203040;
-    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(
-        kFirstTargetAddress, &kReusedValue, sizeof(kReusedValue)));
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kFirstTargetAddress, &kReusedValue,
+                                                            sizeof(kReusedValue)));
     REQUIRE(shared_memory.WaitForPendingUploads());
     CHECK(read_guest(kFirstTargetAddress) == kReusedValue);
     CHECK(read_resident(kFirstTargetAddress) == kReusedValue);
@@ -189,20 +229,77 @@ TEST_CASE("Metal ordered completion staging is recycled only after GPU completio
     // staging buffers have independent lifetimes.
     constexpr uint32_t kThirdValue = 0x0BADF00D;
     constexpr uint32_t kFinalValue = 0xC001D00D;
-    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(
-        kFirstTargetAddress, &kThirdValue, sizeof(kThirdValue)));
-    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(
-        kFirstTargetAddress, &kFinalValue, sizeof(kFinalValue)));
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kFirstTargetAddress, &kThirdValue,
+                                                            sizeof(kThirdValue)));
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kFirstTargetAddress, &kFinalValue,
+                                                            sizeof(kFinalValue)));
     REQUIRE(shared_memory.WaitForPendingUploads());
     CHECK(read_guest(kFirstTargetAddress) == kFinalValue);
     CHECK(read_resident(kFirstTargetAddress) == kFinalValue);
 
     // Shutdown is also a completion fence for an outstanding pooled slot.
     constexpr uint32_t kShutdownValue = 0x13579BDF;
-    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(
-        kFirstTargetAddress, &kShutdownValue, sizeof(kShutdownValue)));
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kFirstTargetAddress, &kShutdownValue,
+                                                            sizeof(kShutdownValue)));
     shared_memory.Shutdown();
     CHECK(read_guest(kFirstTargetAddress) == kShutdownValue);
+  }
+}
+
+TEST_CASE("Metal completion wait permanently falls back after a host event failure",
+          "[graphics][metal][completion][integration]") {
+  @autoreleasepool {
+    rex::memory::Memory memory;
+    REQUIRE(memory.Initialize());
+    rex::graphics::TraceWriter trace_writer(memory.physical_membase());
+    rex::graphics::metal::MetalSharedMemory shared_memory(memory, trace_writer);
+    rex::graphics::metal::MetalSharedMemoryTestPeer::SetCompletionEvent(
+        shared_memory, std::make_shared<UnsupportedWaitEvent>());
+
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    REQUIRE(device != nil);
+    REQUIRE(shared_memory.Initialize((void*)device));
+
+    id<MTLSharedEvent> blocker_event = [device newSharedEvent];
+    REQUIRE(blocker_event != nil);
+    id<MTLCommandQueue> command_queue = (id<MTLCommandQueue>)shared_memory.command_queue();
+    id<MTLCommandBuffer> blocker = [command_queue commandBuffer];
+    REQUIRE(blocker != nil);
+    [blocker encodeWaitForEvent:blocker_event value:1];
+    [blocker commit];
+    SharedEventSignalGuard blocker_signal_guard{blocker_event};
+
+    constexpr uint32_t kTargetAddress = 0x00160000;
+    constexpr uint32_t kTargetValue = 0xA5A55A5A;
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kTargetAddress, &kTargetValue,
+                                                            sizeof(kTargetValue)));
+
+    using CompletionWaitResult =
+        rex::graphics::metal::MetalSharedMemory::OrderedGuestMemoryWriteWaitResult;
+    CHECK(shared_memory.WaitForGpuOrderedGuestMemoryWrite(kTargetAddress, sizeof(kTargetValue),
+                                                          std::chrono::milliseconds(250)) ==
+          CompletionWaitResult::kUnavailable);
+    auto failed_stats = shared_memory.completion_staging_stats();
+    CHECK(failed_stats.completion_event_failures == 1);
+    CHECK(failed_stats.completion_wait_unavailable == 1);
+    CHECK(failed_stats.completion_event_wakeups == 0);
+    CHECK(failed_stats.completion_event_timeouts == 0);
+
+    // The failed event is latched off. A second packet-side query must take the
+    // unavailable fallback without retrying the broken host wait.
+    CHECK(shared_memory.WaitForGpuOrderedGuestMemoryWrite(kTargetAddress, sizeof(kTargetValue),
+                                                          std::chrono::milliseconds(250)) ==
+          CompletionWaitResult::kUnavailable);
+    auto fallback_stats = shared_memory.completion_staging_stats();
+    CHECK(fallback_stats.completion_event_failures == 1);
+    CHECK(fallback_stats.completion_wait_unavailable == 2);
+    CHECK(fallback_stats.completion_event_wakeups == 0);
+    CHECK(fallback_stats.completion_event_timeouts == 0);
+
+    blocker_event.signaledValue = 1;
+    blocker_signal_guard.event = nil;
+    REQUIRE(shared_memory.WaitForPendingUploads());
+    [blocker_event release];
   }
 }
 
@@ -229,8 +326,7 @@ TEST_CASE("Metal guest CPU writes wait for older GPU alias writes",
     auto read_resident = [&]() {
       id<MTLBuffer> resident = (id<MTLBuffer>)shared_memory.buffer();
       uint32_t value = 0;
-      std::memcpy(&value,
-                  reinterpret_cast<const uint8_t*>([resident contents]) + kTargetAddress,
+      std::memcpy(&value, reinterpret_cast<const uint8_t*>([resident contents]) + kTargetAddress,
                   sizeof(value));
       return value;
     };
@@ -246,8 +342,8 @@ TEST_CASE("Metal guest CPU writes wait for older GPU alias writes",
     [blocker encodeWaitForEvent:blocker_event value:1];
     [blocker commit];
     SharedEventSignalGuard blocker_signal_guard{blocker_event};
-    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(
-        kTargetAddress, &kOlderGpuValue, sizeof(kOlderGpuValue)));
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kTargetAddress, &kOlderGpuValue,
+                                                            sizeof(kOlderGpuValue)));
 
     std::atomic<uint32_t> synchronization_call_count = 0;
     std::atomic<bool> synchronization_entered = false;

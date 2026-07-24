@@ -143,6 +143,24 @@ struct ProbeTiledResolveTarget {
   void* presentation_snapshot_texture = nullptr;
   uint32_t presentation_snapshot_x = 0;
   uint32_t presentation_snapshot_y = 0;
+  // Optional caller-owned one-layer R32Float 2D-array texture receiving the
+  // selected-sample depth from the resolved source rectangle.
+  // depth_snapshot_x/y select the destination origin, allowing callers to
+  // assemble a full snapshot from ordered resolve bands without refreshing
+  // rows that were already captured. Values are quantized to guest depth24 and
+  // decoded exactly as texture sampling would observe them.
+  void* depth_snapshot_texture = nullptr;
+  uint32_t depth_snapshot_x = 0;
+  uint32_t depth_snapshot_y = 0;
+  // Optional caller-owned one-layer RGBA8Unorm 2D-array texture receiving the
+  // selected-sample packed depth/stencil bytes. This is for the rare case
+  // where the same resolved D24S8 surface is also sampled through an RGBA8
+  // fetch. The snapshot contains the bytes after both resolve and texture-fetch
+  // endian conversion, matching the normal texture-cache upload.
+  void* packed_depth_snapshot_texture = nullptr;
+  uint32_t packed_depth_snapshot_x = 0;
+  uint32_t packed_depth_snapshot_y = 0;
+  uint32_t packed_depth_snapshot_fetch_endian = 0;
   // xenos::CopySampleSelect (0 through 6). UINT32_MAX requests the full
   // multisample average used by normal reads and presentation.
   uint32_t color_sample_select = UINT32_MAX;
@@ -224,6 +242,11 @@ bool SetPipelineProbeContextSampleCount(void* context, uint32_t sample_count,
                                         std::string* error_out);
 void* CreatePipelineProbeSnapshotTexture(void* metal_device, uint32_t width, uint32_t height,
                                          std::string* error_out);
+void* CreatePipelineProbeDepthSnapshotTexture(void* metal_device, uint32_t width, uint32_t height,
+                                              std::string* error_out);
+void* CreatePipelineProbePackedDepthSnapshotTexture(void* metal_device, uint32_t width,
+                                                    uint32_t height,
+                                                    std::string* error_out);
 void ReleasePipelineProbeSnapshotTexture(void* snapshot_texture);
 // Enqueues and commits a full rectangular texture copy on the supplied queue.
 // The source must be complete before a different queue is used.
@@ -308,10 +331,11 @@ bool ReadPipelineProbeContextRect(void* context, uint32_t width, uint32_t height
                                   std::vector<uint8_t>& bgra_out, std::string* error_out);
 // Reads the selected Xenos MSAA sample or sample pair. Full-sample selectors
 // use the normal hardware resolve.
-bool ReadPipelineProbeContextRectSampleSelected(
-    void* context, uint32_t width, uint32_t height, uint32_t x, uint32_t y, uint32_t read_width,
-    uint32_t read_height, uint32_t color_sample_select, std::vector<uint8_t>& bgra_out,
-    std::string* error_out);
+bool ReadPipelineProbeContextRectSampleSelected(void* context, uint32_t width, uint32_t height,
+                                                uint32_t x, uint32_t y, uint32_t read_width,
+                                                uint32_t read_height, uint32_t color_sample_select,
+                                                std::vector<uint8_t>& bgra_out,
+                                                std::string* error_out);
 // Resolves a BGRA8 rectangle from the persistent render texture into an
 // externally owned MTLBuffer using the exact Xenos 32bpp tiled layout. Pending
 // render work, texture-to-staging blit, compute conversion, and optional guest
@@ -327,6 +351,17 @@ bool ResolvePipelineProbeContextToXenosTiled(void* context, uint32_t width, uint
                                              const ProbeTiledResolveTarget& destination,
                                              std::vector<uint8_t>* bgra_out,
                                              std::string* error_out);
+// Packs the selected persistent depth/stencil sample into Xenos D24S8 or
+// D24FS8 tiled memory. Unlike color resolve, a zero destination pitch is valid:
+// some titles intentionally use the resulting degenerate Xenos tile layout.
+// A supplied depth snapshot is updated in the same command buffer. Set
+// wait_for_completion only when the caller needs immediate CPU-visible bytes;
+// normal runtime copies remain ordered asynchronous submissions.
+bool ResolvePipelineProbeDepthStencilContextToXenosTiled(
+    void* context, uint32_t width, uint32_t height, uint32_t source_x, uint32_t source_y,
+    uint32_t resolve_width, uint32_t resolve_height, bool depth_float24, bool depth_float24_round,
+    uint32_t depth_sample_select, const ProbeTiledResolveTarget& destination,
+    bool wait_for_completion, std::string* error_out);
 bool RenderPipelineProbe(
     void* metal_device, void* pipeline_state, const void* system_constants,
     size_t system_constants_size, const void* float_constants, size_t float_constants_size,

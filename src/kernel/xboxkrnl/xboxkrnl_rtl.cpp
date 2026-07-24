@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
@@ -30,6 +31,7 @@
 #include <rex/system/user_module.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
+#include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
@@ -354,6 +356,75 @@ struct X_RTL_CRITICAL_SECTION {
 };
 #pragma pack(pop)
 static_assert_size(X_RTL_CRITICAL_SECTION, 28);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, lock_count) == 0x10);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, recursion_count) == 0x14);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, owning_thread) == 0x18);
+
+bool QueryRtlCriticalSectionDebugInfo(uint32_t guest_address,
+                                      RtlCriticalSectionDebugInfo* out_info) {
+  constexpr size_t kSnapshotAlignment = std::max(std::atomic_ref<int32_t>::required_alignment,
+                                                 std::atomic_ref<uint32_t>::required_alignment);
+  if (!out_info || guest_address % kSnapshotAlignment != 0 ||
+      guest_address > UINT32_MAX - (static_cast<uint32_t>(sizeof(X_RTL_CRITICAL_SECTION)) - 1)) {
+    return false;
+  }
+
+  auto* state = rex::system::kernel_state();
+  auto* memory = state ? state->memory() : nullptr;
+  if (!memory) {
+    return false;
+  }
+
+  const uint32_t guest_end =
+      guest_address + static_cast<uint32_t>(sizeof(X_RTL_CRITICAL_SECTION)) - 1;
+  auto* heap = memory->LookupHeap(guest_address);
+  if (!heap || heap != memory->LookupHeap(guest_end) ||
+      heap->QueryRangeAccess(guest_address, guest_end) == rex::memory::PageAccess::kNoAccess) {
+    return false;
+  }
+
+  auto* cs = memory->TranslateVirtual<X_RTL_CRITICAL_SECTION*>(guest_address);
+  const auto load_guest_be = []<typename T>(rex::be<T>& field) {
+    const T raw = std::atomic_ref<T>(field.value).load(std::memory_order_relaxed);
+    if constexpr (std::endian::native == std::endian::big) {
+      return raw;
+    } else {
+      return rex::byte_swap(raw);
+    }
+  };
+  const auto read_snapshot = [&]() {
+    RtlCriticalSectionDebugInfo result;
+    result.signal_state = load_guest_be(cs->header.signal_state);
+    result.lock_count = std::atomic_ref<int32_t>(cs->lock_count).load(std::memory_order_relaxed);
+    result.recursion_count = load_guest_be(cs->recursion_count);
+    result.owning_thread = load_guest_be(cs->owning_thread);
+    return result;
+  };
+
+  RtlCriticalSectionDebugInfo snapshot;
+  for (uint32_t attempt = 0; attempt < 3; ++attempt) {
+    const RtlCriticalSectionDebugInfo first = read_snapshot();
+    snapshot = read_snapshot();
+    if (first.signal_state != snapshot.signal_state || first.lock_count != snapshot.lock_count ||
+        first.recursion_count != snapshot.recursion_count ||
+        first.owning_thread != snapshot.owning_thread) {
+      continue;
+    }
+
+    snapshot.estimated_waiters =
+        RtlCriticalSectionEstimatedWaiters(snapshot.lock_count, snapshot.recursion_count);
+    snapshot.coherent = RtlCriticalSectionStateIsCoherent(
+        snapshot.lock_count, snapshot.recursion_count, snapshot.owning_thread);
+    *out_info = snapshot;
+    return true;
+  }
+
+  snapshot.estimated_waiters =
+      RtlCriticalSectionEstimatedWaiters(snapshot.lock_count, snapshot.recursion_count);
+  snapshot.coherent = false;
+  *out_info = snapshot;
+  return true;
+}
 
 void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr) {
   cs->header.type = 1;      // EventSynchronizationObject (auto reset)
@@ -447,7 +518,8 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
           "owner={:08X} lock_count={} recursion={} signal={}",
           cs.guest_address(), cur_thread, current_xthread->creation_params()->start_address,
           static_cast<uint32_t>(cs->owning_thread), static_cast<int32_t>(cs->lock_count),
-          static_cast<int32_t>(cs->recursion_count), static_cast<uint32_t>(cs->header.signal_state));
+          static_cast<int32_t>(cs->recursion_count),
+          static_cast<uint32_t>(cs->header.signal_state));
     }
     X_STATUS wait_status =
         xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);

@@ -67,7 +67,10 @@ bool NormalizeByteRanges(const std::vector<std::pair<uint32_t, uint32_t>>& input
 }  // namespace
 
 MetalSharedMemory::MetalSharedMemory(memory::Memory& memory, TraceWriter& trace_writer)
-    : SharedMemory(memory), trace_writer_(trace_writer) {}
+    : SharedMemory(memory),
+      trace_writer_(trace_writer),
+      ordered_guest_memory_write_completion_event_(
+          rex::thread::Event::CreateAutoResetEvent(false).release()) {}
 
 MetalSharedMemory::~MetalSharedMemory() {
   Shutdown(true);
@@ -92,9 +95,11 @@ bool MetalSharedMemory::SynchronizeBeforeHostResourceMutation() {
 }
 
 bool MetalSharedMemory::Initialize(void* metal_device) {
-  if (!metal_device) {
+  if (!metal_device || !ordered_guest_memory_write_completion_event_) {
     return false;
   }
+  ordered_guest_memory_write_completion_event_wait_available_ = true;
+  ordered_guest_memory_write_completion_event_->Reset();
   metal_device_ = metal_device;
   InitializeCommon();
 
@@ -144,6 +149,9 @@ void MetalSharedMemory::Shutdown(bool from_destructor) {
   // reaches here. Waiting for the last upload also completes all earlier work
   // on the common queue, allowing the staging buffers and destination to go.
   WaitForPendingUploads();
+  if (ordered_guest_memory_write_completion_event_) {
+    ordered_guest_memory_write_completion_event_->Reset();
+  }
   ReleaseIdleCompletionStagingBuffers();
   host_resource_mutation_callback_ = {};
   gpu_resource_mutation_callback_ = {};
@@ -202,8 +210,8 @@ void* MetalSharedMemory::AcquireCompletionStagingBuffer(size_t length, bool& rec
                                              options:MTLResourceStorageModeShared];
   if (buffer) {
     ++completion_staging_allocation_count_;
-    buffer.label = recyclable ? @"ReX Metal pooled completion staging"
-                              : @"ReX Metal completion staging";
+    buffer.label =
+        recyclable ? @"ReX Metal pooled completion staging" : @"ReX Metal completion staging";
   }
   return (void*)buffer;
 }
@@ -296,9 +304,25 @@ bool MetalSharedMemory::WaitForPendingUploads() {
   return ReapPendingUploads(true);
 }
 
-bool MetalSharedMemory::WaitForGpuOrderedGuestMemoryWrite(uint32_t start, uint32_t length) {
+MetalSharedMemory::OrderedGuestMemoryWriteWaitResult
+MetalSharedMemory::WaitForGpuOrderedGuestMemoryWrite(uint32_t start, uint32_t length,
+                                                     std::chrono::milliseconds timeout) {
+  auto record_result = [this](OrderedGuestMemoryWriteWaitResult result) {
+    switch (result) {
+      case OrderedGuestMemoryWriteWaitResult::kUnavailable:
+        ++completion_wait_unavailable_count_;
+        break;
+      case OrderedGuestMemoryWriteWaitResult::kPending:
+        ++completion_wait_pending_count_;
+        break;
+      case OrderedGuestMemoryWriteWaitResult::kCompleted:
+        ++completion_wait_completed_count_;
+        break;
+    }
+    return result;
+  };
   if (!length || start >= kBufferSize || length > kBufferSize - start) {
-    return false;
+    return record_result(OrderedGuestMemoryWriteWaitResult::kUnavailable);
   }
 
   @autoreleasepool {
@@ -313,13 +337,54 @@ bool MetalSharedMemory::WaitForGpuOrderedGuestMemoryWrite(uint32_t start, uint32
       }
     }
     if (!target) {
-      return false;
+      return record_result(OrderedGuestMemoryWriteWaitResult::kUnavailable);
     }
 
-    MTLCommandBufferStatus status = [target status];
-    bool target_succeeded = status == MTLCommandBufferStatusCompleted;
-    bool reaped = ReapPendingUploads(false);
-    return target_succeeded && reaped;
+    auto classify_target = [&]() {
+      MTLCommandBufferStatus status = [target status];
+      if (status == MTLCommandBufferStatusCompleted) {
+        return ReapPendingUploads(false) ? OrderedGuestMemoryWriteWaitResult::kCompleted
+                                         : OrderedGuestMemoryWriteWaitResult::kUnavailable;
+      }
+      if (status == MTLCommandBufferStatusError) {
+        ReapPendingUploads(false);
+        return OrderedGuestMemoryWriteWaitResult::kUnavailable;
+      }
+      return OrderedGuestMemoryWriteWaitResult::kPending;
+    };
+
+    OrderedGuestMemoryWriteWaitResult result = classify_target();
+    if (result != OrderedGuestMemoryWriteWaitResult::kPending) {
+      return record_result(result);
+    }
+    if (!ordered_guest_memory_write_completion_event_ ||
+        !ordered_guest_memory_write_completion_event_wait_available_) {
+      return record_result(OrderedGuestMemoryWriteWaitResult::kUnavailable);
+    }
+    if (timeout <= std::chrono::milliseconds(0)) {
+      return record_result(result);
+    }
+
+    // Completion handlers signal this auto-reset event. Signals are retained
+    // if the command finishes between the status check and the host wait.
+    rex::thread::WaitResult wait_result =
+        rex::thread::Wait(ordered_guest_memory_write_completion_event_.get(), false, timeout);
+    if (wait_result == rex::thread::WaitResult::kSuccess) {
+      ++completion_event_wakeup_count_;
+    } else if (wait_result == rex::thread::WaitResult::kTimeout) {
+      ++completion_event_timeout_count_;
+    } else {
+      // A failed host event must not be retried once per WAIT_REG_MEM poll. Mark
+      // this optimization unavailable for the rest of the session so the
+      // command processor immediately switches to its normal bounded fallback.
+      ordered_guest_memory_write_completion_event_wait_available_ = false;
+      ++completion_event_failure_count_;
+      std::fprintf(stderr, "[metal] completion event wait failed; disabling direct "
+                           "completion waits for this session\n");
+      std::fflush(stderr);
+      return record_result(OrderedGuestMemoryWriteWaitResult::kUnavailable);
+    }
+    return record_result(classify_target());
   }
 }
 
@@ -327,6 +392,12 @@ MetalSharedMemory::CompletionStagingStats MetalSharedMemory::completion_staging_
   CompletionStagingStats stats;
   stats.allocations = completion_staging_allocation_count_;
   stats.reuses = completion_staging_reuse_count_;
+  stats.completion_wait_unavailable = completion_wait_unavailable_count_;
+  stats.completion_wait_pending = completion_wait_pending_count_;
+  stats.completion_wait_completed = completion_wait_completed_count_;
+  stats.completion_event_wakeups = completion_event_wakeup_count_;
+  stats.completion_event_timeouts = completion_event_timeout_count_;
+  stats.completion_event_failures = completion_event_failure_count_;
   stats.idle_buffers = idle_completion_staging_buffers_.size();
   stats.in_flight_buffers = completion_staging_in_flight_count_;
   stats.peak_in_flight_buffers = completion_staging_peak_in_flight_count_;
@@ -743,8 +814,7 @@ bool MetalSharedMemory::EnqueueGpuOrderedGuestMemoryPublicationAndWrites(
     if (recycle_completion_staging) {
       ++completion_staging_in_flight_count_;
       completion_staging_peak_in_flight_count_ =
-          std::max(completion_staging_peak_in_flight_count_,
-                   completion_staging_in_flight_count_);
+          std::max(completion_staging_peak_in_flight_count_, completion_staging_in_flight_count_);
     }
 
     // Publish before commit, matching UploadRanges' invalidation race
@@ -752,6 +822,14 @@ bool MetalSharedMemory::EnqueueGpuOrderedGuestMemoryPublicationAndWrites(
     // range and a future RequestRange restores it from guest memory.
     for (const auto& range : completion_ranges) {
       RangeWrittenByGpu(range.first, range.second);
+    }
+    std::shared_ptr<rex::thread::Event> completion_event =
+        ordered_guest_memory_write_completion_event_;
+    if (completion_event) {
+      [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed_buffer) {
+        (void)completed_buffer;
+        completion_event->Set();
+      }];
     }
     [command_buffer commit];
     pending_upload_bytes_ += completion_data_length;

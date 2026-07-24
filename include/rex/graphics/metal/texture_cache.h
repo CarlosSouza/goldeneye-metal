@@ -1,11 +1,23 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 
 #include <rex/graphics/metal/shared_memory.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 
 namespace rex::graphics::metal {
+
+namespace texture_cache_detail {
+
+// Converts packed Xenos D24S8 / D24FS8 texels to the R32Float representation
+// used for sampling on Metal. The source endianness is applied before the
+// stencil byte is discarded. Returns false for unsupported formats or partial
+// texels.
+bool ConvertDepthTextureData(xenos::TextureFormat format, xenos::Endian endianness, void* output,
+                             const void* input, size_t length);
+
+}  // namespace texture_cache_detail
 
 class MetalTextureCache final : public TextureCache {
  public:

@@ -41,8 +41,10 @@ if(REXGLUE_USE_METAL)
         graphics/metal_completion_packet_test.cpp
         graphics/metal_depth_float24_test.mm
         graphics/metal_exact_resolved_surface_test.cpp
+        graphics/metal_goldeneye_postprocess_alias_test.cpp
         graphics/metal_shared_memory_test.mm
         graphics/metal_sampler_util_test.cpp
+        graphics/metal_texture_cache_depth_test.mm
     )
     target_link_libraries(unit_tests PRIVATE
         glslang::SPIRV

@@ -344,6 +344,14 @@ void CommandProcessor::WorkerThreadMain() {
     return;
   }
 
+  // Metal runs on the same Apple Silicon cores as the recompiled guest. A long
+  // sched_yield spin steals time from the guest thread that produces frame
+  // fences, especially on Macs with fewer performance cores. The write-pointer
+  // event is signaled for new commands and pending host calls, so retain only a
+  // short latency-oriented spin before entering the bounded event wait.
+  const uint32_t idle_spin_limit =
+      graphics_system_ && graphics_system_->name() == "Metal" ? 8 : 500;
+
   for (;;) {
     std::function<void()> fn;
     while (TryPopPendingFunction(&fn)) {
@@ -367,13 +375,14 @@ void CommandProcessor::WorkerThreadMain() {
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
+        if (loop_count >= idle_spin_limit) {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
+        } else {
+          rex::thread::MaybeYield();
         }
 
-        rex::thread::MaybeYield();
         loop_count++;
         ring_snapshot = ring_state_.GetSnapshot();
         write_ptr_index = ring_snapshot.write_pointer;
@@ -1029,10 +1038,13 @@ void CommandProcessor::PrepareForWait() {
 
 void CommandProcessor::ReturnFromWait() {}
 
-bool CommandProcessor::WaitForGpuCompletionMemoryWrite(uint32_t address, uint32_t length) {
+CommandProcessor::GpuCompletionMemoryWriteWaitResult
+CommandProcessor::WaitForGpuCompletionMemoryWrite(uint32_t address, uint32_t length,
+                                                  std::chrono::milliseconds timeout) {
   (void)address;
   (void)length;
-  return false;
+  (void)timeout;
+  return GpuCompletionMemoryWriteWaitResult::kUnavailable;
 }
 
 bool CommandProcessor::BeginWaitRegMemMemoryChange(uint32_t address, uint32_t length) {
@@ -1041,9 +1053,10 @@ bool CommandProcessor::BeginWaitRegMemMemoryChange(uint32_t address, uint32_t le
   return false;
 }
 
-bool CommandProcessor::WaitForWaitRegMemMemoryChange(std::chrono::milliseconds timeout) {
+CommandProcessor::WaitRegMemMemoryChangeResult CommandProcessor::WaitForWaitRegMemMemoryChange(
+    std::chrono::milliseconds timeout) {
   (void)timeout;
-  return false;
+  return WaitRegMemMemoryChangeResult::kUnavailable;
 }
 
 void CommandProcessor::EndWaitRegMemMemoryChange() {}
@@ -1667,11 +1680,17 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       vd_swap_scavenger_enabled && graphics_system_ && graphics_system_->name() == "Metal";
   const auto wait_started = std::chrono::steady_clock::now();
   const auto wait_deadline = wait_started + std::chrono::milliseconds(60);
+  auto remaining_wait_timeout = [&wait_deadline](std::chrono::milliseconds requested_timeout) {
+    std::chrono::milliseconds remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        wait_deadline - std::chrono::steady_clock::now());
+    return std::min(requested_timeout, std::max(remaining, std::chrono::milliseconds(0)));
+  };
 
   bool matched = false;
   bool timed_out = false;
   bool wait_prepared = false;
-  bool backend_completion_wait_attempted = false;
+  bool backend_completion_wait_unavailable = false;
+  std::chrono::milliseconds memory_change_wait_timeout(1);
   uint32_t first_value = 0;
   uint32_t last_value = 0;
   uint64_t poll_count = 0;
@@ -1754,23 +1773,37 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           PrepareForWait();
           wait_prepared = true;
         }
-        // Backends that publish EVENT_WRITE_SHD through the host GPU can wait
-        // for the exact queued write once instead of burning CPU on thousands
-        // of volatile polls. The value is always re-read by the normal loop.
-        if (is_memory && !backend_completion_wait_attempted) {
-          backend_completion_wait_attempted = true;
-          if (WaitForGpuCompletionMemoryWrite(poll_reg_addr & ~uint32_t(0x3),
-                                              sizeof(uint32_t))) {
-            rex::thread::SyncMemory();
-            continue;
+        // Backends that publish EVENT_WRITE_SHD through the host GPU can sleep
+        // on the exact queued write. A pending result is still bounded to 1 ms
+        // so the packet deadline and worker shutdown are checked regularly.
+        bool backend_memory_change_waited = false;
+        if (is_memory && !backend_completion_wait_unavailable) {
+          GpuCompletionMemoryWriteWaitResult completion_wait =
+              WaitForGpuCompletionMemoryWrite(poll_reg_addr & ~uint32_t(0x3), sizeof(uint32_t),
+                                              remaining_wait_timeout(std::chrono::milliseconds(1)));
+          if (completion_wait == GpuCompletionMemoryWriteWaitResult::kUnavailable) {
+            backend_completion_wait_unavailable = true;
+          } else {
+            backend_memory_change_waited = true;
           }
         }
         // Guest CPU memory notifications avoid burning an entire host core on
-        // frame fences. A notification may be early or spurious, so this wait
-        // is capped at 1 ms and the predicate is always re-read above.
-        bool backend_memory_change_waited =
-            memory_change_wait_armed &&
-            WaitForWaitRegMemMemoryChange(std::chrono::milliseconds(1));
+        // frame fences. Back off from 1 to 4 ms across timeouts to reduce
+        // scheduler churn, but reset after any signal because notifications
+        // may be early or spurious. The predicate is always re-read above.
+        if (!backend_memory_change_waited && memory_change_wait_armed) {
+          WaitRegMemMemoryChangeResult memory_change_wait =
+              WaitForWaitRegMemMemoryChange(remaining_wait_timeout(memory_change_wait_timeout));
+          if (memory_change_wait != WaitRegMemMemoryChangeResult::kUnavailable) {
+            backend_memory_change_waited = true;
+            if (memory_change_wait == WaitRegMemMemoryChangeResult::kSignaled) {
+              memory_change_wait_timeout = std::chrono::milliseconds(1);
+            } else {
+              memory_change_wait_timeout =
+                  std::min(memory_change_wait_timeout * 2, std::chrono::milliseconds(4));
+            }
+          }
+        }
         if (!backend_memory_change_waited && !REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
@@ -1780,7 +1813,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // one shot means the loop never re-checks the value OR the deadline
           // above, so a stuck fence hangs the CP worker forever. Poll at most
           // every 1ms so progress + the timeout are actually observed.
-          rex::thread::Sleep(std::chrono::milliseconds(std::min<uint32_t>(wait / 0x100, 1u)));
+          std::chrono::milliseconds fallback_wait = remaining_wait_timeout(
+              std::chrono::milliseconds(std::min<uint32_t>(wait / 0x100, 1u)));
+          if (fallback_wait > std::chrono::milliseconds(0)) {
+            rex::thread::Sleep(fallback_wait);
+          } else {
+            rex::thread::MaybeYield();
+          }
         }
         rex::thread::SyncMemory();
 
@@ -1798,7 +1837,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
                                               std::chrono::steady_clock::now() - wait_started)
                                               .count());
           OnWaitRegMemComplete(is_memory, poll_reg_addr, ref, mask, wait_info & 0x7, wait,
-                               last_value, first_value, poll_count, duration_ns, matched, timed_out);
+                               last_value, first_value, poll_count, duration_ns, matched,
+                               timed_out);
           return false;
         }
       } else {

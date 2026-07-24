@@ -43,12 +43,61 @@ MTLPixelFormat GetMetalPixelFormat(xenos::TextureFormat format, bool is_signed) 
       return is_signed ? MTLPixelFormatInvalid : MTLPixelFormatBC2_RGBA;
     case xenos::TextureFormat::k_DXT4_5:
       return is_signed ? MTLPixelFormatInvalid : MTLPixelFormatBC3_RGBA;
+    case xenos::TextureFormat::k_24_8:
+    case xenos::TextureFormat::k_24_8_FLOAT:
+      // Stencil sampling would require a separate texture. Match the D3D12 and
+      // Vulkan backends by exposing only depth as a scalar float texture.
+      return MTLPixelFormatR32Float;
     default:
       return MTLPixelFormatInvalid;
   }
 }
 
 }  // namespace
+
+namespace texture_cache_detail {
+
+bool ConvertDepthTextureData(xenos::TextureFormat format, xenos::Endian endianness, void* output,
+                             const void* input, size_t length) {
+  if ((format != xenos::TextureFormat::k_24_8 && format != xenos::TextureFormat::k_24_8_FLOAT) ||
+      !output || !input || (length & (sizeof(uint32_t) - 1))) {
+    return false;
+  }
+
+  auto* output_bytes = static_cast<uint8_t*>(output);
+  const auto* input_bytes = static_cast<const uint8_t*>(input);
+  for (size_t offset = 0; offset < length; offset += sizeof(uint32_t)) {
+    uint32_t packed_depth_stencil;
+    texture_conversion::CopySwapBlock(endianness, &packed_depth_stencil, input_bytes + offset,
+                                      sizeof(packed_depth_stencil));
+    uint32_t depth_24 = packed_depth_stencil >> 8;
+    uint32_t depth_float_bits;
+    if (format == xenos::TextureFormat::k_24_8) {
+      // This is the same endpoint-preserving UNORM conversion used by the
+      // D3D12 and Vulkan texture-load shaders. The top-bit correction makes
+      // 0xFFFFFF map exactly to 1.0 while retaining 24-bit precision.
+      float depth = float(depth_24 + (depth_24 >> 23)) * 0x1.0p-24f;
+      std::memcpy(&depth_float_bits, &depth, sizeof(depth_float_bits));
+    } else if (!depth_24) {
+      depth_float_bits = 0;
+    } else {
+      // Xenos float24 depth is an unsigned 4e20 value. Expand it directly to
+      // IEEE float32 (8e23), including normalization of float24 denormals.
+      uint32_t exponent = depth_24 >> 20;
+      uint32_t mantissa = depth_24 & 0xFFFFF;
+      if (!exponent) {
+        uint32_t mantissa_msb = 31u - uint32_t(__builtin_clz(mantissa));
+        exponent = uint32_t(int32_t(mantissa_msb) - 19);
+        mantissa = (mantissa << (20 - mantissa_msb)) & 0xFFFFF;
+      }
+      depth_float_bits = ((exponent + 112) << 23) | (mantissa << 3);
+    }
+    std::memcpy(output_bytes + offset, &depth_float_bits, sizeof(depth_float_bits));
+  }
+  return true;
+}
+
+}  // namespace texture_cache_detail
 
 class MetalTextureCache::MetalTexture final : public TextureCache::Texture {
  public:
@@ -177,6 +226,9 @@ uint32_t MetalTextureCache::GetHostFormatSwizzle(TextureKey key) const {
     case xenos::TextureFormat::k_DXT2_3:
     case xenos::TextureFormat::k_DXT4_5:
       return xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+    case xenos::TextureFormat::k_24_8:
+    case xenos::TextureFormat::k_24_8_FLOAT:
+      return xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR;
     default:
       return xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
   }
@@ -196,6 +248,25 @@ std::unique_ptr<TextureCache::Texture> MetalTextureCache::CreateTexture(TextureK
   MTLPixelFormat pixel_format = GetMetalPixelFormat(key.format, key.signed_separate != 0);
   if (!metal_device_ || pixel_format == MTLPixelFormatInvalid || key.scaled_resolve ||
       key.dimension == xenos::DataDimension::k1D || key.dimension == xenos::DataDimension::k3D) {
+    return nullptr;
+  }
+
+  // Reject impossible guest ranges before asking Metal for what may be a very
+  // large allocation. The normal load path checks this too, but doing it after
+  // allocation is particularly costly for malformed near-maximum descriptors.
+  texture_util::TextureGuestLayout guest_layout = key.GetGuestLayout();
+  auto guest_range_fits = [](uint32_t page, uint32_t extent) {
+    uint64_t start = uint64_t(page) << 12;
+    return !extent || (page && start < SharedMemory::kBufferSize &&
+                       uint64_t(extent) <= SharedMemory::kBufferSize - start);
+  };
+  if (!guest_range_fits(key.base_page, guest_layout.base.level_data_extent_bytes) ||
+      !guest_range_fits(key.mip_page, guest_layout.mips_total_extent_bytes)) {
+    REXGPU_WARN("MetalTextureCache: rejecting texture whose guest range is outside "
+                "physical memory (base=0x{:08X} base_extent=0x{:X}, mips=0x{:08X} "
+                "mip_extent=0x{:X})",
+                key.base_page << 12, guest_layout.base.level_data_extent_bytes, key.mip_page << 12,
+                guest_layout.mips_total_extent_bytes);
     return nullptr;
   }
 
@@ -292,6 +363,8 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   }
 
   std::vector<uint8_t> linear_data(size_t(x_blocks) * y_blocks * bytes_per_block);
+  bool is_depth_texture = key.format == xenos::TextureFormat::k_24_8 ||
+                          key.format == xenos::TextureFormat::k_24_8_FLOAT;
   for (uint32_t slice = 0; slice < array_size; ++slice) {
     uint32_t slice_offset = slice * level.array_slice_stride_bytes;
     const uint8_t* guest_base = buffer_contents + base_physical + slice_offset;
@@ -306,17 +379,27 @@ bool MetalTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       untile_info.output_pitch = x_blocks;
       untile_info.input_format_info = format_info;
       untile_info.output_format_info = format_info;
-      untile_info.copy_callback = [endian = key.endianness](void* output, const void* input,
-                                                            size_t length) {
-        texture_conversion::CopySwapBlock(endian, output, input, length);
+      untile_info.copy_callback = [format = key.format, endian = key.endianness, is_depth_texture](
+                                      void* output, const void* input, size_t length) {
+        if (is_depth_texture) {
+          texture_cache_detail::ConvertDepthTextureData(format, endian, output, input, length);
+        } else {
+          texture_conversion::CopySwapBlock(endian, output, input, length);
+        }
       };
       texture_conversion::Untile(linear_data.data(), guest_base, &untile_info);
     } else {
       size_t output_row_pitch = size_t(x_blocks) * bytes_per_block;
       for (uint32_t y = 0; y < y_blocks; ++y) {
-        texture_conversion::CopySwapBlock(
-            key.endianness, linear_data.data() + size_t(y) * output_row_pitch,
-            guest_base + size_t(y) * level.row_pitch_bytes, output_row_pitch);
+        if (is_depth_texture) {
+          texture_cache_detail::ConvertDepthTextureData(
+              key.format, key.endianness, linear_data.data() + size_t(y) * output_row_pitch,
+              guest_base + size_t(y) * level.row_pitch_bytes, output_row_pitch);
+        } else {
+          texture_conversion::CopySwapBlock(
+              key.endianness, linear_data.data() + size_t(y) * output_row_pitch,
+              guest_base + size_t(y) * level.row_pitch_bytes, output_row_pitch);
+        }
       }
     }
 

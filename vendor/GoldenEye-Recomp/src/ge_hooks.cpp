@@ -25,6 +25,7 @@
 #include <rex/ui/keybinds.h>  // ParseVirtualKey (keyboard rebinding)
 #include <rex/ui/virtual_key.h>
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
+#include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/runtime.h>
 #include <rex/system/xmemory.h>
 #include <rex/graphics/graphics_system.h>
@@ -188,17 +189,243 @@ static_assert(!ge_hold_gpu_watchdog_time(false, false, false, false));
 void ge_notify_wait_reg_mem_write(PPCRegister& fence_base) {
   if (auto* command_processor = ge_cp()) {
     command_processor->NotifyWaitRegMemMemoryWrite(fence_base.u32 + sizeof(uint32_t),
-                                                    sizeof(uint32_t));
+                                                   sizeof(uint32_t));
   }
 }
 
 namespace {
-constexpr uint32_t kGuestLowMemoryStart = 0x10000u;
-constexpr uint32_t kGuestLowMemoryEnd = 0x70000000u;
+struct GeGuestStackScan {
+  uint8_t* host_address = nullptr;
+  uint32_t length = 0;
+};
 
-inline bool guest_low_range_valid(uint32_t ga, uint32_t length) {
-  return ga >= kGuestLowMemoryStart && ga < kGuestLowMemoryEnd &&
-         length <= (kGuestLowMemoryEnd - ga);
+bool ge_guest_range_readable(rex::memory::Memory* memory, uint32_t guest_address, uint32_t length) {
+  if (!memory || length == 0 || guest_address > UINT32_MAX - (length - 1)) {
+    return false;
+  }
+  const uint32_t guest_end = guest_address + length - 1;
+  auto* heap = memory->LookupHeap(guest_address);
+  return heap && heap == memory->LookupHeap(guest_end) &&
+         heap->QueryRangeAccess(guest_address, guest_end) != rex::memory::PageAccess::kNoAccess;
+}
+
+GeGuestStackScan ge_guest_stack_scan(rex::system::XThread* thread, uint32_t guest_sp,
+                                     uint32_t requested_length) {
+  if (!thread || thread->guest_object() == 0) {
+    return {};
+  }
+  auto* memory = thread->memory();
+  if (!ge_guest_range_readable(memory, thread->guest_object(), sizeof(rex::system::X_KTHREAD))) {
+    return {};
+  }
+  auto* guest_thread = thread->guest_object<rex::system::X_KTHREAD>();
+  const uint32_t stack_limit = guest_thread->stack_limit;
+  const uint32_t stack_base = guest_thread->stack_base;
+  if (stack_limit < rex::system::XThread::kStackAddressRangeBegin ||
+      stack_base > rex::system::XThread::kStackAddressRangeEnd || stack_limit >= stack_base ||
+      guest_sp < stack_limit || guest_sp >= stack_base) {
+    return {};
+  }
+  const uint32_t scan_length = std::min(requested_length, stack_base - guest_sp);
+  if (!ge_guest_range_readable(memory, guest_sp, scan_length)) {
+    return {};
+  }
+  return {memory->TranslateVirtual<uint8_t*>(guest_sp), scan_length};
+}
+
+void ge_flush_critical_section_diagnostics() {
+  if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+    logger->flush();
+  }
+  std::fflush(stderr);
+}
+
+void ge_log_main_critical_section_wait(const char* tag) {
+  auto* state = rex::system::kernel_state();
+  if (!state) {
+    return;
+  }
+
+  auto threads = state->object_table()->GetObjectsByType<rex::system::XThread>();
+  for (auto& waiter : threads) {
+    if (!waiter || waiter->creation_params()->start_address != 0x8235E4A8u) {
+      continue;
+    }
+    auto* waiter_state = waiter->thread_state();
+    auto* waiter_context = waiter_state ? waiter_state->context() : nullptr;
+    if (!waiter_context) {
+      continue;
+    }
+
+    const uint32_t waiter_lr = static_cast<uint32_t>(waiter_context->lr);
+    const uint32_t waiter_r3 = waiter_context->r3.u32;
+    const uint32_t waiter_r29 = waiter_context->r29.u32;
+    if (waiter_lr != 0x823E4B88u) {
+      continue;
+    }
+    if (waiter_r3 != waiter_r29) {
+      REXKRNL_INFO(
+          "{} CSWAIT waiter={:#x} thread_id={} lr={:#x}: callsite invariant failed "
+          "r3={:#x} r29={:#x}; snapshot ignored",
+          tag, waiter->guest_object(), waiter->thread_id(), waiter_lr, waiter_r3, waiter_r29);
+      std::fprintf(stderr,
+                   "[ge] %s CSWAIT waiter=0x%08x thread_id=%u lr=0x%08x invariant failed "
+                   "r3=0x%08x r29=0x%08x snapshot ignored\n",
+                   tag, waiter->guest_object(), waiter->thread_id(), waiter_lr, waiter_r3,
+                   waiter_r29);
+      ge_flush_critical_section_diagnostics();
+      return;
+    }
+
+    const uint32_t cs_address = waiter_r29;
+    rex::kernel::xboxkrnl::RtlCriticalSectionDebugInfo info;
+    const bool readable =
+        rex::kernel::xboxkrnl::QueryRtlCriticalSectionDebugInfo(cs_address, &info);
+
+    const uint32_t waiter_lr_after = static_cast<uint32_t>(waiter_context->lr);
+    const uint32_t waiter_r3_after = waiter_context->r3.u32;
+    const uint32_t waiter_r29_after = waiter_context->r29.u32;
+    if (waiter_lr_after != waiter_lr || waiter_r3_after != waiter_r3 ||
+        waiter_r29_after != waiter_r29) {
+      REXKRNL_INFO(
+          "{} CSWAIT waiter={:#x} thread_id={}: waiter moved while sampled "
+          "lr={:#x}->{:#x} r3={:#x}->{:#x} r29={:#x}->{:#x}; snapshot ignored",
+          tag, waiter->guest_object(), waiter->thread_id(), waiter_lr, waiter_lr_after, waiter_r3,
+          waiter_r3_after, waiter_r29, waiter_r29_after);
+      std::fprintf(stderr,
+                   "[ge] %s CSWAIT waiter=0x%08x thread_id=%u moved while sampled "
+                   "lr=0x%08x->0x%08x r3=0x%08x->0x%08x r29=0x%08x->0x%08x "
+                   "snapshot ignored\n",
+                   tag, waiter->guest_object(), waiter->thread_id(), waiter_lr, waiter_lr_after,
+                   waiter_r3, waiter_r3_after, waiter_r29, waiter_r29_after);
+      ge_flush_critical_section_diagnostics();
+      return;
+    }
+
+    if (!readable) {
+      REXKRNL_INFO(
+          "{} CSWAIT waiter={:#x} thread_id={} lr={:#x} r3={:#x} r29={:#x}: "
+          "critical-section memory unreadable",
+          tag, waiter->guest_object(), waiter->thread_id(), waiter_lr, waiter_r3, waiter_r29);
+      std::fprintf(stderr,
+                   "[ge] %s CSWAIT waiter=0x%08x thread_id=%u lr=0x%08x r3=0x%08x r29=0x%08x "
+                   "critical-section memory unreadable\n",
+                   tag, waiter->guest_object(), waiter->thread_id(), waiter_lr, waiter_r3,
+                   waiter_r29);
+      ge_flush_critical_section_diagnostics();
+      return;
+    }
+
+    REXKRNL_INFO(
+        "{} CSWAIT waiter={:#x} thread_id={} lr={:#x} cs={:#x}(r3/r29) signal={} "
+        "lock_count={} recursion={} estimated_waiters={} owner={:#x} [{}]",
+        tag, waiter->guest_object(), waiter->thread_id(), waiter_lr, cs_address, info.signal_state,
+        info.lock_count, info.recursion_count, info.estimated_waiters, info.owning_thread,
+        info.coherent ? "COHERENT" : "TRANSITIONAL/INCONSISTENT");
+    std::fprintf(stderr,
+                 "[ge] %s CSWAIT waiter=0x%08x thread_id=%u lr=0x%08x "
+                 "cs=0x%08x(r3/r29) "
+                 "signal=%u lock_count=%d recursion=%d estimated_waiters=%u owner=0x%08x %s\n",
+                 tag, waiter->guest_object(), waiter->thread_id(), waiter_lr, cs_address,
+                 info.signal_state, info.lock_count, info.recursion_count, info.estimated_waiters,
+                 info.owning_thread, info.coherent ? "COHERENT" : "TRANSITIONAL/INCONSISTENT");
+
+    rex::kernel::xboxkrnl::RtlCriticalSectionDebugInfo confirmed_info;
+    if (!rex::kernel::xboxkrnl::QueryRtlCriticalSectionDebugInfo(cs_address, &confirmed_info)) {
+      REXKRNL_INFO("{} CSOWNER cs={:#x}: memory became unreadable before owner correlation", tag,
+                   cs_address);
+      std::fprintf(stderr,
+                   "[ge] %s CSOWNER cs=0x%08x memory became unreadable before owner correlation\n",
+                   tag, cs_address);
+      ge_flush_critical_section_diagnostics();
+      return;
+    }
+    if (confirmed_info.owning_thread != info.owning_thread ||
+        confirmed_info.lock_count != info.lock_count ||
+        confirmed_info.recursion_count != info.recursion_count) {
+      REXKRNL_INFO(
+          "{} CSOWNER cs={:#x}: lock changed during capture "
+          "owner={:#x}->{:#x} lock_count={}->{} recursion={}->{}; "
+          "thread correlation skipped",
+          tag, cs_address, info.owning_thread, confirmed_info.owning_thread, info.lock_count,
+          confirmed_info.lock_count, info.recursion_count, confirmed_info.recursion_count);
+      std::fprintf(stderr,
+                   "[ge] %s CSOWNER cs=0x%08x lock changed during capture "
+                   "owner=0x%08x->0x%08x lock_count=%d->%d recursion=%d->%d; "
+                   "thread correlation skipped\n",
+                   tag, cs_address, info.owning_thread, confirmed_info.owning_thread,
+                   info.lock_count, confirmed_info.lock_count, info.recursion_count,
+                   confirmed_info.recursion_count);
+      ge_flush_critical_section_diagnostics();
+      return;
+    }
+    info = confirmed_info;
+
+    if (info.owning_thread == 0) {
+      REXKRNL_INFO("{} CSOWNER cs={:#x}: no owner recorded", tag, cs_address);
+      std::fprintf(stderr, "[ge] %s CSOWNER cs=0x%08x no owner recorded\n", tag, cs_address);
+      ge_flush_critical_section_diagnostics();
+      return;
+    }
+
+    const bool self_owner = info.owning_thread == waiter->guest_object();
+    if (self_owner) {
+      REXKRNL_WARN(
+          "{} CSOWNER owner={:#x} is the waiting thread itself "
+          "(self-owner deadlock/corrupt recursion state)",
+          tag, info.owning_thread);
+      std::fprintf(stderr,
+                   "[ge] %s CSOWNER owner=0x%08x SELF-OWNER "
+                   "(deadlock/corrupt recursion state)\n",
+                   tag, info.owning_thread);
+    }
+
+    for (auto& owner : threads) {
+      if (!owner || owner->guest_object() != info.owning_thread) {
+        continue;
+      }
+      auto* owner_state = owner->thread_state();
+      auto* owner_context = owner_state ? owner_state->context() : nullptr;
+      const uint32_t owner_start = owner->creation_params()->start_address;
+      if (owner_context) {
+        REXKRNL_INFO(
+            "{} CSOWNER owner={:#x}{} thread_id={} start={:#x} main={} running={} "
+            "lr={:#x} ctr={:#x} lastIndTgt={:#x} sp={:#x}",
+            tag, info.owning_thread, self_owner ? " [SELF-OWNER]" : "", owner->thread_id(),
+            owner_start, owner->main_thread(), owner->is_running(),
+            static_cast<uint32_t>(owner_context->lr), owner_context->ctr.u32,
+            owner_context->last_indirect_target, owner_context->r1.u32);
+        std::fprintf(stderr,
+                     "[ge] %s CSOWNER owner=0x%08x%s thread_id=%u start=0x%08x "
+                     "main=%u running=%u "
+                     "lr=0x%08x ctr=0x%08x last=0x%08x sp=0x%08x\n",
+                     tag, info.owning_thread, self_owner ? " [SELF-OWNER]" : "", owner->thread_id(),
+                     owner_start, owner->main_thread() ? 1u : 0u, owner->is_running() ? 1u : 0u,
+                     static_cast<uint32_t>(owner_context->lr), owner_context->ctr.u32,
+                     owner_context->last_indirect_target, owner_context->r1.u32);
+      } else {
+        REXKRNL_INFO(
+            "{} CSOWNER owner={:#x} thread_id={} start={:#x} main={} running={}: "
+            "host thread has no PPC context",
+            tag, info.owning_thread, owner->thread_id(), owner_start, owner->main_thread(),
+            owner->is_running());
+        std::fprintf(stderr,
+                     "[ge] %s CSOWNER owner=0x%08x thread_id=%u start=0x%08x main=%u running=%u "
+                     "no PPC context\n",
+                     tag, info.owning_thread, owner->thread_id(), owner_start,
+                     owner->main_thread() ? 1u : 0u, owner->is_running() ? 1u : 0u);
+      }
+      ge_flush_critical_section_diagnostics();
+      return;
+    }
+
+    REXKRNL_INFO("{} CSOWNER owner={:#x}: no live XThread (stale/dead owner)", tag,
+                 info.owning_thread);
+    std::fprintf(stderr, "[ge] %s CSOWNER owner=0x%08x no live XThread (stale/dead owner)\n", tag,
+                 info.owning_thread);
+    ge_flush_critical_section_diagnostics();
+    return;
+  }
 }
 
 inline void getcb(PPCContext*& ctx, uint8_t*& base) {
@@ -243,7 +470,7 @@ inline void ST16(uint8_t* b, uint32_t ga, uint16_t val) {
   std::memcpy(b + ga, &v, 2);
 }
 
-void ge_sample_present_main_thread_path(uint8_t* base, uint32_t present_index) {
+void ge_sample_present_main_thread_path(uint32_t present_index) {
   auto* ks = rex::system::kernel_state();
   if (!ks)
     return;
@@ -298,10 +525,10 @@ void ge_sample_present_main_thread_path(uint8_t* base, uint32_t present_index) {
         char stack_buffer[520];
         int stack_offset =
             std::snprintf(stack_buffer, sizeof(stack_buffer), "lr=%x sp=%x | ", pc, sp);
-        if (guest_low_range_valid(sp, 4)) {
-          uint8_t* stack = base + sp;
-          uint32_t scan_length = std::min<uint32_t>(0x1800u, kGuestLowMemoryEnd - sp);
-          uint8_t* stack_end = stack + scan_length;
+        const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x1800u);
+        if (stack_scan.length != 0) {
+          uint8_t* stack = stack_scan.host_address;
+          uint8_t* stack_end = stack + stack_scan.length;
           for (uint8_t* pp = stack; pp + 4 <= stack_end && stack_offset < 480; pp += 4) {
             uint32_t value;
             std::memcpy(&value, pp, 4);
@@ -443,13 +670,13 @@ void ge_watchdog_thread() {
                          c->last_indirect_target, c->msr, c->r1.u32, c->r3.u32, c->r11.u32,
                          c->r28.u32, c->r29.u32, c->r30.u32, c->r31.u32);
             uint32_t sp = c->r1.u32;
-            if (guest_low_range_valid(sp, 4)) {
-              uint8_t* hsp = base + sp;
-              uint32_t scan_length = std::min<uint32_t>(0x2400u, kGuestLowMemoryEnd - sp);
+            const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x2400u);
+            if (stack_scan.length != 0) {
+              uint8_t* hsp = stack_scan.host_address;
               char sbuf[500];
               int soff = 0;
               sbuf[0] = 0;
-              for (uint8_t* pp = hsp; pp + 4 <= hsp + scan_length && soff < 460; pp += 4) {
+              for (uint8_t* pp = hsp; pp + 4 <= hsp + stack_scan.length && soff < 460; pp += 4) {
                 uint32_t val;
                 std::memcpy(&val, pp, 4);
                 val = __builtin_bswap32(val);
@@ -485,7 +712,8 @@ void ge_watchdog_thread() {
             }
           }
         }
-        std::fflush(stderr);
+        ge_log_main_critical_section_wait("GENOPRESENT");
+        ge_flush_critical_section_diagnostics();
       }
     } else {
       no_present_stall = 0;
@@ -588,10 +816,10 @@ void ge_watchdog_thread() {
             // (0x82xxxxxx return addresses) -> the call chain, directly readable.
             {
               uint32_t sp = c->r1.u32;
-              if (guest_low_range_valid(sp, 4)) {
-                uint8_t* hsp = base + sp;
-                uint32_t scan_length = std::min<uint32_t>(0x2400u, kGuestLowMemoryEnd - sp);
-                uint8_t* send = hsp + scan_length;
+              const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x2400u);
+              if (stack_scan.length != 0) {
+                uint8_t* hsp = stack_scan.host_address;
+                uint8_t* send = hsp + stack_scan.length;
 #if defined(_WIN32)
                 MEMORY_BASIC_INFORMATION mbi;
                 if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
@@ -697,10 +925,10 @@ void ge_watchdog_thread() {
                   uint32_t sp = mc->r1.u32;
                   char fb[620];
                   int fo = std::snprintf(fb, sizeof(fb), "lr=%x | ", pc);
-                  if (guest_low_range_valid(sp, 4)) {
-                    uint8_t* hsp = base + sp;
-                    uint32_t scan_length = std::min<uint32_t>(0x2800u, kGuestLowMemoryEnd - sp);
-                    uint8_t* send = hsp + scan_length;
+                  const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x2800u);
+                  if (stack_scan.length != 0) {
+                    uint8_t* hsp = stack_scan.host_address;
+                    uint8_t* send = hsp + stack_scan.length;
 #if defined(_WIN32)
                     MEMORY_BASIC_INFORMATION mbi;
                     if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
@@ -732,6 +960,8 @@ void ge_watchdog_thread() {
             break;
           }
         }
+        ge_log_main_critical_section_wait("GEWATCHDOG");
+        ge_flush_critical_section_diagnostics();
       }
     } else {
       stall = 0;
@@ -986,7 +1216,7 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
       (present_index == 64 || present_index == 128 || (present_index & 0xFF) == 0)) {
     std::thread([base, present_index]() {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      ge_sample_present_main_thread_path(base, present_index);
+      ge_sample_present_main_thread_path(present_index);
     }).detach();
   }
 }
@@ -2309,7 +2539,7 @@ void ge_log_cleanup_callback_stack_error(std::string_view reason, uint32_t guest
   if (!ge_should_log_sparse_recovery(hit)) {
     return;
   }
-  REXKRNL_WARN("[GE-GUARD-823CFC00-v1] callback snapshot {} hit={} depth={} guest_sp=0x{:08X}",
+  REXKRNL_WARN("[GE-GUARD-823CFC00-v2] callback snapshot {} hit={} depth={} guest_sp=0x{:08X}",
                reason, hit, depth, guest_sp);
   if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
     logger->flush();
@@ -2370,12 +2600,11 @@ bool ge_recover_packed_data_purecall(uint32_t call_site, uint32_t callback_targe
 }  // namespace
 
 // sub_823CFC00 walks two intrusive cleanup lists while holding the owner's
-// critical sections. The virtual cleanup callback at 0x823CFC84 is required by
-// the PPC ABI to preserve r1 and r26-r31. At least one real callback path
-// returns with r28 cleared, which turns the next owner load at 0x823CFC94 into
-// a protected-low-page access at guest 0x70. Snapshot every live nonvolatile
-// register immediately before the callback and restore it immediately after;
-// this preserves the original loop and its ordinary lock-release epilogue.
+// critical sections. Both virtual callbacks (0x823CFC84 and 0x823CFCB8) are
+// required by the PPC ABI to preserve r1 and r26-r31. Snapshot every live
+// nonvolatile register immediately before either callback and restore it
+// immediately after; this preserves the original loops and lock-release
+// epilogue even when a real callback violates that ABI.
 void ge_cleanup_callback_enter(PPCRegister& r1, PPCRegister& r26, PPCRegister& r27,
                                PPCRegister& r28, PPCRegister& r29, PPCRegister& r30,
                                PPCRegister& r31, PPCRegister& r3, PPCRegister& r11) {
@@ -2430,7 +2659,7 @@ void ge_cleanup_callback_leave(PPCRegister& r1, PPCRegister& r26, PPCRegister& r
     return;
   }
   REXKRNL_WARN(
-      "[GE-GUARD-823CFC00-v1] repaired callback ABI hit={} changed=0x{:02X} "
+      "[GE-GUARD-823CFC00-v2] repaired callback ABI hit={} changed=0x{:02X} "
       "owner=0x{:08X} object=0x{:08X} callback=0x{:08X} "
       "returned_r28=0x{:08X} guest_sp=0x{:08X}",
       hit, changed, static_cast<uint32_t>(saved.r28), saved.object, saved.callback,
@@ -2438,6 +2667,35 @@ void ge_cleanup_callback_leave(PPCRegister& r1, PPCRegister& r26, PPCRegister& r
   if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
     logger->flush();
   }
+}
+
+// sub_823DACE0 is reached through sub_823CFC00's second cleanup callback. It
+// walks a circular child list and reads node->next at 0x823DAD08. A captured
+// v0.2.0 crash supplied node=0x6920, making that read hit the runtime's
+// intentionally protected guest low page at 0x6924. Stop only the corrupt
+// remainder; the configured hook jumps through sub_823DACE0's normal epilogue,
+// after which the outer callback guard restores its caller and releases locks.
+bool ge_guard_cleanup_child_node(PPCRegister& r11, PPCRegister& r30, PPCRegister& r1) {
+  const uint32_t node = r11.u32;
+  if (!ge::crash_guards::CleanupListNodeNeedsRecovery(node)) {
+    return false;
+  }
+
+  static std::atomic<uint64_t> hits{0};
+  const uint64_t hit = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (ge_should_log_sparse_recovery(hit)) {
+    const uint32_t sentinel = r30.u32;
+    const uint32_t owner = sentinel >= 240u ? sentinel - 240u : 0;
+    REXKRNL_WARN(
+        "[GE-GUARD-823DACE0-v1] recovered site=0x823DAD08 hit={} "
+        "owner=0x{:08X} sentinel=0x{:08X} node=0x{:08X} "
+        "next=0x{:08X} guest_sp=0x{:08X}",
+        hit, owner, sentinel, node, node + 4u, r1.u32);
+    if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+      logger->flush();
+    }
+  }
+  return true;
 }
 
 // Guard both vtable+16 calls before dispatch. A purecall target here means this

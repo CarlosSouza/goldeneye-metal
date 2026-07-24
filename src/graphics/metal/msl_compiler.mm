@@ -917,6 +917,10 @@ struct PipelineProbeContext {
   id<MTLRenderPipelineState> depth_clear_pipeline_state = nil;
   id<MTLComputePipelineState> multisample_select_resolve_pipeline_state = nil;
   id<MTLComputePipelineState> tiled_resolve_pipeline_state = nil;
+  id<MTLComputePipelineState> depth_tiled_resolve_pipeline_state = nil;
+  id<MTLComputePipelineState> multisample_depth_tiled_resolve_pipeline_state = nil;
+  id<MTLTexture> depth_resolve_dummy_snapshot_texture = nil;
+  id<MTLTexture> depth_resolve_dummy_packed_snapshot_texture = nil;
   MTLStorageMode storage_mode = MTLStorageModeShared;
   uint32_t width = 0;
   uint32_t height = 0;
@@ -1041,6 +1045,28 @@ struct MultisampleSelectResolveConstants {
   uint32_t copy_height;
   uint32_t destination_row_pitch;
   uint32_t host_sample_mask;
+};
+
+struct DepthTiledResolveConstants {
+  uint32_t source_x;
+  uint32_t source_y;
+  uint32_t destination_buffer_offset;
+  uint32_t destination_pitch;
+  uint32_t destination_x;
+  uint32_t destination_y;
+  uint32_t copy_width;
+  uint32_t copy_height;
+  uint32_t destination_endian;
+  uint32_t host_sample;
+  uint32_t depth_float24;
+  uint32_t depth_float24_round;
+  uint32_t snapshot_enabled;
+  uint32_t snapshot_destination_x;
+  uint32_t snapshot_destination_y;
+  uint32_t packed_snapshot_enabled;
+  uint32_t packed_snapshot_destination_x;
+  uint32_t packed_snapshot_destination_y;
+  uint32_t packed_snapshot_fetch_endian;
 };
 
 void ConfigureProbeDepthStencilPass(MTLRenderPassDescriptor* pass,
@@ -1250,6 +1276,32 @@ bool GetProbeColorSampleMask(uint32_t sample_count, uint32_t sample_select,
   return false;
 }
 
+bool GetProbeDepthSample(uint32_t sample_count, uint32_t sample_select, uint32_t& host_sample_out) {
+  if (sample_count == 1) {
+    if (sample_select != 0) {
+      return false;
+    }
+    host_sample_out = 0;
+    return true;
+  }
+  if (sample_count == 2) {
+    if (sample_select > 1) {
+      return false;
+    }
+    // Xenos sample 0 is the top sample. Metal's standard 2x ordering is the
+    // inverse: sample 1 is top-left and sample 0 is bottom-right.
+    host_sample_out = sample_select ? 0 : 1;
+    return true;
+  }
+  if (sample_count == 4 && sample_select <= 3) {
+    // Xenos TL, BL, TR, BR -> Metal TL, TR, BL, BR.
+    constexpr uint32_t kGuestToHostSample[4] = {0, 2, 1, 3};
+    host_sample_out = kGuestToHostSample[sample_select];
+    return true;
+  }
+  return false;
+}
+
 bool EnsureMultisampleSelectResolvePipelineState(PipelineProbeContext* context,
                                                  std::string* error_out) {
   if (!context || !context->device) {
@@ -1301,11 +1353,10 @@ kernel void resolve_selected_color_samples(
 )MSL";
 
   NSError* error = nil;
-  id<MTLLibrary> library =
-      [context->device
-          newLibraryWithSource:[NSString stringWithUTF8String:kMultisampleSelectResolveMsl]
-                       options:nil
-                         error:&error];
+  id<MTLLibrary> library = [context->device
+      newLibraryWithSource:[NSString stringWithUTF8String:kMultisampleSelectResolveMsl]
+                   options:nil
+                     error:&error];
   if (!library) {
     if (error_out) {
       *error_out = error ? [[error localizedDescription] UTF8String]
@@ -1430,6 +1481,299 @@ kernel void resolve_bgra8_to_xenos_tiled(
     }
     return false;
   }
+  return true;
+}
+
+bool EnsureDepthTiledResolvePipelineStates(PipelineProbeContext* context, std::string* error_out) {
+  if (!context || !context->device) {
+    if (error_out) {
+      *error_out = "missing probe context or Metal device";
+    }
+    return false;
+  }
+  if (context->depth_tiled_resolve_pipeline_state &&
+      context->multisample_depth_tiled_resolve_pipeline_state &&
+      context->depth_resolve_dummy_snapshot_texture &&
+      context->depth_resolve_dummy_packed_snapshot_texture) {
+    return true;
+  }
+  static constexpr char kDepthTiledResolveMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct DepthTiledResolveConstants {
+  uint source_x;
+  uint source_y;
+  uint destination_buffer_offset;
+  uint destination_pitch;
+  uint destination_x;
+  uint destination_y;
+  uint copy_width;
+  uint copy_height;
+  uint destination_endian;
+  uint host_sample;
+  uint depth_float24;
+  uint depth_float24_round;
+  uint snapshot_enabled;
+  uint snapshot_destination_x;
+  uint snapshot_destination_y;
+  uint packed_snapshot_enabled;
+  uint packed_snapshot_destination_x;
+  uint packed_snapshot_destination_y;
+  uint packed_snapshot_fetch_endian;
+};
+
+uint tiled_depth32_offset(uint x, uint y, uint pitch) {
+  constexpr uint bytes_per_pixel_log2 = 2;
+  uint aligned_pitch = (pitch + 31u) & ~31u;
+  uint row_macro = ((y / 32u) * (aligned_pitch / 32u)) << (bytes_per_pixel_log2 + 7u);
+  uint row_micro = ((y & 6u) << 2u) << bytes_per_pixel_log2;
+  uint row_base = row_macro + ((row_micro & ~15u) << 1u) + (row_micro & 15u) +
+                  ((y & 8u) << (3u + bytes_per_pixel_log2)) + ((y & 1u) << 4u);
+  uint column_macro = (x / 32u) << (bytes_per_pixel_log2 + 7u);
+  uint column_micro = (x & 7u) << bytes_per_pixel_log2;
+  uint offset = row_base + column_macro + ((column_micro & ~15u) << 1u) +
+                (column_micro & 15u);
+  return ((offset & ~511u) << 3u) + ((offset & 448u) << 2u) + (offset & 63u) +
+         ((y & 16u) << 7u) + (((((y & 8u) >> 2u) + (x >> 3u)) & 3u) << 6u);
+}
+
+uint float32_to_20e4(float value, bool round_to_nearest_even) {
+  if (!(value > 0.0f)) {
+    return 0u;
+  }
+  uint bits = as_type<uint>(value);
+  if (bits >= 0x3FFFFFF8u) {
+    return 0xFFFFFFu;
+  }
+  if (bits < 0x38800000u) {
+    uint shift = min(113u - (bits >> 23u), 24u);
+    bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+  } else {
+    bits += 0xC8000000u;
+  }
+  if (round_to_nearest_even) {
+    bits += 3u + ((bits >> 3u) & 1u);
+  }
+  return (bits >> 3u) & 0xFFFFFFu;
+}
+
+uint apply_depth_endian(uint value, uint endian) {
+  if (endian == 1u || endian == 2u) {
+    value = ((value & 0x00FF00FFu) << 8u) | ((value & 0xFF00FF00u) >> 8u);
+  }
+  if (endian == 2u || endian == 3u) {
+    value = (value << 16u) | (value >> 16u);
+  }
+  return value;
+}
+
+float float20e4_to_32(uint value) {
+  value &= 0xFFFFFFu;
+  if (value == 0u) {
+    return 0.0f;
+  }
+  uint mantissa = value & 0xFFFFFu;
+  uint exponent = value >> 20u;
+  if (exponent == 0u) {
+    uint mantissa_lzcnt = clz(mantissa) - 11u;
+    exponent = uint(1 - int(mantissa_lzcnt));
+    mantissa = (mantissa << mantissa_lzcnt) & 0xFFFFFu;
+  }
+  return as_type<float>(((exponent + 112u) << 23u) | (mantissa << 3u));
+}
+
+uint quantize_depth(float host_depth,
+                    constant DepthTiledResolveConstants& constants) {
+  uint depth24;
+  if (constants.depth_float24 != 0u) {
+    // Float24 host depth is stored in 0...0.5 so host depth comparison remains
+    // monotonic. Restore the guest sampling range before packing.
+    depth24 = float32_to_20e4(host_depth * 2.0f,
+                             constants.depth_float24_round != 0u);
+  } else {
+    depth24 = uint(rint(saturate(host_depth) * 16777215.0f));
+  }
+  return depth24;
+}
+
+float decode_sampled_depth(uint depth24,
+                           constant DepthTiledResolveConstants& constants) {
+  if (constants.depth_float24 != 0u) {
+    return float20e4_to_32(depth24);
+  }
+  return float(depth24 + (depth24 >> 23u)) * (1.0f / 16777216.0f);
+}
+
+uint pack_depth_stencil(uint depth24, uint stencil,
+                        constant DepthTiledResolveConstants& constants) {
+  return apply_depth_endian((depth24 << 8u) | (stencil & 0xFFu),
+                            constants.destination_endian);
+}
+
+float4 unpack_packed_depth_stencil_rgba(
+    uint packed, constant DepthTiledResolveConstants& constants) {
+  uint fetched = apply_depth_endian(
+      packed, constants.packed_snapshot_fetch_endian);
+  return float4(float(fetched & 0xFFu),
+                float((fetched >> 8u) & 0xFFu),
+                float((fetched >> 16u) & 0xFFu),
+                float((fetched >> 24u) & 0xFFu)) * (1.0f / 255.0f);
+}
+
+kernel void resolve_depth_to_xenos_tiled(
+    depth2d<float, access::read> depth [[texture(0)]],
+    texture2d<uint, access::read> stencil [[texture(1)]],
+    texture2d_array<float, access::write> snapshot [[texture(2)]],
+    texture2d_array<float, access::write> packed_snapshot [[texture(3)]],
+    device uint* destination [[buffer(0)]],
+    constant DepthTiledResolveConstants& constants [[buffer(1)]],
+    uint2 position [[thread_position_in_grid]]) {
+  if (position.x >= constants.copy_width ||
+      position.y >= constants.copy_height) {
+    return;
+  }
+  uint2 source = uint2(constants.source_x, constants.source_y) + position;
+  uint depth24 = quantize_depth(depth.read(source), constants);
+  uint packed = pack_depth_stencil(depth24, stencil.read(source).x, constants);
+  uint tiled_offset = tiled_depth32_offset(constants.destination_x + position.x,
+                                           constants.destination_y + position.y,
+                                           constants.destination_pitch);
+  destination[(constants.destination_buffer_offset + tiled_offset) >> 2u] = packed;
+  if (constants.snapshot_enabled != 0u) {
+    uint2 snapshot_destination =
+        uint2(constants.snapshot_destination_x,
+              constants.snapshot_destination_y) + position;
+    snapshot.write(decode_sampled_depth(depth24, constants),
+                   snapshot_destination, 0u);
+  }
+  if (constants.packed_snapshot_enabled != 0u) {
+    uint2 packed_snapshot_destination =
+        uint2(constants.packed_snapshot_destination_x,
+              constants.packed_snapshot_destination_y) + position;
+    packed_snapshot.write(
+        unpack_packed_depth_stencil_rgba(packed, constants),
+        packed_snapshot_destination, 0u);
+  }
+}
+
+kernel void resolve_multisample_depth_to_xenos_tiled(
+    depth2d_ms<float, access::read> depth [[texture(0)]],
+    texture2d_ms<uint, access::read> stencil [[texture(1)]],
+    texture2d_array<float, access::write> snapshot [[texture(2)]],
+    texture2d_array<float, access::write> packed_snapshot [[texture(3)]],
+    device uint* destination [[buffer(0)]],
+    constant DepthTiledResolveConstants& constants [[buffer(1)]],
+    uint2 position [[thread_position_in_grid]]) {
+  if (position.x >= constants.copy_width ||
+      position.y >= constants.copy_height) {
+    return;
+  }
+  uint2 source = uint2(constants.source_x, constants.source_y) + position;
+  uint depth24 =
+      quantize_depth(depth.read(source, constants.host_sample), constants);
+  uint packed = pack_depth_stencil(
+      depth24, stencil.read(source, constants.host_sample).x, constants);
+  uint tiled_offset = tiled_depth32_offset(constants.destination_x + position.x,
+                                           constants.destination_y + position.y,
+                                           constants.destination_pitch);
+  destination[(constants.destination_buffer_offset + tiled_offset) >> 2u] = packed;
+  if (constants.snapshot_enabled != 0u) {
+    uint2 snapshot_destination =
+        uint2(constants.snapshot_destination_x,
+              constants.snapshot_destination_y) + position;
+    snapshot.write(decode_sampled_depth(depth24, constants),
+                   snapshot_destination, 0u);
+  }
+  if (constants.packed_snapshot_enabled != 0u) {
+    uint2 packed_snapshot_destination =
+        uint2(constants.packed_snapshot_destination_x,
+              constants.packed_snapshot_destination_y) + position;
+    packed_snapshot.write(
+        unpack_packed_depth_stencil_rgba(packed, constants),
+        packed_snapshot_destination, 0u);
+  }
+}
+)MSL";
+
+  NSError* error = nil;
+  id<MTLLibrary> library =
+      [context->device newLibraryWithSource:[NSString stringWithUTF8String:kDepthTiledResolveMsl]
+                                    options:nil
+                                      error:&error];
+  if (!library) {
+    if (error_out) {
+      *error_out = error ? [[error localizedDescription] UTF8String]
+                         : "depth tiled resolve compute library failed";
+    }
+    return false;
+  }
+  id<MTLComputePipelineState> single_pipeline = nil;
+  id<MTLComputePipelineState> multisample_pipeline = nil;
+  id<MTLFunction> single_function = [library newFunctionWithName:@"resolve_depth_to_xenos_tiled"];
+  if (single_function) {
+    single_pipeline = [context->device newComputePipelineStateWithFunction:single_function
+                                                                     error:&error];
+    [single_function release];
+  }
+  id<MTLFunction> multisample_function =
+      [library newFunctionWithName:@"resolve_multisample_depth_to_xenos_tiled"];
+  if (multisample_function) {
+    multisample_pipeline = [context->device newComputePipelineStateWithFunction:multisample_function
+                                                                          error:&error];
+    [multisample_function release];
+  }
+  [library release];
+  if (!single_pipeline || !multisample_pipeline) {
+    if (single_pipeline) {
+      [single_pipeline release];
+    }
+    if (multisample_pipeline) {
+      [multisample_pipeline release];
+    }
+    if (error_out) {
+      *error_out = error ? [[error localizedDescription] UTF8String]
+                         : "depth tiled resolve compute pipeline failed";
+    }
+    return false;
+  }
+
+  MTLTextureDescriptor* dummy_descriptor =
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                         width:1
+                                                        height:1
+                                                     mipmapped:NO];
+  dummy_descriptor.textureType = MTLTextureType2DArray;
+  dummy_descriptor.arrayLength = 1;
+  dummy_descriptor.storageMode = MTLStorageModePrivate;
+  dummy_descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  id<MTLTexture> dummy_snapshot = [context->device newTextureWithDescriptor:dummy_descriptor];
+  if (!dummy_snapshot) {
+    [single_pipeline release];
+    [multisample_pipeline release];
+    if (error_out) {
+      *error_out = "failed to create depth resolve fallback snapshot texture";
+    }
+    return false;
+  }
+  dummy_descriptor.pixelFormat = MTLPixelFormatRGBA8Unorm;
+  id<MTLTexture> dummy_packed_snapshot =
+      [context->device newTextureWithDescriptor:dummy_descriptor];
+  if (!dummy_packed_snapshot) {
+    [dummy_snapshot release];
+    [single_pipeline release];
+    [multisample_pipeline release];
+    if (error_out) {
+      *error_out =
+          "failed to create packed depth resolve fallback snapshot texture";
+    }
+    return false;
+  }
+  context->depth_tiled_resolve_pipeline_state = single_pipeline;
+  context->multisample_depth_tiled_resolve_pipeline_state = multisample_pipeline;
+  context->depth_resolve_dummy_snapshot_texture = dummy_snapshot;
+  context->depth_resolve_dummy_packed_snapshot_texture =
+      dummy_packed_snapshot;
   return true;
 }
 
@@ -1829,8 +2173,7 @@ bool EnsureProbeDepthStencilTexture(PipelineProbeContext* context, uint32_t widt
   if (target->texture && target->width == width && target->height == height) {
     return true;
   }
-  if (target->width && target->height &&
-      (target->width != width || target->height != height) &&
+  if (target->width && target->height && (target->width != width || target->height != height) &&
       (target->extent_locked || target->attached_contexts.size() > 1)) {
     if (error_out) {
       *error_out = "shared depth/stencil target dimensions are locked to another color target";
@@ -1855,7 +2198,11 @@ bool EnsureProbeDepthStencilTexture(PipelineProbeContext* context, uint32_t widt
     descriptor.textureType = MTLTextureType2DMultisample;
     descriptor.sampleCount = target->sample_count;
   }
-  descriptor.usage = MTLTextureUsageRenderTarget;
+  // Compute depth resolves read the combined texture directly and create an
+  // X32_Stencil8 view for stencil. PixelFormatView is required by Metal for
+  // that view even though depth remains bound through the original texture.
+  descriptor.usage =
+      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
   descriptor.storageMode = MTLStorageModePrivate;
   id<MTLTexture> replacement_texture = [target->device newTextureWithDescriptor:descriptor];
   if (!replacement_texture) {
@@ -2366,14 +2713,12 @@ bool SharePipelineProbeDepthStencilTarget(void* opaque_destination_context,
     source_width = source_context->width;
     source_height = source_context->height;
   }
-  uint32_t destination_width =
-      destination_context->render_texture
-          ? destination_context->width
-          : (destination_target ? destination_target->width : 0);
-  uint32_t destination_height =
-      destination_context->render_texture
-          ? destination_context->height
-          : (destination_target ? destination_target->height : 0);
+  uint32_t destination_width = destination_context->render_texture
+                                   ? destination_context->width
+                                   : (destination_target ? destination_target->width : 0);
+  uint32_t destination_height = destination_context->render_texture
+                                    ? destination_context->height
+                                    : (destination_target ? destination_target->height : 0);
   if (source_width && source_height && destination_width && destination_height &&
       (source_width != destination_width || source_height != destination_height)) {
     if (error_out) {
@@ -2490,6 +2835,69 @@ void* CreatePipelineProbeSnapshotTexture(void* metal_device, uint32_t width, uin
   }
 }
 
+void* CreatePipelineProbeDepthSnapshotTexture(void* metal_device, uint32_t width, uint32_t height,
+                                              std::string* error_out) {
+  @autoreleasepool {
+    id<MTLDevice> device = (id<MTLDevice>)metal_device;
+    if (!device || !width || !height) {
+      if (error_out) {
+        *error_out = "missing Metal device or depth snapshot dimensions";
+      }
+      return nullptr;
+    }
+    MTLTextureDescriptor* descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.arrayLength = 1;
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    if (!texture) {
+      if (error_out) {
+        *error_out = "failed to allocate the private depth resolve snapshot texture";
+      }
+      return nullptr;
+    }
+    texture.label = @"ReX Metal resolved depth snapshot";
+    return (void*)texture;
+  }
+}
+
+void* CreatePipelineProbePackedDepthSnapshotTexture(void* metal_device, uint32_t width,
+                                                    uint32_t height,
+                                                    std::string* error_out) {
+  @autoreleasepool {
+    id<MTLDevice> device = (id<MTLDevice>)metal_device;
+    if (!device || !width || !height) {
+      if (error_out) {
+        *error_out = "missing Metal device or packed depth snapshot dimensions";
+      }
+      return nullptr;
+    }
+    MTLTextureDescriptor* descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.arrayLength = 1;
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    if (!texture) {
+      if (error_out) {
+        *error_out = "failed to allocate the private packed depth/stencil snapshot texture";
+      }
+      return nullptr;
+    }
+    texture.label = @"ReX Metal packed depth/stencil snapshot";
+    return (void*)texture;
+  }
+}
+
 void ReleasePipelineProbeSnapshotTexture(void* snapshot_texture) {
   if (snapshot_texture) {
     [(id<MTLTexture>)snapshot_texture release];
@@ -2589,9 +2997,8 @@ void ResetPipelineProbeContext(void* opaque_context) {
                      waited_submission_count, finalize_error.c_str());
       }
     }
-    bool depth_stencil_exclusive =
-        context->depth_stencil_target &&
-        context->depth_stencil_target->attached_contexts.size() == 1;
+    bool depth_stencil_exclusive = context->depth_stencil_target &&
+                                   context->depth_stencil_target->attached_contexts.size() == 1;
     InvalidateProbeContextColorTarget(context);
     if (depth_stencil_exclusive) {
       context->depth_stencil_target->initialized = false;
@@ -2649,6 +3056,18 @@ void ReleasePipelineProbeContext(void* opaque_context) {
   }
   if (context->tiled_resolve_pipeline_state) {
     [context->tiled_resolve_pipeline_state release];
+  }
+  if (context->depth_tiled_resolve_pipeline_state) {
+    [context->depth_tiled_resolve_pipeline_state release];
+  }
+  if (context->multisample_depth_tiled_resolve_pipeline_state) {
+    [context->multisample_depth_tiled_resolve_pipeline_state release];
+  }
+  if (context->depth_resolve_dummy_snapshot_texture) {
+    [context->depth_resolve_dummy_snapshot_texture release];
+  }
+  if (context->depth_resolve_dummy_packed_snapshot_texture) {
+    [context->depth_resolve_dummy_packed_snapshot_texture release];
   }
   if (context->render_texture) {
     [context->render_texture release];
@@ -3431,10 +3850,12 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
   }
 }
 
-bool ReadPipelineProbeContextRectSampleSelected(
-    void* opaque_context, uint32_t width, uint32_t height, uint32_t x, uint32_t y,
-    uint32_t read_width, uint32_t read_height, uint32_t color_sample_select,
-    std::vector<uint8_t>& bgra_out, std::string* error_out) {
+bool ReadPipelineProbeContextRectSampleSelected(void* opaque_context, uint32_t width,
+                                                uint32_t height, uint32_t x, uint32_t y,
+                                                uint32_t read_width, uint32_t read_height,
+                                                uint32_t color_sample_select,
+                                                std::vector<uint8_t>& bgra_out,
+                                                std::string* error_out) {
   @autoreleasepool {
     auto* context = static_cast<PipelineProbeContext*>(opaque_context);
     bgra_out.clear();
@@ -3464,8 +3885,7 @@ bool ReadPipelineProbeContextRectSampleSelected(
           "persistent multisample probe texture is unavailable or has a different size");
     }
     uint32_t host_sample_mask = 0;
-    if (!GetProbeColorSampleMask(context->sample_count, color_sample_select,
-                                 host_sample_mask)) {
+    if (!GetProbeColorSampleMask(context->sample_count, color_sample_select, host_sample_mask)) {
       return reject_and_drain("probe read sample selection is invalid for the sample count");
     }
     uint32_t full_host_sample_mask = (uint32_t(1) << context->sample_count) - 1;
@@ -3508,8 +3928,7 @@ bool ReadPipelineProbeContextRectSampleSelected(
     }
     MultisampleSelectResolveConstants constants = {
         x, y, read_width, read_height, uint32_t(row_pitch), host_sample_mask};
-    id<MTLComputePipelineState> pipeline_state =
-        context->multisample_select_resolve_pipeline_state;
+    id<MTLComputePipelineState> pipeline_state = context->multisample_select_resolve_pipeline_state;
     [encoder setComputePipelineState:pipeline_state];
     [encoder setTexture:context->multisample_render_texture atIndex:0];
     [encoder setBuffer:readback_buffer offset:0 atIndex:0];
@@ -3520,7 +3939,7 @@ bool ReadPipelineProbeContextRectSampleSelected(
     NSUInteger thread_height =
         std::max<NSUInteger>(1, std::min<NSUInteger>(read_height, max_threads / thread_width));
     [encoder dispatchThreads:MTLSizeMake(read_width, read_height, 1)
-       threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
+        threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
     [encoder endEncoding];
     ++context->multisample_resolve_count;
     [command_buffer commit];
@@ -3608,13 +4027,21 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
     uint32_t full_host_sample_mask = (uint32_t(1) << context->sample_count) - 1;
     bool selective_multisample_resolve =
         context->sample_count > 1 && host_sample_mask != full_host_sample_mask;
+    id<MTLTexture> presentation_snapshot =
+        (id<MTLTexture>)destination.presentation_snapshot_texture;
+    bool snapshot_only = !destination.metal_buffer && presentation_snapshot &&
+                         !destination.guest_memory_metal_buffer &&
+                         !destination.guest_memory_copy_length;
     if (!resolve_width || !resolve_height || source_x >= width || source_y >= height ||
         resolve_width > width - source_x || resolve_height > height - source_y ||
-        !destination.metal_buffer || !destination.pitch || !destination.height ||
-        destination.x >= destination.pitch || destination.y >= destination.height ||
-        resolve_width > destination.pitch - destination.x ||
-        resolve_height > destination.height - destination.y || destination.endian > 3 ||
-        (destination.buffer_offset & 3) || destination.buffer_offset > UINT32_MAX ||
+        (!snapshot_only &&
+         (!destination.metal_buffer || !destination.pitch ||
+          !destination.height || destination.x >= destination.pitch ||
+          destination.y >= destination.height ||
+          resolve_width > destination.pitch - destination.x ||
+          resolve_height > destination.height - destination.y ||
+          destination.endian > 3 || (destination.buffer_offset & 3) ||
+          destination.buffer_offset > UINT32_MAX)) ||
         resolve_width > UINT32_MAX / 4 || size_t(resolve_width) > SIZE_MAX / 4 ||
         size_t(resolve_height) > SIZE_MAX / (size_t(resolve_width) * 4)) {
       return reject_and_drain("invalid tiled resolve rectangle, surface, buffer, or endian");
@@ -3622,18 +4049,23 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
 
     id<MTLBuffer> destination_buffer = (id<MTLBuffer>)destination.metal_buffer;
     id<MTLBuffer> guest_memory_buffer = (id<MTLBuffer>)destination.guest_memory_metal_buffer;
-    id<MTLTexture> presentation_snapshot =
-        (id<MTLTexture>)destination.presentation_snapshot_texture;
     uint64_t aligned_destination_pitch = (uint64_t(destination.pitch) + 31u) & ~uint64_t(31u);
     uint64_t aligned_destination_height = (uint64_t(destination.height) + 31u) & ~uint64_t(31u);
-    if (aligned_destination_pitch > uint64_t(UINT32_MAX / 4) / aligned_destination_height) {
+    if (!snapshot_only && aligned_destination_height &&
+        aligned_destination_pitch >
+            uint64_t(UINT32_MAX / 4) / aligned_destination_height) {
       return reject_and_drain("tiled resolve surface byte extent exceeds 32-bit addressing");
     }
     uint32_t tiled_surface_extent =
-        GetTiledRgba8UpperBound(destination.pitch, destination.height, destination.pitch);
+        snapshot_only
+            ? 0
+            : GetTiledRgba8UpperBound(destination.pitch, destination.height,
+                                     destination.pitch);
     uint64_t destination_end = uint64_t(destination.buffer_offset) + tiled_surface_extent;
-    if ([destination_buffer storageMode] != MTLStorageModeShared || !tiled_surface_extent ||
-        destination_end > [destination_buffer length] || destination_end > UINT32_MAX) {
+    if (!snapshot_only &&
+        ([destination_buffer storageMode] != MTLStorageModeShared ||
+         !tiled_surface_extent || destination_end > [destination_buffer length] ||
+         destination_end > UINT32_MAX)) {
       return reject_and_drain(
           "tiled resolve destination is not a sufficiently large shared Metal buffer");
     }
@@ -3663,7 +4095,8 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
     }
 
     std::string setup_error;
-    if (!EnsureTiledResolvePipelineState(context, &setup_error) ||
+    if ((!snapshot_only &&
+         !EnsureTiledResolvePipelineState(context, &setup_error)) ||
         (selective_multisample_resolve &&
          !EnsureMultisampleSelectResolvePipelineState(context, &setup_error))) {
       return reject_and_drain(setup_error);
@@ -3678,10 +4111,9 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
     // Commit render work without waiting. The blit and compute command buffer is
     // on the same queue, so waiting for it completes every earlier submission.
     std::string finalize_error;
-    bool color_finalized =
-        selective_multisample_resolve
-            ? FinalizeOpenPipelineProbeCommandBuffer(context, &finalize_error)
-            : FinalizeProbeColorForConsumer(context, &finalize_error);
+    bool color_finalized = selective_multisample_resolve
+                               ? FinalizeOpenPipelineProbeCommandBuffer(context, &finalize_error)
+                               : FinalizeProbeColorForConsumer(context, &finalize_error);
     if (!color_finalized) {
       return reject_and_drain(finalize_error.empty()
                                   ? "failed to finalize pending render work for tiled resolve"
@@ -3692,8 +4124,7 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
       return reject_and_drain("failed to create tiled resolve command buffer");
     }
     if (selective_multisample_resolve) {
-      id<MTLComputeCommandEncoder> sample_resolve_encoder =
-          [command_buffer computeCommandEncoder];
+      id<MTLComputeCommandEncoder> sample_resolve_encoder = [command_buffer computeCommandEncoder];
       if (!sample_resolve_encoder) {
         return reject_and_drain("failed to create multisample select resolve encoder");
       }
@@ -3714,7 +4145,7 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
       NSUInteger sample_thread_height = std::max<NSUInteger>(
           1, std::min<NSUInteger>(resolve_height, sample_max_threads / sample_thread_width));
       [sample_resolve_encoder
-          dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
+                dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
           threadsPerThreadgroup:MTLSizeMake(sample_thread_width, sample_thread_height, 1)];
       [sample_resolve_encoder endEncoding];
       ++context->multisample_resolve_count;
@@ -3724,17 +4155,16 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
         if (!snapshot_encoder) {
           return reject_and_drain("failed to create selected-sample snapshot blit encoder");
         }
-        [snapshot_encoder
-               copyFromBuffer:staging_buffer
-                 sourceOffset:0
-            sourceBytesPerRow:row_pitch
-          sourceBytesPerImage:row_pitch * resolve_height
-                  sourceSize:MTLSizeMake(resolve_width, resolve_height, 1)
-                   toTexture:presentation_snapshot
-            destinationSlice:0
-            destinationLevel:0
-           destinationOrigin:MTLOriginMake(destination.presentation_snapshot_x,
-                                           destination.presentation_snapshot_y, 0)];
+        [snapshot_encoder copyFromBuffer:staging_buffer
+                            sourceOffset:0
+                       sourceBytesPerRow:row_pitch
+                     sourceBytesPerImage:row_pitch * resolve_height
+                              sourceSize:MTLSizeMake(resolve_width, resolve_height, 1)
+                               toTexture:presentation_snapshot
+                        destinationSlice:0
+                        destinationLevel:0
+                       destinationOrigin:MTLOriginMake(destination.presentation_snapshot_x,
+                                                       destination.presentation_snapshot_y, 0)];
         [snapshot_encoder endEncoding];
       }
     } else {
@@ -3766,29 +4196,35 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
       [blit_encoder endEncoding];
     }
 
-    id<MTLComputeCommandEncoder> tiled_compute_encoder = [command_buffer computeCommandEncoder];
-    if (!tiled_compute_encoder) {
-      return reject_and_drain("failed to create tiled resolve compute encoder");
+    if (!snapshot_only) {
+      id<MTLComputeCommandEncoder> tiled_compute_encoder =
+          [command_buffer computeCommandEncoder];
+      if (!tiled_compute_encoder) {
+        return reject_and_drain("failed to create tiled resolve compute encoder");
+      }
+      TiledResolveConstants constants = {
+          uint32_t(row_pitch), uint32_t(destination.buffer_offset),
+          destination.pitch,   destination.x,
+          destination.y,       resolve_width,
+          resolve_height,      destination.endian,
+      };
+      id<MTLComputePipelineState> pipeline_state =
+          context->tiled_resolve_pipeline_state;
+      [tiled_compute_encoder setComputePipelineState:pipeline_state];
+      [tiled_compute_encoder setBuffer:staging_buffer offset:0 atIndex:0];
+      [tiled_compute_encoder setBuffer:destination_buffer offset:0 atIndex:1];
+      [tiled_compute_encoder setBytes:&constants length:sizeof(constants) atIndex:2];
+      NSUInteger thread_width = std::max<NSUInteger>(
+          1, std::min<NSUInteger>(resolve_width,
+                                  [pipeline_state threadExecutionWidth]));
+      NSUInteger max_threads = [pipeline_state maxTotalThreadsPerThreadgroup];
+      NSUInteger thread_height = std::max<NSUInteger>(
+          1, std::min<NSUInteger>(resolve_height, max_threads / thread_width));
+      [tiled_compute_encoder
+                dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
+          threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
+      [tiled_compute_encoder endEncoding];
     }
-    TiledResolveConstants constants = {
-        uint32_t(row_pitch), uint32_t(destination.buffer_offset),
-        destination.pitch,   destination.x,
-        destination.y,       resolve_width,
-        resolve_height,      destination.endian,
-    };
-    id<MTLComputePipelineState> pipeline_state = context->tiled_resolve_pipeline_state;
-    [tiled_compute_encoder setComputePipelineState:pipeline_state];
-    [tiled_compute_encoder setBuffer:staging_buffer offset:0 atIndex:0];
-    [tiled_compute_encoder setBuffer:destination_buffer offset:0 atIndex:1];
-    [tiled_compute_encoder setBytes:&constants length:sizeof(constants) atIndex:2];
-    NSUInteger thread_width = std::max<NSUInteger>(
-        1, std::min<NSUInteger>(resolve_width, [pipeline_state threadExecutionWidth]));
-    NSUInteger max_threads = [pipeline_state maxTotalThreadsPerThreadgroup];
-    NSUInteger thread_height =
-        std::max<NSUInteger>(1, std::min<NSUInteger>(resolve_height, max_threads / thread_width));
-    [tiled_compute_encoder dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
-                     threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
-    [tiled_compute_encoder endEncoding];
 
     if (guest_memory_buffer) {
       id<MTLBlitCommandEncoder> mirror_encoder = [command_buffer blitCommandEncoder];
@@ -3871,6 +4307,291 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
                       source + size_t(row) * row_pitch, tight_row_pitch);
         }
       }
+    }
+    return true;
+  }
+}
+
+bool ResolvePipelineProbeDepthStencilContextToXenosTiled(
+    void* opaque_context, uint32_t width, uint32_t height, uint32_t source_x, uint32_t source_y,
+    uint32_t resolve_width, uint32_t resolve_height, bool depth_float24, bool depth_float24_round,
+    uint32_t depth_sample_select, const ProbeTiledResolveTarget& destination,
+    bool wait_for_completion, std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    if (!context || !context->depth_stencil_target) {
+      if (error_out) {
+        *error_out = "missing probe context or persistent depth/stencil target";
+      }
+      return false;
+    }
+    ProbeDepthStencilTarget* target = context->depth_stencil_target;
+
+    auto reject_and_drain = [&](const std::string& reason) {
+      std::string drain_error;
+      bool drained = true;
+      // A shared color context may own the open encoder that last wrote depth.
+      // Invalid metadata is still a fence, so drain every attached context.
+      for (PipelineProbeContext* attached_context : target->attached_contexts) {
+        std::string attached_error;
+        if (!WaitPendingPipelineProbeCommands(attached_context, &attached_error, nullptr)) {
+          drained = false;
+          if (drain_error.empty()) {
+            drain_error = attached_error;
+          }
+        }
+      }
+      if (error_out) {
+        *error_out = reason;
+        if (!drained && !drain_error.empty()) {
+          error_out->append("; prior depth/stencil work failed: ");
+          error_out->append(drain_error);
+        }
+      }
+      return false;
+    };
+
+    if (!target->texture || !target->initialized || !width || !height || target->width != width ||
+        target->height != height ||
+        [target->texture pixelFormat] != MTLPixelFormatDepth32Float_Stencil8) {
+      return reject_and_drain(
+          "persistent probe depth/stencil texture is unavailable or has a different size");
+    }
+    uint32_t host_sample = 0;
+    if (!GetProbeDepthSample(target->sample_count, depth_sample_select, host_sample)) {
+      return reject_and_drain("depth tiled resolve sample selection is invalid");
+    }
+    bool degenerate_zero_pitch = destination.pitch == 0;
+    if (!resolve_width || !resolve_height || source_x >= width || source_y >= height ||
+        resolve_width > width - source_x || resolve_height > height - source_y ||
+        !destination.metal_buffer || !destination.height ||
+        (!degenerate_zero_pitch && (destination.x >= destination.pitch ||
+                                    resolve_width > destination.pitch - destination.x)) ||
+        destination.y >= destination.height ||
+        resolve_height > destination.height - destination.y || destination.endian > 3 ||
+        (destination.buffer_offset & 3) || destination.buffer_offset > UINT32_MAX ||
+        destination.x > UINT32_MAX - resolve_width || destination.y > UINT32_MAX - resolve_height) {
+      return reject_and_drain("invalid depth tiled resolve rectangle, surface, buffer, or endian");
+    }
+
+    id<MTLBuffer> destination_buffer = (id<MTLBuffer>)destination.metal_buffer;
+    id<MTLBuffer> guest_memory_buffer = (id<MTLBuffer>)destination.guest_memory_metal_buffer;
+    uint32_t destination_right = destination.x + resolve_width;
+    uint32_t destination_bottom = destination.y + resolve_height;
+    uint32_t tiled_rect_upper_bound =
+        GetTiledRgba8UpperBound(destination_right, destination_bottom, destination.pitch);
+    uint64_t destination_end = uint64_t(destination.buffer_offset) + tiled_rect_upper_bound;
+    if ([destination_buffer storageMode] != MTLStorageModeShared || !tiled_rect_upper_bound ||
+        destination_end > [destination_buffer length] || destination_end > UINT32_MAX) {
+      return reject_and_drain(
+          "depth tiled resolve destination is not a sufficiently large shared Metal buffer");
+    }
+    if (guest_memory_buffer) {
+      uint64_t mirror_source_end = uint64_t(destination.guest_memory_copy_source_offset) +
+                                   destination.guest_memory_copy_length;
+      uint64_t mirror_destination_end = uint64_t(destination.guest_memory_copy_destination_offset) +
+                                        destination.guest_memory_copy_length;
+      if (!destination.guest_memory_copy_length ||
+          [guest_memory_buffer storageMode] != MTLStorageModeShared ||
+          mirror_source_end > [destination_buffer length] ||
+          mirror_destination_end > [guest_memory_buffer length]) {
+        return reject_and_drain(
+            "depth tiled resolve guest mirror range is invalid or not backed by shared storage");
+      }
+    } else if (destination.guest_memory_copy_length) {
+      return reject_and_drain("depth tiled resolve guest mirror range has no destination buffer");
+    }
+
+    id<MTLTexture> snapshot = (id<MTLTexture>)destination.depth_snapshot_texture;
+    uint32_t snapshot_width = snapshot ? uint32_t([snapshot width]) : 0;
+    uint32_t snapshot_height = snapshot ? uint32_t([snapshot height]) : 0;
+    if (snapshot &&
+        ([snapshot device] != context->device || [snapshot pixelFormat] != MTLPixelFormatR32Float ||
+         [snapshot textureType] != MTLTextureType2DArray || [snapshot arrayLength] < 1 ||
+         destination.depth_snapshot_x >= snapshot_width ||
+         destination.depth_snapshot_y >= snapshot_height ||
+         resolve_width > snapshot_width - destination.depth_snapshot_x ||
+         resolve_height > snapshot_height - destination.depth_snapshot_y)) {
+      return reject_and_drain("depth resolve snapshot texture is incompatible");
+    }
+    id<MTLTexture> packed_snapshot =
+        (id<MTLTexture>)destination.packed_depth_snapshot_texture;
+    uint32_t packed_snapshot_width =
+        packed_snapshot ? uint32_t([packed_snapshot width]) : 0;
+    uint32_t packed_snapshot_height =
+        packed_snapshot ? uint32_t([packed_snapshot height]) : 0;
+    if (packed_snapshot &&
+        ([packed_snapshot device] != context->device ||
+         [packed_snapshot pixelFormat] != MTLPixelFormatRGBA8Unorm ||
+         [packed_snapshot textureType] != MTLTextureType2DArray ||
+         [packed_snapshot arrayLength] < 1 ||
+         destination.packed_depth_snapshot_fetch_endian > 3 ||
+         destination.packed_depth_snapshot_x >= packed_snapshot_width ||
+         destination.packed_depth_snapshot_y >= packed_snapshot_height ||
+         resolve_width >
+             packed_snapshot_width - destination.packed_depth_snapshot_x ||
+         resolve_height >
+             packed_snapshot_height - destination.packed_depth_snapshot_y)) {
+      return reject_and_drain(
+          "packed depth resolve snapshot texture is incompatible");
+    }
+
+    std::string setup_error;
+    if (!EnsureDepthTiledResolvePipelineStates(context, &setup_error)) {
+      return reject_and_drain(setup_error);
+    }
+
+    // End any color encoder sharing this target. The resolve command uses the
+    // same queue, so commit order is the required draw -> copy ordering without
+    // a CPU stall.
+    PipelineProbeContext* previous_owner = target->open_owner;
+    if (previous_owner && !FinalizeOpenPipelineProbeCommandBuffer(previous_owner, &setup_error)) {
+      return reject_and_drain(setup_error.empty()
+                                  ? "failed to finalize pending depth/stencil render work"
+                                  : setup_error);
+    }
+    if (target->open_owner) {
+      return reject_and_drain("persistent depth/stencil target retained an open owner");
+    }
+
+    id<MTLTexture> stencil_view =
+        [target->texture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+    if (!stencil_view) {
+      return reject_and_drain("failed to create the depth resolve stencil texture view");
+    }
+    id<MTLCommandBuffer> command_buffer = [context->command_queue commandBuffer];
+    if (!command_buffer) {
+      [stencil_view release];
+      return reject_and_drain("failed to create depth tiled resolve command buffer");
+    }
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (!encoder) {
+      [stencil_view release];
+      return reject_and_drain("failed to create depth tiled resolve compute encoder");
+    }
+
+    DepthTiledResolveConstants constants = {
+        source_x,
+        source_y,
+        uint32_t(destination.buffer_offset),
+        destination.pitch,
+        destination.x,
+        destination.y,
+        resolve_width,
+        resolve_height,
+        destination.endian,
+        host_sample,
+        depth_float24 ? 1u : 0u,
+        depth_float24_round ? 1u : 0u,
+        snapshot ? 1u : 0u,
+        destination.depth_snapshot_x,
+        destination.depth_snapshot_y,
+        packed_snapshot ? 1u : 0u,
+        destination.packed_depth_snapshot_x,
+        destination.packed_depth_snapshot_y,
+        destination.packed_depth_snapshot_fetch_endian,
+    };
+    id<MTLComputePipelineState> pipeline_state =
+        target->sample_count > 1 ? context->multisample_depth_tiled_resolve_pipeline_state
+                                 : context->depth_tiled_resolve_pipeline_state;
+    [encoder setComputePipelineState:pipeline_state];
+    [encoder setTexture:target->texture atIndex:0];
+    [encoder setTexture:stencil_view atIndex:1];
+    [encoder setTexture:snapshot ? snapshot : context->depth_resolve_dummy_snapshot_texture
+                atIndex:2];
+    [encoder
+          setTexture:packed_snapshot
+                         ? packed_snapshot
+                         : context->depth_resolve_dummy_packed_snapshot_texture
+             atIndex:3];
+    [encoder setBuffer:destination_buffer offset:0 atIndex:0];
+    [encoder setBytes:&constants length:sizeof(constants) atIndex:1];
+    NSUInteger thread_width = std::max<NSUInteger>(
+        1, std::min<NSUInteger>(resolve_width, [pipeline_state threadExecutionWidth]));
+    NSUInteger max_threads = [pipeline_state maxTotalThreadsPerThreadgroup];
+    NSUInteger thread_height =
+        std::max<NSUInteger>(1, std::min<NSUInteger>(resolve_height, max_threads / thread_width));
+    [encoder dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
+        threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
+    [encoder endEncoding];
+
+    if (guest_memory_buffer) {
+      id<MTLBlitCommandEncoder> mirror_encoder = [command_buffer blitCommandEncoder];
+      if (!mirror_encoder) {
+        [stencil_view release];
+        return reject_and_drain("failed to create depth tiled resolve guest mirror encoder");
+      }
+      [mirror_encoder copyFromBuffer:destination_buffer
+                        sourceOffset:destination.guest_memory_copy_source_offset
+                            toBuffer:guest_memory_buffer
+                   destinationOffset:destination.guest_memory_copy_destination_offset
+                                size:destination.guest_memory_copy_length];
+      [mirror_encoder endEncoding];
+    }
+
+    if (destination.submission_callback && destination.submission_length) {
+      destination.submission_callback(destination.submission_callback_context,
+                                      destination.submission_start, destination.submission_length);
+    }
+    if (!wait_for_completion) {
+      CommittedProbeCommandBuffer committed;
+      committed.command_buffer = [command_buffer retain];
+      committed.auxiliary_submission_count = 1;
+      committed.async_failure_callback = destination.async_failure_callback;
+      committed.async_failure_callback_context = destination.async_failure_callback_context;
+      committed.async_failure_start = destination.async_failure_start;
+      committed.async_failure_length = destination.async_failure_length;
+      try {
+        context->committed_command_buffers.push_back(committed);
+      } catch (...) {
+        [committed.command_buffer release];
+        [stencil_view release];
+        if (error_out) {
+          *error_out = "failed to retain asynchronous depth tiled resolve submission";
+        }
+        return false;
+      }
+      [command_buffer commit];
+      [stencil_view release];
+      return true;
+    }
+
+    [command_buffer commit];
+    [stencil_view release];
+    [command_buffer waitUntilCompleted];
+    std::string prior_error;
+    bool prior_commands_succeeded = ConsumeCompletedPipelineProbeCommands(context, &prior_error);
+    if (previous_owner && previous_owner != context) {
+      std::string owner_error;
+      if (!ConsumeCompletedPipelineProbeCommands(previous_owner, &owner_error)) {
+        prior_commands_succeeded = false;
+        if (!owner_error.empty()) {
+          if (!prior_error.empty()) {
+            prior_error.append("; ");
+          }
+          prior_error.append(owner_error);
+        }
+      }
+    }
+    bool resolve_succeeded = [command_buffer status] == MTLCommandBufferStatusCompleted;
+    if (!prior_commands_succeeded || !resolve_succeeded) {
+      if (error_out) {
+        error_out->clear();
+        if (!prior_commands_succeeded) {
+          error_out->append("prior depth/stencil work failed: ");
+          error_out->append(prior_error);
+        }
+        if (!resolve_succeeded) {
+          if (!error_out->empty()) {
+            error_out->append("; ");
+          }
+          NSError* command_error = [command_buffer error];
+          const char* description =
+              command_error ? [[command_error localizedDescription] UTF8String] : nullptr;
+          error_out->append(description ? description : "depth tiled resolve compute failed");
+        }
+      }
+      return false;
     }
     return true;
   }
