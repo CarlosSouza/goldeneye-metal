@@ -56,6 +56,18 @@ address = 0x82199944
 name = "ge_diag_vdswap"
 registers = ["r31", "r30"]
 after_instruction = true
+# Wake the host WAIT_REG_MEM only after either retail fence-clear store has
+# become guest-visible. Both sites retain the fence base in r11.
+[[midasm_hook]]
+address = 0x82199038
+name = "ge_notify_wait_reg_mem_write"
+registers = ["r11"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x8219922C
+name = "ge_notify_wait_reg_mem_write"
+registers = ["r11"]
+after_instruction = true
 [[midasm_hook]]
 address = 0x821A4D50
 name = "ge_trace_render_submit"

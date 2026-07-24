@@ -63,6 +63,32 @@ constexpr uint32_t kMaxAsyncProbeSubmissionsBetweenGlobalWaits = 2048;
 constexpr uint64_t kPipelineArchiveQuietSwaps = 120;
 constexpr uint64_t kPipelineArchiveMaximumDirtySwaps = 600;
 
+uint64_t GetCompatibleExactResolvedSurfaceFetchKey(
+    const xenos::xe_gpu_texture_fetch_t& fetch) {
+  if (fetch.type != xenos::FetchConstantType::kTexture || !fetch.tiled ||
+      fetch.format != xenos::TextureFormat::k_8_8_8_8 ||
+      fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked ||
+      fetch.packed_mips || fetch.mip_address || fetch.mip_min_level || fetch.mip_max_level ||
+      texture_util::IsAnySignSigned(texture_util::SwizzleSigns(fetch))) {
+    return 0;
+  }
+  uint32_t width_minus_1 = 0;
+  uint32_t height_minus_1 = 0;
+  uint32_t depth_or_array_size_minus_1 = 0;
+  uint32_t base_page = 0;
+  texture_util::GetSubresourcesFromFetchConstant(
+      fetch, &width_minus_1, &height_minus_1, &depth_or_array_size_minus_1, &base_page, nullptr,
+      nullptr, nullptr);
+  uint32_t width = width_minus_1 + 1;
+  uint32_t height = height_minus_1 + 1;
+  uint32_t pitch = uint32_t(fetch.pitch) << 5;
+  if (!base_page || depth_or_array_size_minus_1 || !width || width != pitch || !height) {
+    return 0;
+  }
+  return uint64_t(base_page) | (uint64_t(pitch) << 17) | (uint64_t(height) << 31) |
+         (uint64_t(fetch.endianness) << 45);
+}
+
 constexpr uint32_t GetMetalSampleCount(xenos::MsaaSamples msaa_samples) {
   return uint32_t(1) << std::min(uint32_t(msaa_samples), uint32_t(2));
 }
@@ -1417,7 +1443,10 @@ bool TransformGuestPositionForHost(const float* guest_position, reg::PA_CL_VTE_C
 
 MetalCommandProcessor::MetalCommandProcessor(GraphicsSystem* graphics_system,
                                              system::KernelState* kernel_state)
-    : CommandProcessor(graphics_system, kernel_state) {}
+    : CommandProcessor(graphics_system, kernel_state),
+      wait_reg_mem_memory_change_event_(rex::thread::Event::CreateAutoResetEvent(false)) {
+  assert_not_null(wait_reg_mem_memory_change_event_);
+}
 
 MetalCommandProcessor::~MetalCommandProcessor() {
   ShutdownPipelineArchive();
@@ -1782,8 +1811,8 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     swap_synchronized = false;
     ++pipeline_probe_failure_count_;
   }
-  // Most frames publish through EVENT_WRITE_SHD/EXT. Keep swap as a strict
-  // fallback fence for streams that reach presentation without such an event.
+  // Keep swap as a strict fallback fence for streams that reach presentation
+  // without a shader-completion event.
   if (swap_synchronized && !PublishPendingGpuTiledResolveRangesToGuest()) {
     ++pipeline_probe_failure_count_;
   } else if (!swap_synchronized && shared_memory_) {
@@ -1815,6 +1844,8 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     std::fprintf(stderr,
                  "[metal] async probe summary#%u submitted=%llu waits=%llu waited=%llu "
                  "max_pending=%u gpu_tiled_resolves=%llu pixels=%llu fallbacks=%llu "
+                 "alias_mirrors=%llu mirror_bytes=%llu "
+                 "direct_resolved_texture_draws=%llu bindings=%llu "
                  "publication_events=%llu publication_ranges=%llu->%llu "
                  "publication_bytes=%llu completion_writes=%llu "
                  "completion_batches=%llu\n",
@@ -1825,12 +1856,27 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                  static_cast<unsigned long long>(gpu_tiled_resolve_count_),
                  static_cast<unsigned long long>(gpu_tiled_resolve_pixel_count_),
                  static_cast<unsigned long long>(gpu_tiled_resolve_fallback_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_mirror_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_mirror_byte_count_),
+                 static_cast<unsigned long long>(gpu_resolved_texture_draw_count_),
+                 static_cast<unsigned long long>(gpu_resolved_texture_binding_count_),
                  static_cast<unsigned long long>(gpu_publication_event_count_),
                  static_cast<unsigned long long>(gpu_publication_input_range_count_),
                  static_cast<unsigned long long>(gpu_publication_merged_range_count_),
                  static_cast<unsigned long long>(gpu_publication_byte_count_),
                  static_cast<unsigned long long>(gpu_completion_write_count_),
                  static_cast<unsigned long long>(gpu_completion_batch_count_));
+    if (shared_memory_) {
+      MetalSharedMemory::CompletionStagingStats staging_stats =
+          shared_memory_->completion_staging_stats();
+      std::fprintf(
+          stderr,
+          "[metal] completion staging#%u allocations=%llu reuses=%llu idle=%zu "
+          "in_flight=%zu peak_in_flight=%zu\n",
+          metal_swap_index, static_cast<unsigned long long>(staging_stats.allocations),
+          static_cast<unsigned long long>(staging_stats.reuses), staging_stats.idle_buffers,
+          staging_stats.in_flight_buffers, staging_stats.peak_in_flight_buffers);
+    }
     std::fflush(stderr);
   }
   bool log_draw_route_summary = ShouldLogMetalDiagnostic(metal_swap_index, 32, 0x3F);
@@ -1879,23 +1925,18 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         uint32_t height = height_minus_1 + 1;
         uint32_t base_physical = base_page ? (base_page << 12) : frontbuffer_ptr;
         uint32_t fetch_pitch = fetch.pitch << 5;
-        uint32_t required_tiled_extent =
-            fetch_pitch && fetch.tiled
-                ? texture_util::GetTiledAddressUpperBound2D(fetch_pitch, height, fetch_pitch, 2)
-                : 0;
-        const ExactResolvedSurface& exact = exact_resolved_surface_;
+        void* snapshot_texture = nullptr;
+        uint32_t snapshot_width = 0;
+        uint32_t snapshot_height = 0;
+        uint32_t snapshot_swizzle = 0;
+        uint8_t snapshot_signs = 0;
         bool exact_gpu_compatible =
-            exact.valid && exact.gpu_snapshot && exact.metal_texture && fetch.tiled &&
-            GetBaseFormat(fetch.format) == xenos::TextureFormat::k_8_8_8_8 &&
-            fetch.dimension == xenos::DataDimension::k2DOrStacked &&
-            depth_or_array_size_minus_1 == 0 && width && height && fetch_pitch >= width &&
-            base_physical == exact.base && last_copy_dest_base_ == exact.base &&
-            fetch_pitch == exact.pitch && uint32_t(fetch.endianness) == uint32_t(exact.endian) &&
-            exact.bgra_height >= height && exact.texture_width >= width &&
-            exact.texture_height >= height && required_tiled_extent &&
-            exact.tiled_extent >= required_tiled_extent;
+            base_physical == last_copy_dest_base_ &&
+            GetExactResolvedSurfaceTextureForFetch(
+                fetch, snapshot_texture, snapshot_width, snapshot_height, snapshot_swizzle,
+                snapshot_signs) &&
+            snapshot_width == width && snapshot_height == height;
         if (exact_gpu_compatible) {
-          void* snapshot_texture = exact.metal_texture;
           uint32_t guest_swizzle = fetch.swizzle;
           refreshed = presenter->RefreshGuestOutput(
               width, height, frontbuffer_width, frontbuffer_height,
@@ -1927,7 +1968,8 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               std::fprintf(stderr,
                            "[metal] direct snapshot present#%u base=0x%08x "
                            "size=%ux%u pitch=%u swiz=0x%03x\n",
-                           direct_index, exact.base, width, height, exact.pitch, guest_swizzle);
+                           direct_index, base_physical, width, height, fetch_pitch,
+                           guest_swizzle);
               std::fflush(stderr);
             }
           }
@@ -2484,13 +2526,13 @@ void MetalCommandProcessor::ReportProfileWindow() {
     const WaitRegMemProfileEntry& entry = *wait_reg_mem_entries[i];
     std::fprintf(stderr,
                  "[metal-profile] wait-reg-mem swaps=%llu-%llu rank=%zu source=%s address=0x%08x "
-                 "reference=0x%08x mask=0x%08x operation=%u wait=0x%08x last=0x%08x calls=%llu "
-                 "polls=%llu avg_polls_per_call=%.3f max_polls=%llu total_ns=%llu "
+                 "reference=0x%08x mask=0x%08x operation=%u wait=0x%08x first=0x%08x "
+                 "last=0x%08x calls=%llu polls=%llu avg_polls_per_call=%.3f max_polls=%llu total_ns=%llu "
                  "avg_ns_per_swap=%llu max_ns=%llu unmatched=%llu timeouts=%llu\n",
                  static_cast<unsigned long long>(first_swap),
                  static_cast<unsigned long long>(profiled_swap_count_), i + 1,
                  entry.is_memory ? "memory" : "register", entry.poll_address, entry.reference,
-                 entry.mask, entry.operation, entry.wait, entry.last_value,
+                 entry.mask, entry.operation, entry.wait, entry.first_value, entry.last_value,
                  static_cast<unsigned long long>(entry.call_count),
                  static_cast<unsigned long long>(entry.poll_count),
                  entry.call_count ? double(entry.poll_count) / double(entry.call_count) : 0.0,
@@ -2508,9 +2550,9 @@ void MetalCommandProcessor::ReportProfileWindow() {
 void MetalCommandProcessor::OnWaitRegMemComplete(bool is_memory, uint32_t poll_address,
                                                  uint32_t reference, uint32_t mask,
                                                  uint32_t operation, uint32_t wait,
-                                                 uint32_t last_value, uint64_t poll_count,
-                                                 uint64_t duration_ns, bool matched,
-                                                 bool timed_out) {
+                                                 uint32_t last_value, uint32_t first_value,
+                                                 uint64_t poll_count, uint64_t duration_ns,
+                                                 bool matched, bool timed_out) {
   if (!profile_enabled_) {
     return;
   }
@@ -2532,6 +2574,7 @@ void MetalCommandProcessor::OnWaitRegMemComplete(bool is_memory, uint32_t poll_a
   entry.mask = mask;
   entry.operation = operation;
   entry.wait = wait;
+  entry.first_value = first_value;
   entry.last_value = last_value;
   ++entry.call_count;
   entry.poll_count += poll_count;
@@ -2584,7 +2627,7 @@ bool MetalCommandProcessor::SetupContext() {
   SpirvShaderTranslator::Features metal_shader_features(true);
   metal_shader_features.image_view_format_swizzle = false;
   shader_translator_ =
-      std::make_unique<SpirvShaderTranslator>(metal_shader_features, false, false, false);
+      std::make_unique<SpirvShaderTranslator>(metal_shader_features, true, false, false);
   if (auto* provider = dynamic_cast<ui::metal::MetalProvider*>(graphics_system_->provider())) {
     metal_device_ = provider->metal_device();
     if (memory_) {
@@ -2594,6 +2637,8 @@ bool MetalCommandProcessor::SetupContext() {
         shared_memory_.reset();
       }
       if (shared_memory_) {
+        wait_reg_mem_memory_change_watch_ =
+            shared_memory_->RegisterGlobalWatch(WaitRegMemMemoryChangeWatchCallback, this);
         exact_resolved_surface_watch_ =
             shared_memory_->RegisterGlobalWatch(ExactResolvedSurfaceWatchCallback, this);
         texture_cache_ =
@@ -2655,7 +2700,12 @@ void MetalCommandProcessor::ClearCaches() {
   }
   CommandProcessor::ClearCaches();
   ReleaseExactResolvedSurfaceSnapshot();
-  exact_resolved_surface_ = {};
+  {
+    std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+    exact_resolved_surface_ = {};
+  }
+  exact_resolved_surface_invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  observed_exact_resolved_surface_fetches_.clear();
   // Phase 0.5: mirror VulkanCommandProcessor::ClearCaches for the shared-memory /
   // texture-cache lifecycle, scoped to base-class methods present in Metal.
   if (texture_cache_) {
@@ -2671,7 +2721,7 @@ void MetalCommandProcessor::ClearCaches() {
   }
   for (auto& depth_entry : host_depth_stencil_targets_) {
     if (depth_entry.second.context) {
-      ResetPipelineProbeContext(depth_entry.second.context);
+      ResetPipelineProbeDepthStencilTarget(depth_entry.second.context);
     }
   }
 }
@@ -2694,7 +2744,12 @@ void MetalCommandProcessor::ShutdownContext() {
     shared_memory_->SetHostResourceMutationCallback({});
     shared_memory_->SetGpuResourceMutationCallback({});
   }
-  exact_resolved_surface_ = {};
+  {
+    std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+    exact_resolved_surface_ = {};
+  }
+  exact_resolved_surface_invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  observed_exact_resolved_surface_fetches_.clear();
   ShutdownPipelineArchive();
   REXLOG_INFO("Metal shader cache shutdown: {} shaders cached, {} translated, {} failed",
               shaders_.size(), translated_shader_count_, failed_shader_translation_count_);
@@ -2736,6 +2791,10 @@ void MetalCommandProcessor::ShutdownContext() {
   host_vertex_color_pixel_fragment_library_ = nullptr;
   ReleaseMslLibrary(dummy_fragment_library_);
   dummy_fragment_library_ = nullptr;
+  ReleaseMslLibrary(depth_float24_truncating_fragment_library_);
+  depth_float24_truncating_fragment_library_ = nullptr;
+  ReleaseMslLibrary(depth_float24_rounding_fragment_library_);
+  depth_float24_rounding_fragment_library_ = nullptr;
   ReleaseMslLibrary(solid_fragment_library_);
   solid_fragment_library_ = nullptr;
   ReleasePipelineProbeContext(pipeline_probe_context_);
@@ -2759,7 +2818,12 @@ void MetalCommandProcessor::ShutdownContext() {
   shaders_.clear();
   texture_cache_.reset();
   primitive_processor_.reset();
+  EndWaitRegMemMemoryChange();
   if (shared_memory_) {
+    if (wait_reg_mem_memory_change_watch_) {
+      shared_memory_->UnregisterGlobalWatch(wait_reg_mem_memory_change_watch_);
+      wait_reg_mem_memory_change_watch_ = nullptr;
+    }
     if (exact_resolved_surface_watch_) {
       shared_memory_->UnregisterGlobalWatch(exact_resolved_surface_watch_);
       exact_resolved_surface_watch_ = nullptr;
@@ -2781,45 +2845,30 @@ void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
+bool MetalCommandProcessor::WriteGpuMemory(uint32_t address, const void* data, size_t length) {
+  uint32_t physical_address = address & (SharedMemory::kBufferSize - 1);
+  if (!data || !length || physical_address >= SharedMemory::kBufferSize ||
+      length > SharedMemory::kBufferSize - physical_address ||
+      !CommandProcessor::WriteGpuMemory(physical_address, data, length)) {
+    return false;
+  }
+
+  // Ordinary packet writes, including SCREEN_EXT_RPT, are immediately
+  // authoritative in the guest physical mapping. Invalidate Metal's resident
+  // copy so a later GPU consumer reloads these bytes instead of trusting stale
+  // data. True EVENT_WRITE_SHD fences use the ordered hook below.
+  if (shared_memory_) {
+    shared_memory_->MemoryInvalidationCallback(physical_address, uint32_t(length), true);
+  }
+  return true;
+}
+
 bool MetalCommandProcessor::WriteGpuCompletionMemory(uint32_t address, const void* data,
                                                      size_t length) {
   uint32_t physical_address = address & (SharedMemory::kBufferSize - 1);
   if (!data || !length || length > PendingGpuCompletionWrite::kMaxDataLength ||
       physical_address >= SharedMemory::kBufferSize ||
       length > SharedMemory::kBufferSize - physical_address) {
-    return false;
-  }
-
-  // With no pending resident-to-guest publication, preserve the base command
-  // processor's immediate guest-visible EVENT_WRITE semantics. This keeps the
-  // marker before any later draw packet. Invalidate the separate resident
-  // Metal copy so a later GPU consumer reloads the marker rather than trusting
-  // stale bytes. A pending resolve is different: its completion must stay
-  // ordered behind the publication, so it takes the queued path below.
-  if (pending_gpu_tiled_resolve_publication_ranges_.empty()) {
-    if (!pending_gpu_completion_writes_.empty() && !FlushGpuCompletionMemoryWrites()) {
-      return false;
-    }
-    if (!CommandProcessor::WriteGpuCompletionMemory(physical_address, data, length)) {
-      return false;
-    }
-    if (shared_memory_) {
-      shared_memory_->MemoryInvalidationCallback(physical_address, uint32_t(length), true);
-    }
-    ++gpu_completion_write_count_;
-    return true;
-  }
-
-  // If the same bytes are written twice in one ring batch, expose the earlier
-  // value first. This preserves polling handshakes that use transitions on one
-  // fence while still batching the hundreds of independent completion writes
-  // GoldenEye emits in a frame.
-  bool overlaps_pending_write = false;
-  for (const PendingGpuCompletionWrite& pending : pending_gpu_completion_writes_) {
-    overlaps_pending_write |=
-        RangesOverlap(physical_address, uint32_t(length), pending.address, pending.length);
-  }
-  if (overlaps_pending_write && !FlushGpuCompletionMemoryWrites()) {
     return false;
   }
 
@@ -2924,6 +2973,84 @@ void MetalCommandProcessor::PrepareForWait() {
     ++pipeline_probe_failure_count_;
   }
   CommandProcessor::PrepareForWait();
+}
+
+bool MetalCommandProcessor::WaitForGpuCompletionMemoryWrite(uint32_t address, uint32_t length) {
+  return shared_memory_ &&
+         shared_memory_->WaitForGpuOrderedGuestMemoryWrite(
+             address & (SharedMemory::kBufferSize - 1), length);
+}
+
+bool MetalCommandProcessor::BeginWaitRegMemMemoryChange(uint32_t address, uint32_t length) {
+  if (!shared_memory_ || !wait_reg_mem_memory_change_watch_ ||
+      !wait_reg_mem_memory_change_event_ || !length) {
+    return false;
+  }
+  uint32_t physical_address = address & (SharedMemory::kBufferSize - 1);
+  if (physical_address >= SharedMemory::kBufferSize ||
+      length > SharedMemory::kBufferSize - physical_address) {
+    return false;
+  }
+
+  // Make the old range inactive before clearing a retained signal. Publishing
+  // the first address last means the callback's acquire load also observes the
+  // corresponding end address.
+  wait_reg_mem_memory_change_first_.store(UINT32_MAX, std::memory_order_release);
+  wait_reg_mem_memory_change_event_->Reset();
+  wait_reg_mem_memory_change_last_.store(physical_address + length - 1,
+                                         std::memory_order_relaxed);
+  wait_reg_mem_memory_change_first_.store(physical_address, std::memory_order_release);
+  return true;
+}
+
+bool MetalCommandProcessor::WaitForWaitRegMemMemoryChange(
+    std::chrono::milliseconds timeout) {
+  if (!wait_reg_mem_memory_change_event_ ||
+      wait_reg_mem_memory_change_first_.load(std::memory_order_acquire) == UINT32_MAX) {
+    return false;
+  }
+  timeout = std::max(timeout, std::chrono::milliseconds(0));
+  timeout = std::min(timeout, std::chrono::milliseconds(1));
+  rex::thread::WaitResult result =
+      rex::thread::Wait(wait_reg_mem_memory_change_event_.get(), false, timeout);
+  return result != rex::thread::WaitResult::kFailed;
+}
+
+void MetalCommandProcessor::EndWaitRegMemMemoryChange() {
+  wait_reg_mem_memory_change_first_.store(UINT32_MAX, std::memory_order_release);
+}
+
+void MetalCommandProcessor::NotifyWaitRegMemMemoryWrite(uint32_t address, uint32_t length) {
+  if (!wait_reg_mem_memory_change_event_ || !length) {
+    return;
+  }
+  // Recompiled stores carry a guest virtual address. In particular, the
+  // 0xE0000000 physical alias has a one-page bias, so masking the address is
+  // not sufficient (0xffc9a004 maps to physical 0x1fc9b004).
+  uint32_t physical_address = memory_ ? memory_->GetPhysicalAddress(address) : UINT32_MAX;
+  // SharedMemory's global-watch callback already reports physical addresses.
+  if (physical_address == UINT32_MAX && address < SharedMemory::kBufferSize) {
+    physical_address = address;
+  }
+  if (physical_address == UINT32_MAX) {
+    return;
+  }
+  if (length > SharedMemory::kBufferSize - physical_address) {
+    return;
+  }
+  uint32_t wait_first =
+      wait_reg_mem_memory_change_first_.load(std::memory_order_acquire);
+  uint32_t wait_last =
+      wait_reg_mem_memory_change_last_.load(std::memory_order_relaxed);
+  uint32_t write_last = physical_address + length - 1;
+  bool overlaps = wait_first != UINT32_MAX && physical_address <= wait_last &&
+                  write_last >= wait_first;
+  if (wait_first == UINT32_MAX) {
+    return;
+  }
+  if (overlaps) {
+    wait_reg_mem_memory_change_event_->Set();
+  }
 }
 
 bool MetalCommandProcessor::PublishPendingGpuTiledResolveRangesToGuest() {
@@ -3378,13 +3505,9 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     if (!register_color_candidate_draw) {
       return 0;
     }
-    uint32_t shader_color_mask = pixel_shader ? uint32_t(pixel_shader->writes_color_targets()) : 0;
-    if (shader_color_mask) {
-      uint32_t normalized_shader_mask =
-          draw_util::GetNormalizedColorMask(*register_file_, shader_color_mask);
-      if (normalized_shader_mask) {
-        return normalized_shader_mask;
-      }
+    if (pixel_shader) {
+      return draw_util::GetNormalizedColorMask(
+          *register_file_, uint32_t(pixel_shader->writes_color_targets()));
     }
     return register_color_mask_all;
   };
@@ -5591,10 +5714,26 @@ bool MetalCommandProcessor::IssueCopy() {
     return (source_base_delta / pitch_tiles) * tile_height_pixels +
            ((raw_source_y_samples % xenos::kEdramTileHeightSamples) >> sample_count_log2_y);
   };
+  xenos::CopySampleSelect pending_slice_sample_select = xenos::CopySampleSelect::k0;
+  bool pending_slice_transform_compatible = false;
+  if (register_file_ && active_copy_control.copy_src_select < xenos::kMaxColorRenderTargets) {
+    reg::RB_SURFACE_INFO surface_info = register_file_->Get<reg::RB_SURFACE_INFO>();
+    reg::RB_COLOR_INFO color_info = register_file_->Get<reg::RB_COLOR_INFO>(
+        reg::RB_COLOR_INFO::rt_register_indices[uint32_t(active_copy_control.copy_src_select)]);
+    pending_slice_sample_select = draw_util::SanitizeCopySampleSelect(
+        active_copy_control.copy_sample_select, surface_info.msaa_samples, false);
+    pending_slice_transform_compatible =
+        active_copy_control.copy_command == xenos::CopyCommand::kConvert &&
+        color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+        active_copy_dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
+        active_copy_dest_info.copy_dest_number ==
+            xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
+        !active_copy_dest_info.copy_dest_array && !active_copy_dest_info.copy_dest_slice &&
+        !active_copy_dest_info.copy_dest_exp_bias && active_copy_dest_info.copy_dest_swap &&
+        uint32_t(active_copy_dest_info.copy_dest_endian) <= 3;
+  }
   if (!wrote_source_resolve && !resolve_info_valid && active_copy_valid && memory_ &&
-      register_file_ && resolve_host_rt_context &&
-      active_copy_dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
-      !active_copy_dest_info.copy_dest_array &&
+      register_file_ && resolve_host_rt_context && pending_slice_transform_compatible &&
       active_copy_control.copy_src_select < xenos::kMaxColorRenderTargets) {
     uint32_t resolve_width = fallback_output_width_;
     uint32_t resolve_height = fallback_output_height_;
@@ -5610,9 +5749,10 @@ bool MetalCommandProcessor::IssueCopy() {
     if (source_rect_width && source_rect_height && source_rect_x <= resolve_width &&
         host_source_y <= resolve_height && source_rect_width <= resolve_width - source_rect_x &&
         source_rect_height <= resolve_height - host_source_y &&
-        ReadPipelineProbeContextRect(resolve_host_rt_context, resolve_width, resolve_height,
-                                     source_rect_x, host_source_y, source_rect_width,
-                                     source_rect_height, slice_bgra, &slice_error)) {
+        ReadPipelineProbeContextRectSampleSelected(
+            resolve_host_rt_context, resolve_width, resolve_height, source_rect_x, host_source_y,
+            source_rect_width, source_rect_height, uint32_t(pending_slice_sample_select),
+            slice_bgra, &slice_error)) {
       PendingReadbackResolveSlice slice;
       slice.copy_dest_base = last_copy_dest_base_;
       slice.pitch = std::max<uint32_t>(active_copy_dest_pitch.copy_dest_pitch, 1);
@@ -5735,7 +5875,29 @@ bool MetalCommandProcessor::IssueCopy() {
           dest_height = std::max(dest_height, write_dest_y + copy_height);
         }
       }
-      if (MetalGpuTiledResolveEnabled() && resolve_host_rt_context && shared_memory_ &&
+      xenos::ColorRenderTargetFormat source_color_format =
+          xenos::ColorRenderTargetFormat(source_edram_info.format);
+      xenos::CopySampleSelect copy_sample_select =
+          resolve_info.copy_dest_coordinate_info.copy_sample_select;
+      bool selective_msaa_copy =
+          (source_edram_info.msaa_samples == xenos::MsaaSamples::k2X &&
+           copy_sample_select != xenos::CopySampleSelect::k01) ||
+          (source_edram_info.msaa_samples == xenos::MsaaSamples::k4X &&
+           copy_sample_select != xenos::CopySampleSelect::k0123);
+      bool direct_host_rt_transform_compatible =
+          !resolve_info.IsCopyingDepth() &&
+          resolve_info.rb_copy_control.copy_command == xenos::CopyCommand::kConvert &&
+          source_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+          resolve_info.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
+          resolve_info.copy_dest_info.copy_dest_number ==
+              xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
+          !resolve_info.copy_dest_info.copy_dest_array &&
+          !resolve_info.copy_dest_info.copy_dest_slice &&
+          !resolve_info.copy_dest_info.copy_dest_exp_bias &&
+          resolve_info.copy_dest_info.copy_dest_swap &&
+          uint32_t(resolve_info.copy_dest_info.copy_dest_endian) <= 3;
+      if (MetalGpuTiledResolveEnabled() && direct_host_rt_transform_compatible &&
+          resolve_host_rt_context && shared_memory_ &&
           shared_memory_->buffer() && copy_width && copy_height &&
           pending_readback_resolve_slices_.empty() && host_source_rect_x <= resolve_width &&
           host_source_rect_y <= resolve_height &&
@@ -5752,8 +5914,56 @@ bool MetalCommandProcessor::IssueCopy() {
         uint32_t dirty_start = dirty_range_valid ? uint32_t(dirty_start_unclamped) : 0;
         uint32_t dirty_length =
             dirty_range_valid ? uint32_t(dirty_end_unclamped - dirty_start_unclamped) : 0;
-        bool exact_cache_candidate = !rect_x && !write_dest_y && copy_width == dest_pitch &&
-                                     copy_height >= fallback_output_height_;
+        // GoldenEye builds its 1280x720 post-process input as three contiguous
+        // full-width resolves (256 + 256 + 208 rows). Mirror only the exact
+        // compatible resolve form into one linear Metal texture so the
+        // following draw can sample it without a GPU -> CPU wait, CPU untile,
+        // and CPU -> GPU texture upload.
+        uint32_t exact_snapshot_height = fallback_output_height_;
+        uint32_t exact_snapshot_y = write_dest_y;
+        uint32_t exact_snapshot_base = write_dest_base;
+        uint64_t raw_dest_offset =
+            uint64_t(exact_snapshot_y) * uint64_t(dest_pitch) * 4;
+        bool raw_dest_matches_snapshot =
+            uint64_t(resolve_info.copy_dest_base) ==
+            uint64_t(exact_snapshot_base) + raw_dest_offset;
+        uint32_t exact_snapshot_extent =
+            exact_snapshot_height
+                ? texture_util::GetTiledAddressUpperBound2D(
+                      dest_pitch, exact_snapshot_height, dest_pitch, 2)
+                : 0;
+        bool exact_sample_compatible =
+            (source_edram_info.msaa_samples == xenos::MsaaSamples::k1X &&
+             copy_sample_select == xenos::CopySampleSelect::k0) ||
+            (source_edram_info.msaa_samples == xenos::MsaaSamples::k2X &&
+             copy_sample_select == xenos::CopySampleSelect::k01) ||
+            (source_edram_info.msaa_samples == xenos::MsaaSamples::k4X &&
+             copy_sample_select == xenos::CopySampleSelect::k0123);
+        bool exact_transform_compatible =
+            !resolve_info.IsCopyingDepth() &&
+            resolve_info.rb_copy_control.copy_command == xenos::CopyCommand::kConvert &&
+            source_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+            resolve_info.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
+            resolve_info.copy_dest_info.copy_dest_number ==
+                xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
+            !resolve_info.copy_dest_info.copy_dest_array &&
+            !resolve_info.copy_dest_info.copy_dest_slice &&
+            !resolve_info.copy_dest_info.copy_dest_exp_bias &&
+            resolve_info.copy_dest_info.copy_dest_swap && exact_sample_compatible;
+        uint64_t exact_resolve_signature =
+            uint64_t(resolve_info.copy_dest_info.value) |
+            (uint64_t(resolve_info.rb_copy_control.copy_command) << 32) |
+            (uint64_t(copy_sample_select) << 34) |
+            (uint64_t(source_edram_info.msaa_samples) << 37) |
+            (uint64_t(source_color_format) << 39);
+        bool exact_snapshot_candidate =
+            exact_transform_compatible && !rect_x && !rect_y && !source_rect_x &&
+            !host_source_rect_x && copy_width == dest_pitch && exact_snapshot_height &&
+            exact_snapshot_y <= exact_snapshot_height &&
+            copy_height <= exact_snapshot_height - exact_snapshot_y &&
+            !(exact_snapshot_y & 31u) && raw_dest_matches_snapshot && exact_snapshot_base &&
+            exact_snapshot_base < SharedMemory::kBufferSize && exact_snapshot_extent &&
+            exact_snapshot_extent <= SharedMemory::kBufferSize - exact_snapshot_base;
         std::string gpu_resolve_error;
         ProbeTiledResolveTarget gpu_destination = {
             shared_memory_->buffer(),
@@ -5763,11 +5973,47 @@ bool MetalCommandProcessor::IssueCopy() {
             rect_x,
             write_dest_y,
             uint32_t(resolve_info.copy_dest_info.copy_dest_endian)};
+        gpu_destination.color_sample_select = uint32_t(copy_sample_select);
         bool has_guest_memory_alias = shared_memory_->guest_memory_buffer() != nullptr;
-        bool exact_snapshot_ready = exact_cache_candidate && has_guest_memory_alias &&
-                                    EnsureExactResolvedSurfaceSnapshot(copy_width, copy_height);
-        if (exact_snapshot_ready) {
-          gpu_destination.presentation_snapshot_texture = exact_resolved_surface_.metal_texture;
+        if (has_guest_memory_alias) {
+          gpu_destination.guest_memory_metal_buffer = shared_memory_->guest_memory_buffer();
+          gpu_destination.guest_memory_copy_source_offset = dirty_start;
+          gpu_destination.guest_memory_copy_destination_offset = dirty_start;
+          gpu_destination.guest_memory_copy_length = dirty_length;
+          gpu_destination.submission_callback = [](void* context, uint32_t start, uint32_t length) {
+            static_cast<MetalSharedMemory*>(context)->RangeWrittenByGpu(start, length);
+          };
+          gpu_destination.submission_callback_context = shared_memory_.get();
+          gpu_destination.submission_start = dirty_start;
+          gpu_destination.submission_length = dirty_length;
+        }
+        // Every persistent context and shared-memory upload uses the same
+        // command queue. Commit earlier encoders so this resolve is ordered
+        // after all potential buffer readers, without stalling the CPU.
+        bool gpu_resolve_wait_ready = dirty_length && FinalizePipelineProbeSubmissions();
+        bool gpu_resolve_range_ready =
+            gpu_resolve_wait_ready && shared_memory_->RequestRange(dirty_start, dirty_length);
+        bool gpu_resolve_ready = gpu_resolve_range_ready;
+        if (!dirty_length) {
+          gpu_resolve_error = "invalid GPU tiled resolve dirty range";
+        } else if (!gpu_resolve_wait_ready) {
+          gpu_resolve_error = "failed to synchronize GPU tiled resolve writer";
+        } else if (!gpu_resolve_range_ready) {
+          gpu_resolve_error = "failed to make GPU tiled resolve destination resident";
+        }
+        bool exact_snapshot_ready = false;
+        uint64_t exact_snapshot_invalidation_epoch = 0;
+        if (gpu_resolve_ready && exact_snapshot_candidate && has_guest_memory_alias) {
+          void* exact_snapshot_texture = nullptr;
+          exact_snapshot_ready = PrepareExactResolvedSurfaceGpuBand(
+              exact_snapshot_base, dest_pitch, exact_snapshot_height, exact_snapshot_y,
+              copy_height, resolve_info.copy_dest_info.copy_dest_endian,
+              exact_resolve_signature, exact_snapshot_texture,
+              exact_snapshot_invalidation_epoch);
+          if (exact_snapshot_ready) {
+            gpu_destination.presentation_snapshot_texture = exact_snapshot_texture;
+            gpu_destination.presentation_snapshot_y = exact_snapshot_y;
+          }
         }
         if (has_guest_memory_alias) {
           if (exact_snapshot_ready) {
@@ -5791,36 +6037,40 @@ bool MetalCommandProcessor::IssueCopy() {
           gpu_destination.async_failure_start = dirty_start;
           gpu_destination.async_failure_length = dirty_length;
         }
-        // Every persistent context and shared-memory upload uses the same
-        // command queue. Commit earlier encoders so this resolve is ordered
-        // after all potential buffer readers, without stalling the CPU.
-        bool gpu_resolve_wait_ready = dirty_length && FinalizePipelineProbeSubmissions();
-        bool gpu_resolve_range_ready =
-            gpu_resolve_wait_ready && shared_memory_->RequestRange(dirty_start, dirty_length);
-        bool gpu_resolve_ready = gpu_resolve_range_ready;
-        if (!dirty_length) {
-          gpu_resolve_error = "invalid GPU tiled resolve dirty range";
-        } else if (!gpu_resolve_wait_ready) {
-          gpu_resolve_error = "failed to synchronize GPU tiled resolve writer";
-        } else if (!gpu_resolve_range_ready) {
-          gpu_resolve_error = "failed to make GPU tiled resolve destination resident";
-        }
         bool gpu_resolve_completed = false;
-        bool capture_resolve_bgra = (exact_cache_candidate && !exact_snapshot_ready) ||
+        bool capture_resolve_bgra = (exact_snapshot_candidate && !exact_snapshot_ready) ||
                                     MetalVerboseDiagnosticsEnabled() || !has_guest_memory_alias;
+        if (exact_snapshot_candidate && !exact_snapshot_ready) {
+          exact_snapshot_invalidation_epoch =
+              exact_resolved_surface_invalidation_epoch_.load(std::memory_order_acquire);
+        }
         if (gpu_resolve_ready) {
+          bool exact_cache_write_expected = exact_snapshot_candidate;
+          if (exact_cache_write_expected) {
+            uint32_t page_mask = uint32_t(rex::memory::page_size()) - 1;
+            exact_resolved_surface_expected_gpu_write_first_.store(
+                dirty_start & ~page_mask, std::memory_order_relaxed);
+            exact_resolved_surface_expected_gpu_write_last_.store(
+                (dirty_start + dirty_length - 1) | page_mask, std::memory_order_relaxed);
+            exact_resolved_surface_expected_gpu_write_active_.store(
+                true, std::memory_order_release);
+          }
           gpu_resolve_completed = ResolvePipelineProbeContextToXenosTiled(
               resolve_host_rt_context, resolve_width, resolve_height, host_source_rect_x,
               host_source_rect_y, copy_width, copy_height, gpu_destination,
               capture_resolve_bgra ? &gpu_tiled_resolve_bgra : nullptr, &gpu_resolve_error);
           if (gpu_resolve_completed) {
             if (has_guest_memory_alias) {
-              shared_memory_->RangeWrittenByGpu(dirty_start, dirty_length);
-              pending_gpu_tiled_resolve_publication_ranges_.emplace_back(dirty_start, dirty_length);
+              ++gpu_tiled_resolve_mirror_count_;
+              gpu_tiled_resolve_mirror_byte_count_ += dirty_length;
             } else if (!shared_memory_->CommitGpuBufferWriteToGuest(dirty_start, dirty_length)) {
               gpu_resolve_completed = false;
               gpu_resolve_error = "failed to publish GPU tiled resolve to guest memory";
             }
+          }
+          if (exact_cache_write_expected) {
+            exact_resolved_surface_expected_gpu_write_active_.store(false,
+                                                                    std::memory_order_release);
           }
         }
         if (gpu_resolve_completed) {
@@ -5828,18 +6078,25 @@ bool MetalCommandProcessor::IssueCopy() {
           refreshed_host_rt = true;
           ++gpu_tiled_resolve_count_;
           gpu_tiled_resolve_pixel_count_ += uint64_t(copy_width) * copy_height;
-          InvalidateExactResolvedSurfaceCache(
-              write_dest_base,
-              texture_util::GetTiledAddressUpperBound2D(dest_pitch, dest_height, dest_pitch, 2));
           if (exact_snapshot_ready) {
-            UpdateExactResolvedSurfaceGpuCache(write_dest_base, dest_pitch, dest_height, copy_width,
-                                               copy_height,
-                                               resolve_info.copy_dest_info.copy_dest_endian);
-          } else if (exact_cache_candidate && !gpu_tiled_resolve_bgra.empty()) {
+            UpdateExactResolvedSurfaceGpuCache(exact_snapshot_base, dest_pitch,
+                                               exact_snapshot_height, dest_pitch,
+                                               exact_snapshot_height, exact_snapshot_y, copy_height,
+                                               resolve_info.copy_dest_info.copy_dest_endian,
+                                               exact_resolve_signature,
+                                               exact_snapshot_invalidation_epoch);
+          } else if (!exact_snapshot_candidate || gpu_tiled_resolve_bgra.empty()) {
+            InvalidateExactResolvedSurfaceCache(
+                write_dest_base,
+                texture_util::GetTiledAddressUpperBound2D(dest_pitch, dest_height, dest_pitch, 2));
+          }
+          if (!exact_snapshot_ready && exact_snapshot_candidate &&
+              !gpu_tiled_resolve_bgra.empty()) {
             UpdateExactResolvedSurfaceCache(write_dest_base, dest_pitch, dest_height,
                                             gpu_tiled_resolve_bgra, copy_width, copy_height, 0, 0,
                                             rect_x, write_dest_y, copy_width, copy_height,
-                                            resolve_info.copy_dest_info.copy_dest_endian);
+                                            resolve_info.copy_dest_info.copy_dest_endian,
+                                            exact_snapshot_invalidation_epoch);
           }
         } else {
           if (gpu_resolve_ready) {
@@ -5862,19 +6119,23 @@ bool MetalCommandProcessor::IssueCopy() {
           }
         }
       }
-      if (!gpu_tiled_resolve && resolve_host_rt_context && copy_width && copy_height &&
+      if (!gpu_tiled_resolve && direct_host_rt_transform_compatible &&
+          resolve_host_rt_context && copy_width && copy_height &&
           host_source_rect_x <= resolve_width && host_source_rect_y <= resolve_height &&
           copy_width <= resolve_width - host_source_rect_x &&
           copy_height <= resolve_height - host_source_rect_y) {
         std::string regional_error;
-        if (ReadPipelineProbeContextRect(resolve_host_rt_context, resolve_width, resolve_height,
-                                         host_source_rect_x, host_source_rect_y, copy_width,
-                                         copy_height, regional_host_rt_bgra, &regional_error)) {
+        if (ReadPipelineProbeContextRectSampleSelected(
+                resolve_host_rt_context, resolve_width, resolve_height, host_source_rect_x,
+                host_source_rect_y, copy_width, copy_height, uint32_t(copy_sample_select),
+                regional_host_rt_bgra, &regional_error)) {
           refreshed_host_rt = true;
           regional_host_rt_readback = true;
         }
       }
-      if (!refreshed_host_rt) {
+      // A generic read resolves every host sample. It is not a valid fallback
+      // when the guest requested one sample or one 4x sample pair.
+      if (!refreshed_host_rt && !selective_msaa_copy) {
         refreshed_host_rt = refresh_resolve_host_rt(resolve_width, resolve_height);
       }
       if (log_resolve_gate) {
@@ -5905,11 +6166,13 @@ bool MetalCommandProcessor::IssueCopy() {
       }
       if (refreshed_host_rt) {
         bool can_resolve_directly_from_host_rt =
-            gpu_tiled_resolve || regional_host_rt_readback ||
-            (resolve_host_rt && host_source_rect_x <= latest_host_render_target_width_ &&
-             host_source_rect_y <= latest_host_render_target_height_ &&
-             copy_width <= latest_host_render_target_width_ - host_source_rect_x &&
-             copy_height <= latest_host_render_target_height_ - host_source_rect_y);
+            direct_host_rt_transform_compatible &&
+            (gpu_tiled_resolve || regional_host_rt_readback ||
+             (!selective_msaa_copy && resolve_host_rt &&
+              host_source_rect_x <= latest_host_render_target_width_ &&
+              host_source_rect_y <= latest_host_render_target_height_ &&
+              copy_width <= latest_host_render_target_width_ - host_source_rect_x &&
+              copy_height <= latest_host_render_target_height_ - host_source_rect_y));
         std::vector<uint8_t> edram_resolved_bgra;
         bool used_edram_resolve = false;
         // The persistent Metal target is already the resolved, single-sample representation of the
@@ -5990,10 +6253,12 @@ bool MetalCommandProcessor::IssueCopy() {
                 : host_source_rect_y;
         bool wrote_host_rt_resolve =
             gpu_tiled_resolve ||
-            WriteBgraToTiledResolveRegion(
-                write_dest_base, dest_pitch, dest_height, resolve_source_bgra, resolve_source_width,
-                resolve_source_height, resolve_source_x, resolve_source_y, rect_x, write_dest_y,
-                copy_width, copy_height, resolve_info.copy_dest_info.copy_dest_endian);
+            (direct_host_rt_transform_compatible &&
+             WriteBgraToTiledResolveRegion(
+                 write_dest_base, dest_pitch, dest_height, resolve_source_bgra,
+                 resolve_source_width, resolve_source_height, resolve_source_x, resolve_source_y,
+                 rect_x, write_dest_y, copy_width, copy_height,
+                 resolve_info.copy_dest_info.copy_dest_endian));
         if (wrote_host_rt_resolve) {
           wrote_source_resolve = true;
           static std::atomic<uint32_t> host_rt_resolve_logs{0};
@@ -6788,61 +7053,67 @@ bool MetalCommandProcessor::WriteBgraToTiledResolveRegion(
       }
     }
   };
-  switch (dest_endian) {
-    case xenos::Endian128::k8in16: {
-      auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
-        target[0] = source[1];
-        target[1] = source[2];
-        target[2] = source[3];
-        target[3] = source[0];
-      };
-      write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
-        for (uint32_t pixel = 0; pixel < 4; ++pixel) {
-          pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
-        }
-      });
-      break;
+  auto write_guest = [&]() {
+    switch (dest_endian) {
+      case xenos::Endian128::k8in16: {
+        auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
+          target[0] = source[1];
+          target[1] = source[2];
+          target[2] = source[3];
+          target[3] = source[0];
+        };
+        write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
+          for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+            pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
+          }
+        });
+        break;
+      }
+      case xenos::Endian128::k8in32: {
+        auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
+          target[0] = source[3];
+          target[1] = source[0];
+          target[2] = source[1];
+          target[3] = source[2];
+        };
+        write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
+          for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+            pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
+          }
+        });
+        break;
+      }
+      case xenos::Endian128::k16in32: {
+        auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
+          target[0] = source[0];
+          target[1] = source[3];
+          target[2] = source[2];
+          target[3] = source[1];
+        };
+        write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
+          for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+            pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
+          }
+        });
+        break;
+      }
+      case xenos::Endian128::kNone:
+      default: {
+        auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
+          target[0] = source[2];
+          target[1] = source[1];
+          target[2] = source[0];
+          target[3] = source[3];
+        };
+        write_tiled_pixels(pack_pixel, PackFourBgraPixelsToGuestRgba);
+        break;
+      }
     }
-    case xenos::Endian128::k8in32: {
-      auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
-        target[0] = source[3];
-        target[1] = source[0];
-        target[2] = source[1];
-        target[3] = source[2];
-      };
-      write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
-        for (uint32_t pixel = 0; pixel < 4; ++pixel) {
-          pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
-        }
-      });
-      break;
-    }
-    case xenos::Endian128::k16in32: {
-      auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
-        target[0] = source[0];
-        target[1] = source[3];
-        target[2] = source[2];
-        target[3] = source[1];
-      };
-      write_tiled_pixels(pack_pixel, [&pack_pixel](uint8_t* target, const uint8_t* source) {
-        for (uint32_t pixel = 0; pixel < 4; ++pixel) {
-          pack_pixel(target + size_t(pixel) * 4, source + size_t(pixel) * 4);
-        }
-      });
-      break;
-    }
-    case xenos::Endian128::kNone:
-    default: {
-      auto pack_pixel = [](uint8_t* target, const uint8_t* source) {
-        target[0] = source[2];
-        target[1] = source[1];
-        target[2] = source[0];
-        target[3] = source[3];
-      };
-      write_tiled_pixels(pack_pixel, PackFourBgraPixelsToGuestRgba);
-      break;
-    }
-  }
+    return true;
+  };
+  bool wrote_guest = false;
+  uint64_t exact_cache_invalidation_epoch =
+      exact_resolved_surface_invalidation_epoch_.load(std::memory_order_acquire);
   if (shared_memory_) {
     uint32_t dirty_offset_start =
         texture_util::GetTiledAddressLowerBound2D(dest_x, dest_y, pitch, 2);
@@ -6855,14 +7126,33 @@ bool MetalCommandProcessor::WriteBgraToTiledResolveRegion(
     uint32_t clamped_end =
         uint32_t(std::min<uint64_t>(dirty_end_unclamped, SharedMemory::kBufferSize));
     uint32_t clamped_length = clamped_end > clamped_start ? clamped_end - clamped_start : 0;
-    if (clamped_length &&
-        !shared_memory_->CommitGuestCpuWriteAsGpu(clamped_start, clamped_length)) {
-      log_write_failure("shared-memory-commit");
-      return false;
+    if (clamped_length) {
+      uint32_t page_mask = uint32_t(rex::memory::page_size()) - 1;
+      exact_resolved_surface_expected_gpu_write_first_.store(
+          clamped_start & ~page_mask, std::memory_order_relaxed);
+      exact_resolved_surface_expected_gpu_write_last_.store(
+          (clamped_start + clamped_length - 1) | page_mask, std::memory_order_relaxed);
+      exact_resolved_surface_expected_gpu_write_active_.store(true, std::memory_order_release);
     }
+    wrote_guest =
+        clamped_length
+            ? shared_memory_->CommitSynchronizedGuestCpuWriteAsGpu(clamped_start, clamped_length,
+                                                                   write_guest)
+            : write_guest();
+    if (clamped_length) {
+      exact_resolved_surface_expected_gpu_write_active_.store(false,
+                                                              std::memory_order_release);
+    }
+  } else {
+    wrote_guest = write_guest();
+  }
+  if (!wrote_guest) {
+    log_write_failure("shared-memory-commit");
+    return false;
   }
   UpdateExactResolvedSurfaceCache(dest_base, pitch, height, bgra, width, source_height, source_x,
-                                  source_y, dest_x, dest_y, write_width, write_height, dest_endian);
+                                  source_y, dest_x, dest_y, write_width, write_height, dest_endian,
+                                  exact_cache_invalidation_epoch);
   uint64_t surface_bytes = texture_util::GetTiledAddressUpperBound2D(pitch, height, pitch, 2);
   uint32_t clamped_start = std::min(dest_base, SharedMemory::kBufferSize);
   uint32_t clamped_length =
@@ -7934,7 +8224,8 @@ void MetalCommandProcessor::InvalidateRetainedResolvedFrames(uint32_t base_physi
 void MetalCommandProcessor::UpdateExactResolvedSurfaceCache(
     uint32_t dest_base, uint32_t pitch, uint32_t surface_height, const std::vector<uint8_t>& bgra,
     uint32_t width, uint32_t source_height, uint32_t source_x, uint32_t source_y, uint32_t dest_x,
-    uint32_t dest_y, uint32_t write_width, uint32_t write_height, xenos::Endian128 dest_endian) {
+    uint32_t dest_y, uint32_t write_width, uint32_t write_height, xenos::Endian128 dest_endian,
+    uint64_t expected_invalidation_epoch) {
   uint32_t tiled_extent =
       texture_util::GetTiledAddressUpperBound2D(pitch, surface_height, pitch, 2);
 
@@ -7951,15 +8242,27 @@ void MetalCommandProcessor::UpdateExactResolvedSurfaceCache(
   // Reuse the two large allocations across frames. The title writes several
   // partial bands before its complete resolve, so discarding BGRA capacity on
   // every invalidation causes avoidable multi-megabyte allocator churn.
+  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
   ExactResolvedSurface& candidate = exact_resolved_surface_;
+  if (exact_resolved_surface_invalidation_epoch_.load(std::memory_order_acquire) !=
+      expected_invalidation_epoch) {
+    candidate.valid = false;
+    candidate.gpu_snapshot = false;
+    candidate.gpu_snapshot_row_valid.clear();
+    candidate.gpu_snapshot_valid_row_count = 0;
+    return;
+  }
   candidate.valid = false;
   candidate.gpu_snapshot = false;
+  candidate.gpu_snapshot_row_valid.clear();
+  candidate.gpu_snapshot_valid_row_count = 0;
   candidate.base = dest_base;
   candidate.pitch = pitch;
   candidate.bgra_height = write_height;
   candidate.surface_height = surface_height;
   candidate.tiled_extent = tiled_extent;
   candidate.endian = dest_endian;
+  candidate.resolve_signature = 0;
   candidate.bgra.resize(size_t(pitch) * write_height * 4);
   size_t packed_row_pitch = size_t(pitch) * 4;
   if (!source_x && width == pitch) {
@@ -7975,13 +8278,23 @@ void MetalCommandProcessor::UpdateExactResolvedSurfaceCache(
 }
 
 bool MetalCommandProcessor::EnsureExactResolvedSurfaceSnapshot(uint32_t width, uint32_t height) {
+  {
+    std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+    const ExactResolvedSurface& candidate = exact_resolved_surface_;
+    if (candidate.metal_texture && candidate.texture_width == width &&
+        candidate.texture_height == height) {
+      return true;
+    }
+  }
+  if (!WaitForPipelineProbeSubmissions("exact-snapshot-resize")) {
+    return false;
+  }
+
+  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
   ExactResolvedSurface& candidate = exact_resolved_surface_;
   if (candidate.metal_texture && candidate.texture_width == width &&
       candidate.texture_height == height) {
     return true;
-  }
-  if (candidate.metal_texture && !WaitForPipelineProbeSubmissions("exact-snapshot-resize")) {
-    return false;
   }
   ReleaseExactResolvedSurfaceSnapshot();
   std::string error;
@@ -7998,36 +8311,235 @@ bool MetalCommandProcessor::EnsureExactResolvedSurfaceSnapshot(uint32_t width, u
   return true;
 }
 
+void MetalCommandProcessor::RememberCompatibleExactResolvedSurfaceFetch(
+    const xenos::xe_gpu_texture_fetch_t& fetch) {
+  uint64_t key = GetCompatibleExactResolvedSurfaceFetchKey(fetch);
+  if (key) {
+    observed_exact_resolved_surface_fetches_.insert(key);
+  }
+}
+
+bool MetalCommandProcessor::HasCompatibleExactResolvedSurfaceFetch(
+    uint32_t base, uint32_t pitch, uint32_t height, xenos::Endian128 endian) const {
+  if (!register_file_ || !base || !pitch || !height) {
+    return false;
+  }
+  uint64_t expected_key = uint64_t(base >> 12) | (uint64_t(pitch) << 17) |
+                          (uint64_t(height) << 31) | (uint64_t(endian) << 45);
+  if (observed_exact_resolved_surface_fetches_.count(expected_key)) {
+    return true;
+  }
+  for (uint32_t fetch_index = 0; fetch_index < 32; ++fetch_index) {
+    if (GetCompatibleExactResolvedSurfaceFetchKey(
+            register_file_->GetTextureFetch(fetch_index)) == expected_key) {
+      return true;
+    }
+  }
+  return last_swap_fetch_valid_ &&
+         GetCompatibleExactResolvedSurfaceFetchKey(last_swap_fetch_) == expected_key;
+}
+
+bool MetalCommandProcessor::PrepareExactResolvedSurfaceGpuBand(
+    uint32_t dest_base, uint32_t pitch, uint32_t surface_height, uint32_t snapshot_y,
+    uint32_t write_height, xenos::Endian128 dest_endian, uint64_t resolve_signature,
+    void*& texture_out, uint64_t& invalidation_epoch_out) {
+  texture_out = nullptr;
+  invalidation_epoch_out = 0;
+  uint32_t tiled_extent =
+      texture_util::GetTiledAddressUpperBound2D(pitch, surface_height, pitch, 2);
+  if (!memory_ || !dest_base || !pitch || !surface_height || !write_height ||
+      snapshot_y > surface_height || write_height > surface_height - snapshot_y ||
+      surface_height < fallback_output_height_ || !tiled_extent ||
+      dest_base >= SharedMemory::kBufferSize ||
+      tiled_extent > SharedMemory::kBufferSize - dest_base) {
+    return false;
+  }
+
+  if (!snapshot_y) {
+    // A first band is only worth copying when a live fetch already describes
+    // this exact surface. A complete full-height resolve is also directly
+    // presentable and doesn't need speculative multi-band assembly.
+    if (write_height != surface_height &&
+        !HasCompatibleExactResolvedSurfaceFetch(dest_base, pitch, surface_height, dest_endian)) {
+      return false;
+    }
+  } else {
+    std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+    const ExactResolvedSurface& candidate = exact_resolved_surface_;
+    if (!candidate.gpu_snapshot || candidate.base != dest_base || candidate.pitch != pitch ||
+        candidate.bgra_height != surface_height ||
+        candidate.surface_height != surface_height || candidate.tiled_extent != tiled_extent ||
+        candidate.endian != dest_endian || candidate.resolve_signature != resolve_signature ||
+        candidate.gpu_snapshot_row_valid.size() != surface_height ||
+        candidate.gpu_snapshot_valid_row_count != snapshot_y) {
+      return false;
+    }
+  }
+
+  if (!EnsureExactResolvedSurfaceSnapshot(pitch, surface_height)) {
+    return false;
+  }
+
+  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+  const ExactResolvedSurface& candidate = exact_resolved_surface_;
+  if (snapshot_y &&
+      (!candidate.gpu_snapshot || candidate.base != dest_base || candidate.pitch != pitch ||
+       candidate.bgra_height != surface_height ||
+       candidate.surface_height != surface_height || candidate.tiled_extent != tiled_extent ||
+       candidate.endian != dest_endian || candidate.resolve_signature != resolve_signature ||
+       candidate.gpu_snapshot_row_valid.size() != surface_height ||
+       candidate.gpu_snapshot_valid_row_count != snapshot_y)) {
+    return false;
+  }
+  if (!candidate.metal_texture || candidate.texture_width != pitch ||
+      candidate.texture_height != surface_height) {
+    return false;
+  }
+  texture_out = candidate.metal_texture;
+  invalidation_epoch_out =
+      exact_resolved_surface_invalidation_epoch_.load(std::memory_order_acquire);
+  return true;
+}
+
 void MetalCommandProcessor::UpdateExactResolvedSurfaceGpuCache(uint32_t dest_base, uint32_t pitch,
                                                                uint32_t surface_height,
                                                                uint32_t snapshot_width,
                                                                uint32_t snapshot_height,
-                                                               xenos::Endian128 dest_endian) {
+                                                               uint32_t snapshot_y,
+                                                               uint32_t write_height,
+                                                               xenos::Endian128 dest_endian,
+                                                               uint64_t resolve_signature,
+                                                               uint64_t expected_invalidation_epoch) {
   uint32_t tiled_extent =
       texture_util::GetTiledAddressUpperBound2D(pitch, surface_height, pitch, 2);
+  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
   ExactResolvedSurface& candidate = exact_resolved_surface_;
-  candidate.valid = false;
-  candidate.gpu_snapshot = false;
-  if (!candidate.metal_texture || !memory_ || !dest_base || !pitch || !surface_height ||
+  if (exact_resolved_surface_invalidation_epoch_.load(std::memory_order_acquire) !=
+          expected_invalidation_epoch ||
+      !candidate.metal_texture || !memory_ || !dest_base || !pitch || !surface_height ||
       !snapshot_width || !snapshot_height || snapshot_width != pitch ||
+      snapshot_y > snapshot_height || !write_height ||
+      write_height > snapshot_height - snapshot_y ||
       snapshot_height < fallback_output_height_ || !tiled_extent ||
       candidate.texture_width < snapshot_width || candidate.texture_height < snapshot_height ||
       dest_base >= SharedMemory::kBufferSize ||
       tiled_extent > SharedMemory::kBufferSize - dest_base) {
+    candidate.valid = false;
+    candidate.gpu_snapshot = false;
+    candidate.gpu_snapshot_row_valid.clear();
+    candidate.gpu_snapshot_valid_row_count = 0;
     return;
   }
-  candidate.base = dest_base;
-  candidate.pitch = pitch;
-  candidate.bgra_height = snapshot_height;
-  candidate.surface_height = surface_height;
-  candidate.tiled_extent = tiled_extent;
-  candidate.endian = dest_endian;
-  candidate.bgra.clear();
-  candidate.gpu_snapshot = true;
-  candidate.valid = true;
+
+  bool same_surface = candidate.gpu_snapshot && candidate.base == dest_base &&
+                      candidate.pitch == pitch && candidate.bgra_height == snapshot_height &&
+                      candidate.surface_height == surface_height &&
+                      candidate.tiled_extent == tiled_extent && candidate.endian == dest_endian &&
+                      candidate.resolve_signature == resolve_signature &&
+                      candidate.gpu_snapshot_row_valid.size() == snapshot_height;
+  if (!same_surface) {
+    // Only a top-origin write may start or replace an assembly. A later band
+    // without its exact prefix must remain on the normal texture-cache path.
+    if (snapshot_y) {
+      candidate.valid = false;
+      candidate.gpu_snapshot = false;
+      candidate.gpu_snapshot_row_valid.clear();
+      candidate.gpu_snapshot_valid_row_count = 0;
+      return;
+    }
+    candidate.valid = false;
+    candidate.base = dest_base;
+    candidate.pitch = pitch;
+    candidate.bgra_height = snapshot_height;
+    candidate.surface_height = surface_height;
+    candidate.tiled_extent = tiled_extent;
+    candidate.endian = dest_endian;
+    candidate.resolve_signature = resolve_signature;
+    candidate.bgra.clear();
+    candidate.gpu_snapshot_row_valid.clear();
+    candidate.gpu_snapshot_valid_row_count = 0;
+    candidate.gpu_snapshot = true;
+  }
+  if (!UpdateExactResolvedSurfaceRowCoverage(candidate.gpu_snapshot_row_valid,
+                                             candidate.gpu_snapshot_valid_row_count,
+                                             snapshot_height, snapshot_y, write_height)) {
+    candidate.valid = false;
+    candidate.gpu_snapshot = false;
+    candidate.gpu_snapshot_row_valid.clear();
+    candidate.gpu_snapshot_valid_row_count = 0;
+    return;
+  }
+  bool was_valid = candidate.valid;
+  candidate.valid = candidate.gpu_snapshot_valid_row_count == snapshot_height;
+  if (candidate.valid && !was_valid) {
+    static std::atomic<uint32_t> exact_gpu_surface_ready_logs{0};
+    uint32_t ready_index =
+        exact_gpu_surface_ready_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ShouldLogMetalDiagnostic(ready_index, 8, 0x3F)) {
+      std::fprintf(stderr,
+                   "[metal] exact GPU resolved surface ready#%u base=0x%08x "
+                   "size=%ux%u extent=0x%x\n",
+                   ready_index, candidate.base, candidate.pitch, candidate.bgra_height,
+                   candidate.tiled_extent);
+      std::fflush(stderr);
+    }
+  }
+}
+
+bool MetalCommandProcessor::GetExactResolvedSurfaceTextureForFetch(
+    const xenos::xe_gpu_texture_fetch_t& fetch, void*& texture_out, uint32_t& width_out,
+    uint32_t& height_out, uint32_t& host_swizzle_out, uint8_t& swizzled_signs_out) const {
+  texture_out = nullptr;
+  width_out = 0;
+  height_out = 0;
+  host_swizzle_out = xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
+  swizzled_signs_out = uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
+
+  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+  const ExactResolvedSurface& exact = exact_resolved_surface_;
+  if (!exact.valid || !exact.gpu_snapshot || !exact.metal_texture ||
+      fetch.type != xenos::FetchConstantType::kTexture || !fetch.tiled ||
+      fetch.format != xenos::TextureFormat::k_8_8_8_8 ||
+      fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked ||
+      fetch.packed_mips || fetch.mip_address || fetch.mip_min_level || fetch.mip_max_level) {
+    return false;
+  }
+
+  uint32_t width_minus_1 = 0;
+  uint32_t height_minus_1 = 0;
+  uint32_t depth_or_array_size_minus_1 = 0;
+  uint32_t base_page = 0;
+  texture_util::GetSubresourcesFromFetchConstant(
+      fetch, &width_minus_1, &height_minus_1, &depth_or_array_size_minus_1, &base_page, nullptr,
+      nullptr, nullptr);
+  uint32_t width = width_minus_1 + 1;
+  uint32_t height = height_minus_1 + 1;
+  uint32_t pitch = fetch.pitch << 5;
+  uint32_t required_tiled_extent =
+      pitch && height ? texture_util::GetTiledAddressUpperBound2D(pitch, height, pitch, 2) : 0;
+  uint8_t swizzled_signs = texture_util::SwizzleSigns(fetch);
+  if (!base_page || depth_or_array_size_minus_1 || !width || !height || pitch < width ||
+      (base_page << 12) != exact.base || pitch != exact.pitch ||
+      uint32_t(fetch.endianness) != uint32_t(exact.endian) || exact.bgra_height < height ||
+      exact.texture_width != width || exact.texture_height != height || !required_tiled_extent ||
+      exact.tiled_extent < required_tiled_extent ||
+      texture_util::IsAnySignSigned(swizzled_signs)) {
+    return false;
+  }
+
+  // The snapshot is BGRA8 in memory, but Metal exposes its sampled components
+  // as logical RGBA, matching the RGBA texture-cache representation.
+  texture_out = exact.metal_texture;
+  width_out = width;
+  height_out = height;
+  host_swizzle_out =
+      TextureCache::GuestToHostSwizzle(fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
+  swizzled_signs_out = swizzled_signs;
+  return true;
 }
 
 void MetalCommandProcessor::ReleaseExactResolvedSurfaceSnapshot() {
+  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
   ExactResolvedSurface& candidate = exact_resolved_surface_;
   if (candidate.metal_texture) {
     ReleasePipelineProbeSnapshotTexture(candidate.metal_texture);
@@ -8035,35 +8547,87 @@ void MetalCommandProcessor::ReleaseExactResolvedSurfaceSnapshot() {
   }
   candidate.texture_width = 0;
   candidate.texture_height = 0;
+  candidate.gpu_snapshot_row_valid.clear();
+  candidate.gpu_snapshot_valid_row_count = 0;
   candidate.gpu_snapshot = false;
   candidate.valid = false;
+}
+
+void MetalCommandProcessor::WaitRegMemMemoryChangeWatchCallback(
+    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+  (void)global_lock;
+  if (!context || invalidated_by_gpu || address_last < address_first) {
+    return;
+  }
+  auto* command_processor = static_cast<MetalCommandProcessor*>(context);
+  uint32_t wait_first =
+      command_processor->wait_reg_mem_memory_change_first_.load(std::memory_order_acquire);
+  if (wait_first == UINT32_MAX) {
+    return;
+  }
+  uint32_t wait_last =
+      command_processor->wait_reg_mem_memory_change_last_.load(std::memory_order_relaxed);
+  if (address_first <= wait_last && address_last >= wait_first &&
+      command_processor->wait_reg_mem_memory_change_event_) {
+    // Memory invalidation callbacks may run before the faulting guest store is
+    // retried. Waking early is safe because WAIT_REG_MEM re-reads its predicate
+    // and falls back to another bounded wait if the value has not changed yet.
+    command_processor->NotifyWaitRegMemMemoryWrite(
+        address_first, address_last - address_first + 1);
+  }
 }
 
 void MetalCommandProcessor::ExactResolvedSurfaceWatchCallback(
     const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
     uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
   (void)global_lock;
-  (void)invalidated_by_gpu;
   if (!context || address_last < address_first) {
     return;
   }
-  static_cast<MetalCommandProcessor*>(context)->InvalidateExactResolvedSurfaceCache(
-      address_first, address_last - address_first + 1);
+  auto* command_processor = static_cast<MetalCommandProcessor*>(context);
+  if (invalidated_by_gpu &&
+      command_processor->exact_resolved_surface_expected_gpu_write_active_.load(
+          std::memory_order_acquire)) {
+    uint32_t expected_first =
+        command_processor->exact_resolved_surface_expected_gpu_write_first_.load(
+            std::memory_order_relaxed);
+    uint32_t expected_last =
+        command_processor->exact_resolved_surface_expected_gpu_write_last_.load(
+            std::memory_order_relaxed);
+    if (address_first == expected_first && address_last == expected_last) {
+      return;
+    }
+  }
+  command_processor->InvalidateExactResolvedSurfaceCache(address_first,
+                                                         address_last - address_first + 1);
 }
 
 void MetalCommandProcessor::InvalidateExactResolvedSurfaceCache(uint32_t base_physical,
                                                                 uint32_t length) {
-  if (!length || !exact_resolved_surface_.valid) {
+  if (!length) {
+    return;
+  }
+  // Increment before waiting for the state lock. If publication is currently
+  // between submitting its Metal copy and updating row coverage, it will see
+  // this epoch change and refuse to publish stale state.
+  exact_resolved_surface_invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+  ExactResolvedSurface& candidate = exact_resolved_surface_;
+  if ((!candidate.valid && !candidate.gpu_snapshot) || !candidate.tiled_extent) {
     return;
   }
   uint64_t write_start = base_physical;
   uint64_t write_end = write_start + length;
-  uint64_t cache_start = exact_resolved_surface_.base;
-  uint64_t cache_end = cache_start + exact_resolved_surface_.tiled_extent;
+  uint64_t cache_start = candidate.base;
+  uint64_t cache_end = cache_start + candidate.tiled_extent;
   if (write_start >= cache_end || write_end <= cache_start) {
     return;
   }
-  exact_resolved_surface_.valid = false;
+  candidate.valid = false;
+  candidate.gpu_snapshot = false;
+  candidate.gpu_snapshot_row_valid.clear();
+  candidate.gpu_snapshot_valid_row_count = 0;
 }
 
 MetalShader* MetalCommandProcessor::LoadShaderFromCache(xenos::ShaderType shader_type,
@@ -8237,6 +8801,16 @@ uint64_t MetalCommandProcessor::GetCurrentPixelShaderModification(MetalShader& s
     modification.pixel.param_gen_enable = 0;
     modification.pixel.param_gen_interpolator = 0;
     modification.pixel.param_gen_point = 0;
+  }
+  reg::RB_DEPTHCONTROL normalized_depth_control =
+      draw_util::GetNormalizedDepthControl(*register_file_);
+  if (normalized_depth_control.z_enable &&
+      register_file_->Get<reg::RB_DEPTH_INFO>().depth_format ==
+          xenos::DepthRenderTargetFormat::kD24FS8) {
+    using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
+    modification.pixel.depth_stencil_mode =
+        REXCVAR_GET(depth_float24_round) ? DepthStencilMode::kFloat24Rounding
+                                        : DepthStencilMode::kFloat24Truncating;
   }
   return modification.value;
 }
@@ -9447,7 +10021,7 @@ void* MetalCommandProcessor::EnsureSolidColorPipeline(MetalShader& vertex_shader
 
 void* MetalCommandProcessor::EnsureDepthOnlyPipeline(MetalShader& vertex_shader,
                                                      MetalShader* pixel_shader) {
-  if (!metal_device_ || !register_file_) {
+  if (!metal_device_ || !register_file_ || !shader_translator_) {
     return nullptr;
   }
   uint64_t vertex_modification = 0;
@@ -9458,21 +10032,55 @@ void* MetalCommandProcessor::EnsureDepthOnlyPipeline(MetalShader& vertex_shader,
   if (!vertex_translation || !vertex_translation->metal_library()) {
     return nullptr;
   }
-  if (!dummy_fragment_library_) {
-    std::string fragment_error;
-    dummy_fragment_library_ =
-        CreateMslLibrary(metal_device_, MakeDummyFragmentMsl(), &fragment_error);
+
+  using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
+  DepthStencilMode depth_stencil_mode = DepthStencilMode::kNoModifiers;
+  reg::RB_DEPTHCONTROL normalized_depth_control =
+      draw_util::GetNormalizedDepthControl(*register_file_);
+  if (normalized_depth_control.z_enable &&
+      register_file_->Get<reg::RB_DEPTH_INFO>().depth_format ==
+          xenos::DepthRenderTargetFormat::kD24FS8) {
+    depth_stencil_mode = REXCVAR_GET(depth_float24_round)
+                             ? DepthStencilMode::kFloat24Rounding
+                             : DepthStencilMode::kFloat24Truncating;
+  }
+
+  void* fragment_library = nullptr;
+  if (depth_stencil_mode == DepthStencilMode::kNoModifiers) {
     if (!dummy_fragment_library_) {
-      REXLOG_WARN("Metal depth-only dummy fragment unavailable: {}", fragment_error);
-      return nullptr;
+      std::string fragment_error;
+      dummy_fragment_library_ =
+          CreateMslLibrary(metal_device_, MakeDummyFragmentMsl(), &fragment_error);
+      if (!dummy_fragment_library_) {
+        REXLOG_WARN("Metal depth-only dummy fragment unavailable: {}", fragment_error);
+        return nullptr;
+      }
     }
+    fragment_library = dummy_fragment_library_;
+  } else {
+    void*& depth_float24_fragment_library =
+        depth_stencil_mode == DepthStencilMode::kFloat24Rounding
+            ? depth_float24_rounding_fragment_library_
+            : depth_float24_truncating_fragment_library_;
+    if (!depth_float24_fragment_library) {
+      std::string fragment_error;
+      depth_float24_fragment_library = CreateDepthOnlyFragmentMslLibrary(
+          metal_device_, *shader_translator_, depth_stencil_mode, &fragment_error);
+      if (!depth_float24_fragment_library) {
+        REXLOG_WARN("Metal float24 depth-only fragment unavailable (mode {}): {}",
+                    uint32_t(depth_stencil_mode), fragment_error);
+        return nullptr;
+      }
+    }
+    fragment_library = depth_float24_fragment_library;
   }
 
   uint32_t sample_count =
       GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
   constexpr uint64_t kDepthOnlyPipelineTag = UINT64_C(0x445054484F4E4C59);
-  uint64_t pipeline_key_parts[4] = {kDepthOnlyPipelineTag, vertex_shader.ucode_data_hash(),
-                                    vertex_modification, sample_count};
+  uint64_t pipeline_key_parts[5] = {
+      kDepthOnlyPipelineTag, vertex_shader.ucode_data_hash(), vertex_modification, sample_count,
+      uint64_t(depth_stencil_mode)};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   auto existing = solid_color_pipeline_states_.find(pipeline_key);
   if (existing != solid_color_pipeline_states_.end()) {
@@ -9482,9 +10090,9 @@ void* MetalCommandProcessor::EnsureDepthOnlyPipeline(MetalShader& vertex_shader,
   ProbeColorTargetState color_state;
   color_state.write_mask = 0;
   std::string pipeline_error;
-  void* pipeline_state =
-      CreateCachedRenderPipelineState(vertex_translation->metal_library(), dummy_fragment_library_,
-                                      &pipeline_error, &color_state, sample_count);
+  void* pipeline_state = CreateCachedRenderPipelineState(
+      vertex_translation->metal_library(), fragment_library, &pipeline_error, &color_state,
+      sample_count);
   solid_color_pipeline_states_.emplace(pipeline_key, pipeline_state);
   if (!pipeline_state) {
     REXLOG_WARN("Metal depth-only pipeline failed for vertex shader {:016X}: {}",
@@ -9676,10 +10284,13 @@ void MetalCommandProcessor::UpdateMinimalSystemConstants(xenos::PrimitiveType pr
   system_constants_.vertex_index_max = regs.Get<uint32_t>(XE_GPU_REG_VGT_MAX_VTX_INDX);
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+  bool host_depth_float24 =
+      normalized_depth_control.z_enable &&
+      rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8;
   draw_util::ViewportInfo viewport_info = {};
   draw_util::GetHostViewportInfo(
       regs, 1, 1, true, fallback_output_width_, fallback_output_height_, true,
-      normalized_depth_control, false, false,
+      normalized_depth_control, host_depth_float24, host_depth_float24,
       active_pixel_shader_ && static_cast<MetalShader*>(active_pixel_shader_)->writes_depth(),
       viewport_info);
   for (uint32_t i = 0; i < 3; ++i) {
@@ -9933,21 +10544,102 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
   auto& fragment_texture_storage = fragment_texture_storage_scratch_;
   auto& vertex_texture_slots = vertex_texture_slots_scratch_;
   auto& fragment_texture_slots = fragment_texture_slots_scratch_;
+  std::array<void*, 32> exact_resolved_textures = {};
+  std::array<uint32_t, 32> exact_resolved_texture_widths = {};
+  std::array<uint32_t, 32> exact_resolved_texture_heights = {};
+  std::array<uint32_t, 32> exact_resolved_texture_swizzles = {};
+  std::array<uint8_t, 32> exact_resolved_texture_signs = {};
+  uint32_t exact_resolved_texture_mask = 0;
   if (texture_cache_) {
     uint32_t used_texture_mask =
         vertex_shader.GetUsedTextureMaskAfterTranslation() |
         (pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
     if (used_texture_mask) {
-      texture_cache_->RequestTextures(used_texture_mask);
+      // A fetch constant may be referenced by instructions with different
+      // dimensions. The exact resolve snapshot is a one-layer 2D array, so
+      // only use it when every translated binding for the fetch is 2D.
+      uint32_t exact_eligible_texture_mask = used_texture_mask;
+      auto reject_non_2d_exact_bindings = [&](const MetalShader& shader) {
+        for (const auto& binding : shader.GetTextureBindingsAfterTranslation()) {
+          if (binding.dimension != xenos::FetchOpDimension::k2D) {
+            exact_eligible_texture_mask &= ~(UINT32_C(1) << binding.fetch_constant);
+          }
+        }
+      };
+      reject_non_2d_exact_bindings(vertex_shader);
+      if (pixel_shader) {
+        reject_non_2d_exact_bindings(*pixel_shader);
+      }
+
+      uint32_t textures_to_check = exact_eligible_texture_mask;
+      uint32_t exact_binding_count = 0;
+      uint32_t texture_index = 0;
+      while (rex::bit_scan_forward(textures_to_check, &texture_index)) {
+        textures_to_check &= ~(UINT32_C(1) << texture_index);
+        xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(texture_index);
+        RememberCompatibleExactResolvedSurfaceFetch(fetch);
+        if (GetExactResolvedSurfaceTextureForFetch(
+                fetch, exact_resolved_textures[texture_index],
+                exact_resolved_texture_widths[texture_index],
+                exact_resolved_texture_heights[texture_index],
+                exact_resolved_texture_swizzles[texture_index],
+                exact_resolved_texture_signs[texture_index])) {
+          exact_resolved_texture_mask |= UINT32_C(1) << texture_index;
+          ++exact_binding_count;
+        }
+      }
+      uint32_t cache_texture_mask = used_texture_mask & ~exact_resolved_texture_mask;
+      if (cache_texture_mask) {
+        texture_cache_->RequestTextures(cache_texture_mask);
+      }
+
+      // RequestTextures may wait for older command buffers. If an asynchronous
+      // resolve failure is reported while waiting, it invalidates the snapshot.
+      // Revalidate every direct binding before retaining the decision. If any
+      // changed, conservatively load all of them through the normal cache.
+      bool exact_resolved_textures_stale = false;
+      uint32_t exact_textures_to_revalidate = exact_resolved_texture_mask;
+      texture_index = 0;
+      while (rex::bit_scan_forward(exact_textures_to_revalidate, &texture_index)) {
+        exact_textures_to_revalidate &= ~(UINT32_C(1) << texture_index);
+        void* texture = nullptr;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t swizzle = 0;
+        uint8_t signs = 0;
+        xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(texture_index);
+        if (!GetExactResolvedSurfaceTextureForFetch(fetch, texture, width, height, swizzle, signs) ||
+            texture != exact_resolved_textures[texture_index] ||
+            width != exact_resolved_texture_widths[texture_index] ||
+            height != exact_resolved_texture_heights[texture_index] ||
+            swizzle != exact_resolved_texture_swizzles[texture_index] ||
+            signs != exact_resolved_texture_signs[texture_index]) {
+          exact_resolved_textures_stale = true;
+          break;
+        }
+      }
+      if (exact_resolved_textures_stale) {
+        texture_cache_->RequestTextures(exact_resolved_texture_mask);
+        exact_resolved_texture_mask = 0;
+        exact_binding_count = 0;
+      }
+      if (exact_resolved_texture_mask) {
+        ++gpu_resolved_texture_draw_count_;
+        gpu_resolved_texture_binding_count_ += exact_binding_count;
+      }
       uint32_t textures_resolution_scaled = 0;
       uint32_t textures_remaining = used_texture_mask;
-      uint32_t texture_index = 0;
+      texture_index = 0;
       while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
         textures_remaining &= ~(UINT32_C(1) << texture_index);
         uint32_t& texture_signs_uint = system_constants_.texture_swizzled_signs[texture_index >> 2];
         uint32_t texture_signs_shift = 8 * (texture_index & 3);
+        bool exact_resolved_texture =
+            (exact_resolved_texture_mask & (UINT32_C(1) << texture_index)) != 0;
         uint32_t texture_signs_shifted =
-            uint32_t(texture_cache_->GetActiveTextureSwizzledSigns(texture_index))
+            uint32_t(exact_resolved_texture
+                         ? exact_resolved_texture_signs[texture_index]
+                         : texture_cache_->GetActiveTextureSwizzledSigns(texture_index))
             << texture_signs_shift;
         uint32_t texture_signs_mask = UINT32_C(0xFF) << texture_signs_shift;
         texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
@@ -9955,14 +10647,18 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
         uint32_t& texture_swizzles_uint = system_constants_.texture_swizzles[texture_index >> 1];
         uint32_t texture_swizzle_shift = 12 * (texture_index & 1);
         uint32_t texture_swizzle_shifted =
-            texture_cache_->GetActiveTextureHostSwizzle(texture_index) << texture_swizzle_shift;
+            (exact_resolved_texture ? exact_resolved_texture_swizzles[texture_index]
+                                    : texture_cache_->GetActiveTextureHostSwizzle(texture_index))
+            << texture_swizzle_shift;
         uint32_t texture_swizzle_mask = ((UINT32_C(1) << 12) - 1) << texture_swizzle_shift;
         texture_swizzles_uint =
             (texture_swizzles_uint & ~texture_swizzle_mask) | texture_swizzle_shifted;
 
-        textures_resolution_scaled |=
-            uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index))
-            << texture_index;
+        if (!exact_resolved_texture) {
+          textures_resolution_scaled |=
+              uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index))
+              << texture_index;
+        }
       }
       system_constants_.textures_resolution_scaled = textures_resolution_scaled;
     }
@@ -9989,6 +10685,30 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
           i < shader.GetTextureBindingsAfterTranslation().size()
               ? bool(shader.GetTextureBindingsAfterTranslation()[i].is_signed)
               : false;
+      if (fetch_constant < exact_resolved_textures.size() &&
+          (exact_resolved_texture_mask & (UINT32_C(1) << fetch_constant))) {
+        // The translator declares separate signed and unsigned resource slots.
+        // GetExactResolvedSurfaceTextureForFetch rejects signed runtime fetches,
+        // so only the unsigned sampling branch can execute. Binding the same
+        // snapshot to the inactive signed slot merely satisfies the layout.
+        slots[i].metal_texture = exact_resolved_textures[fetch_constant];
+        slots[i].width = exact_resolved_texture_widths[fetch_constant];
+        slots[i].height = exact_resolved_texture_heights[fetch_constant];
+        slots[i].array_length = 1;
+        static std::atomic<uint32_t> exact_resolved_texture_logs{0};
+        uint32_t exact_resolved_texture_index =
+            exact_resolved_texture_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogMetalDiagnostic(exact_resolved_texture_index, 8, 0x3F)) {
+          std::fprintf(stderr,
+                       "[metal] direct resolved texture#%u %s shader=%016llx binding=%zu "
+                       "fetch=%u signed_slot=%u size=%ux%u\n",
+                       exact_resolved_texture_index, stage,
+                       static_cast<unsigned long long>(shader.ucode_data_hash()), i, fetch_constant,
+                       binding_is_signed ? 1u : 0u, slots[i].width, slots[i].height);
+          std::fflush(stderr);
+        }
+        continue;
+      }
       if (texture_cache_) {
         if (void* cached_texture =
                 texture_cache_->GetActiveTexture(fetch_constant, binding_is_signed)) {
@@ -10071,8 +10791,12 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
   uint32_t probe_height = std::max<uint32_t>(fallback_output_height_, 1);
   draw_util::ViewportInfo probe_viewport_info = {};
   reg::RB_DEPTHCONTROL probe_depth_control = draw_util::GetNormalizedDepthControl(*register_file_);
+  bool probe_depth_float24 =
+      probe_depth_control.z_enable &&
+      register_file_->Get<reg::RB_DEPTH_INFO>().depth_format ==
+          xenos::DepthRenderTargetFormat::kD24FS8;
   draw_util::GetHostViewportInfo(*register_file_, 1, 1, true, probe_width, probe_height, true,
-                                 probe_depth_control, false, false,
+                                 probe_depth_control, probe_depth_float24, probe_depth_float24,
                                  pixel_shader && pixel_shader->writes_depth(), probe_viewport_info);
   draw_util::Scissor probe_scissor = {};
   draw_util::GetScissor(*register_file_, probe_scissor);
@@ -10105,6 +10829,20 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
       register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
           xenos::VGTOutputPath::kTessellationEnable,
       guest_primitive_type);
+  float guest_depth_bias_slope = 0.0f;
+  float guest_depth_bias_constant = 0.0f;
+  draw_util::GetPreferredFacePolygonOffset(*register_file_, guest_primitive_polygonal,
+                                           guest_depth_bias_slope, guest_depth_bias_constant);
+  probe_rasterization_state.depth_bias =
+      guest_depth_bias_constant *
+      (register_file_->Get<reg::RB_DEPTH_INFO>().depth_format ==
+               xenos::DepthRenderTargetFormat::kD24S8
+           ? draw_util::kD3D10PolygonOffsetFactorUnorm24
+           : draw_util::kD3D10PolygonOffsetFactorFloat24);
+  probe_rasterization_state.depth_bias_slope_scale =
+      guest_depth_bias_slope * xenos::kPolygonOffsetScaleSubpixelUnit;
+  probe_rasterization_state.depth_clamp_enabled =
+      register_file_->Get<reg::PA_CL_CLIP_CNTL>().clip_disable != 0;
   if (guest_primitive_polygonal) {
     reg::PA_SU_SC_MODE_CNTL mode_control = register_file_->Get<reg::PA_SU_SC_MODE_CNTL>();
     // PA_SU_SC_MODE_CNTL::face uses the same convention as Metal: zero is
@@ -11390,68 +12128,71 @@ bool MetalCommandProcessor::DecodeSwapTextureToBgra(uint32_t fallback_frontbuffe
       fetch_pitch && fetch.tiled
           ? texture_util::GetTiledAddressUpperBound2D(fetch_pitch, height, fetch_pitch, 2)
           : 0;
-  const ExactResolvedSurface& exact = exact_resolved_surface_;
-  bool exact_cache_hit =
-      exact.valid && fetch.tiled && fetch_pitch >= width && base_physical == exact.base &&
-      last_copy_dest_base_ == exact.base && fetch_pitch == exact.pitch &&
-      uint32_t(fetch.endianness) == uint32_t(exact.endian) && exact.bgra_height >= height &&
-      exact.bgra.size() >= size_t(exact.pitch) * height * 4 && required_tiled_extent &&
-      exact.tiled_extent >= required_tiled_extent;
-  if (exact_cache_hit) {
-    bgra_out.resize(size_t(width) * height * 4);
-    constexpr uint8_t kGuestRgbaToCachedBgra[6] = {2, 1, 0, 3, 4, 5};
-    uint8_t output_source[4] = {
-        kGuestRgbaToCachedBgra[SwizzleComponent(fetch.swizzle, 2)],
-        kGuestRgbaToCachedBgra[SwizzleComponent(fetch.swizzle, 1)],
-        kGuestRgbaToCachedBgra[SwizzleComponent(fetch.swizzle, 0)],
-        kGuestRgbaToCachedBgra[SwizzleComponent(fetch.swizzle, 3)],
-    };
-    const bool direct_copy = output_source[0] == 0 && output_source[1] == 1 &&
-                             output_source[2] == 2 && output_source[3] == 3;
-    const bool swap_red_blue = output_source[0] == 2 && output_source[1] == 1 &&
-                               output_source[2] == 0 &&
-                               (output_source[3] == 3 || output_source[3] == 5);
-    for (uint32_t y = 0; y < height; ++y) {
-      const uint8_t* source_row = exact.bgra.data() + size_t(y) * exact.pitch * 4;
-      uint8_t* target_row = bgra_out.data() + size_t(y) * width * 4;
-      if (direct_copy) {
-        std::memcpy(target_row, source_row, size_t(width) * 4);
-        continue;
-      }
-      uint32_t x = 0;
+  {
+    std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+    const ExactResolvedSurface& exact = exact_resolved_surface_;
+    bool exact_cache_hit =
+        exact.valid && fetch.tiled && fetch_pitch >= width && base_physical == exact.base &&
+        last_copy_dest_base_ == exact.base && fetch_pitch == exact.pitch &&
+        uint32_t(fetch.endianness) == uint32_t(exact.endian) && exact.bgra_height >= height &&
+        exact.bgra.size() >= size_t(exact.pitch) * height * 4 && required_tiled_extent &&
+        exact.tiled_extent >= required_tiled_extent;
+    if (exact_cache_hit) {
+      bgra_out.resize(size_t(width) * height * 4);
+      constexpr uint8_t kGuestRgbaToCachedBgra[6] = {2, 1, 0, 3, 4, 5};
+      uint8_t output_source[4] = {
+          kGuestRgbaToCachedBgra[SwizzleComponent(fetch.swizzle, 2)],
+          kGuestRgbaToCachedBgra[SwizzleComponent(fetch.swizzle, 1)],
+          kGuestRgbaToCachedBgra[SwizzleComponent(fetch.swizzle, 0)],
+          kGuestRgbaToCachedBgra[SwizzleComponent(fetch.swizzle, 3)],
+      };
+      const bool direct_copy = output_source[0] == 0 && output_source[1] == 1 &&
+                               output_source[2] == 2 && output_source[3] == 3;
+      const bool swap_red_blue = output_source[0] == 2 && output_source[1] == 1 &&
+                                 output_source[2] == 0 &&
+                                 (output_source[3] == 3 || output_source[3] == 5);
+      for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* source_row = exact.bgra.data() + size_t(y) * exact.pitch * 4;
+        uint8_t* target_row = bgra_out.data() + size_t(y) * width * 4;
+        if (direct_copy) {
+          std::memcpy(target_row, source_row, size_t(width) * 4);
+          continue;
+        }
+        uint32_t x = 0;
 #if defined(__aarch64__) || defined(_M_ARM64)
-      if (swap_red_blue) {
-        uint8x16_t forced_alpha = vdupq_n_u8(0xFF);
-        for (; x + 16 <= width; x += 16) {
-          uint8x16x4_t source = vld4q_u8(source_row + size_t(x) * 4);
-          uint8x16x4_t target = {{source.val[2], source.val[1], source.val[0],
-                                  output_source[3] == 3 ? source.val[3] : forced_alpha}};
-          vst4q_u8(target_row + size_t(x) * 4, target);
+        if (swap_red_blue) {
+          uint8x16_t forced_alpha = vdupq_n_u8(0xFF);
+          for (; x + 16 <= width; x += 16) {
+            uint8x16x4_t source = vld4q_u8(source_row + size_t(x) * 4);
+            uint8x16x4_t target = {{source.val[2], source.val[1], source.val[0],
+                                    output_source[3] == 3 ? source.val[3] : forced_alpha}};
+            vst4q_u8(target_row + size_t(x) * 4, target);
+          }
         }
-      }
 #endif
-      for (; x < width; ++x) {
-        const uint8_t* source = source_row + size_t(x) * 4;
-        uint8_t* target = target_row + size_t(x) * 4;
-        for (uint32_t component = 0; component < 4; ++component) {
-          uint8_t source_index = output_source[component];
-          target[component] =
-              source_index < 4 ? source[source_index] : (source_index == 5 ? 0xFF : 0);
+        for (; x < width; ++x) {
+          const uint8_t* source = source_row + size_t(x) * 4;
+          uint8_t* target = target_row + size_t(x) * 4;
+          for (uint32_t component = 0; component < 4; ++component) {
+            uint8_t source_index = output_source[component];
+            target[component] =
+                source_index < 4 ? source[source_index] : (source_index == 5 ? 0xFF : 0);
+          }
         }
       }
+      width_out = width;
+      height_out = height;
+      static std::atomic<uint32_t> exact_swap_cache_hit_logs{0};
+      uint32_t hit_index = exact_swap_cache_hit_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (hit_index <= 8 || (hit_index & 0x3F) == 0) {
+        std::fprintf(stderr,
+                     "[metal] exact swap resolve cache hit#%u base=0x%08x size=%ux%u "
+                     "pitch=%u extent=%u\n",
+                     hit_index, exact.base, width, height, exact.pitch, required_tiled_extent);
+        std::fflush(stderr);
+      }
+      return true;
     }
-    width_out = width;
-    height_out = height;
-    static std::atomic<uint32_t> exact_swap_cache_hit_logs{0};
-    uint32_t hit_index = exact_swap_cache_hit_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (hit_index <= 8 || (hit_index & 0x3F) == 0) {
-      std::fprintf(stderr,
-                   "[metal] exact swap resolve cache hit#%u base=0x%08x size=%ux%u "
-                   "pitch=%u extent=%u\n",
-                   hit_index, exact.base, width, height, exact.pitch, required_tiled_extent);
-      std::fflush(stderr);
-    }
-    return true;
   }
 
   std::vector<uint8_t> rgba;

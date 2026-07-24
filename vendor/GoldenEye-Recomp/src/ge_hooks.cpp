@@ -185,6 +185,13 @@ static_assert(!ge_hold_gpu_watchdog_time(true, true, true, false));
 static_assert(!ge_hold_gpu_watchdog_time(false, false, false, false));
 }  // namespace
 
+void ge_notify_wait_reg_mem_write(PPCRegister& fence_base) {
+  if (auto* command_processor = ge_cp()) {
+    command_processor->NotifyWaitRegMemMemoryWrite(fence_base.u32 + sizeof(uint32_t),
+                                                    sizeof(uint32_t));
+  }
+}
+
 namespace {
 constexpr uint32_t kGuestLowMemoryStart = 0x10000u;
 constexpr uint32_t kGuestLowMemoryEnd = 0x70000000u;

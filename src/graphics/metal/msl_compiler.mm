@@ -100,7 +100,8 @@ bool IsProbeRasterizationStateValid(const ProbeRasterizationState* state, uint32
       state->scissor_y > height || state->scissor_width > width - state->scissor_x ||
       state->scissor_height > height - state->scissor_y || !std::isfinite(state->blend_red) ||
       !std::isfinite(state->blend_green) || !std::isfinite(state->blend_blue) ||
-      !std::isfinite(state->blend_alpha) ||
+      !std::isfinite(state->blend_alpha) || !std::isfinite(state->depth_bias) ||
+      !std::isfinite(state->depth_bias_slope_scale) ||
       uint32_t(state->cull_mode) > uint32_t(ProbeCullMode::kBack)) {
     return false;
   }
@@ -887,6 +888,9 @@ struct ProbeDepthStencilTarget {
   uint32_t height = 0;
   uint32_t sample_count = 1;
   bool initialized = false;
+  // Once multiple color contexts share this target, its logical dimensions
+  // may only be changed by an explicit coordinated depth reset.
+  bool extent_locked = false;
   // An open render encoder retains exclusive logical ownership. Before a
   // different color context uses this target, the previous owner's command
   // buffer is finalized so commits to the shared queue preserve draw order.
@@ -911,6 +915,7 @@ struct PipelineProbeContext {
   std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_stencil_state_cache;
   id<MTLRenderPipelineState> clear_pipeline_state = nil;
   id<MTLRenderPipelineState> depth_clear_pipeline_state = nil;
+  id<MTLComputePipelineState> multisample_select_resolve_pipeline_state = nil;
   id<MTLComputePipelineState> tiled_resolve_pipeline_state = nil;
   MTLStorageMode storage_mode = MTLStorageModeShared;
   uint32_t width = 0;
@@ -969,6 +974,9 @@ void DetachProbeDepthStencilTarget(PipelineProbeContext* context) {
   if (attached_it != target->attached_contexts.end()) {
     target->attached_contexts.erase(attached_it);
   }
+  if (target->attached_contexts.size() <= 1) {
+    target->extent_locked = false;
+  }
   context->depth_stencil_target = nullptr;
   if (!target->attached_contexts.empty()) {
     return;
@@ -985,6 +993,7 @@ void AttachProbeDepthStencilTarget(PipelineProbeContext* context, ProbeDepthSten
   }
   DetachProbeDepthStencilTarget(context);
   target->attached_contexts.push_back(context);
+  target->extent_locked = target->attached_contexts.size() > 1;
   context->depth_stencil_target = target;
 }
 
@@ -1006,6 +1015,14 @@ void InvalidateProbeContextTargets(PipelineProbeContext* context) {
   }
 }
 
+void InvalidateProbeContextColorTarget(PipelineProbeContext* context) {
+  if (!context) {
+    return;
+  }
+  context->initialized = false;
+  context->color_resolve_dirty = false;
+}
+
 struct TiledResolveConstants {
   uint32_t source_row_pitch;
   uint32_t destination_buffer_offset;
@@ -1015,6 +1032,15 @@ struct TiledResolveConstants {
   uint32_t copy_width;
   uint32_t copy_height;
   uint32_t destination_endian;
+};
+
+struct MultisampleSelectResolveConstants {
+  uint32_t source_x;
+  uint32_t source_y;
+  uint32_t copy_width;
+  uint32_t copy_height;
+  uint32_t destination_row_pitch;
+  uint32_t host_sample_mask;
 };
 
 void ConfigureProbeDepthStencilPass(MTLRenderPassDescriptor* pass,
@@ -1162,6 +1188,146 @@ void DiscardEmptyOpenPipelineProbeCommandBuffer(PipelineProbeContext* context) {
   context->open_upload_arena_index = kInvalidProbeUploadArena;
   ReleaseOpenProbeDepthStencilOwnership(context);
   ResetOpenProbeBindingTracking(context);
+}
+
+bool GetProbeColorSampleMask(uint32_t sample_count, uint32_t sample_select,
+                             uint32_t& host_sample_mask_out) {
+  uint32_t full_sample_mask = (uint32_t(1) << sample_count) - 1;
+  if (sample_select == UINT32_MAX) {
+    host_sample_mask_out = full_sample_mask;
+    return true;
+  }
+  if (sample_count == 1) {
+    if (sample_select != 0) {
+      return false;
+    }
+    host_sample_mask_out = 1;
+    return true;
+  }
+  if (sample_count == 2) {
+    // Xenos 2x sample 0 is the top sample. In the standard native 2x pattern,
+    // Metal sample 1 is top-left and sample 0 is bottom-right.
+    switch (sample_select) {
+      case 0:
+        host_sample_mask_out = uint32_t(1) << 1;
+        return true;
+      case 1:
+        host_sample_mask_out = uint32_t(1) << 0;
+        return true;
+      case 4:
+        host_sample_mask_out = full_sample_mask;
+        return true;
+      default:
+        return false;
+    }
+  }
+  if (sample_count == 4) {
+    // Xenos orders the samples TL, BL, TR, BR, while Metal uses the standard
+    // host ordering TL, TR, BL, BR.
+    constexpr uint32_t kGuestToHostSample[4] = {0, 2, 1, 3};
+    switch (sample_select) {
+      case 0:
+      case 1:
+      case 2:
+      case 3:
+        host_sample_mask_out = uint32_t(1) << kGuestToHostSample[sample_select];
+        return true;
+      case 4:
+        host_sample_mask_out =
+            (uint32_t(1) << kGuestToHostSample[0]) | (uint32_t(1) << kGuestToHostSample[1]);
+        return true;
+      case 5:
+        host_sample_mask_out =
+            (uint32_t(1) << kGuestToHostSample[2]) | (uint32_t(1) << kGuestToHostSample[3]);
+        return true;
+      case 6:
+        host_sample_mask_out = full_sample_mask;
+        return true;
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
+bool EnsureMultisampleSelectResolvePipelineState(PipelineProbeContext* context,
+                                                 std::string* error_out) {
+  if (!context || !context->device) {
+    if (error_out) {
+      *error_out = "missing probe context or Metal device";
+    }
+    return false;
+  }
+  if (context->multisample_select_resolve_pipeline_state) {
+    return true;
+  }
+  static constexpr char kMultisampleSelectResolveMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MultisampleSelectResolveConstants {
+  uint source_x;
+  uint source_y;
+  uint copy_width;
+  uint copy_height;
+  uint destination_row_pitch;
+  uint host_sample_mask;
+};
+
+kernel void resolve_selected_color_samples(
+    texture2d_ms<float, access::read> source [[texture(0)]],
+    device uchar* destination [[buffer(0)]],
+    constant MultisampleSelectResolveConstants& constants [[buffer(1)]],
+    uint2 position [[thread_position_in_grid]]) {
+  if (position.x >= constants.copy_width || position.y >= constants.copy_height) {
+    return;
+  }
+  float4 rgba = 0.0f;
+  uint selected_count = 0;
+  for (uint sample = 0; sample < 4; ++sample) {
+    if (constants.host_sample_mask & (1u << sample)) {
+      rgba += source.read(position + uint2(constants.source_x, constants.source_y), sample);
+      ++selected_count;
+    }
+  }
+  rgba /= float(max(selected_count, 1u));
+  uchar4 bgra = uchar4(clamp(rint(rgba.zyxw * 255.0f), 0.0f, 255.0f));
+  uint destination_offset = position.y * constants.destination_row_pitch + position.x * 4u;
+  destination[destination_offset] = bgra.x;
+  destination[destination_offset + 1u] = bgra.y;
+  destination[destination_offset + 2u] = bgra.z;
+  destination[destination_offset + 3u] = bgra.w;
+}
+)MSL";
+
+  NSError* error = nil;
+  id<MTLLibrary> library =
+      [context->device
+          newLibraryWithSource:[NSString stringWithUTF8String:kMultisampleSelectResolveMsl]
+                       options:nil
+                         error:&error];
+  if (!library) {
+    if (error_out) {
+      *error_out = error ? [[error localizedDescription] UTF8String]
+                         : "multisample select resolve compute library failed";
+    }
+    return false;
+  }
+  id<MTLFunction> function = [library newFunctionWithName:@"resolve_selected_color_samples"];
+  if (function) {
+    context->multisample_select_resolve_pipeline_state =
+        [context->device newComputePipelineStateWithFunction:function error:&error];
+    [function release];
+  }
+  [library release];
+  if (!context->multisample_select_resolve_pipeline_state) {
+    if (error_out) {
+      *error_out = error ? [[error localizedDescription] UTF8String]
+                         : "multisample select resolve compute pipeline failed";
+    }
+    return false;
+  }
+  return true;
 }
 
 bool EnsureTiledResolvePipelineState(PipelineProbeContext* context, std::string* error_out) {
@@ -1663,6 +1829,14 @@ bool EnsureProbeDepthStencilTexture(PipelineProbeContext* context, uint32_t widt
   if (target->texture && target->width == width && target->height == height) {
     return true;
   }
+  if (target->width && target->height &&
+      (target->width != width || target->height != height) &&
+      (target->extent_locked || target->attached_contexts.size() > 1)) {
+    if (error_out) {
+      *error_out = "shared depth/stencil target dimensions are locked to another color target";
+    }
+    return false;
+  }
 
   // A resize replaces the texture shared by every attached color context.
   // Drain all of them first so no encoder can retain the old texture while
@@ -1671,11 +1845,6 @@ bool EnsureProbeDepthStencilTexture(PipelineProbeContext* context, uint32_t widt
     if (!WaitPendingPipelineProbeCommands(attached_context, error_out, nullptr)) {
       return false;
     }
-  }
-  target->open_owner = nullptr;
-  if (target->texture) {
-    [target->texture release];
-    target->texture = nil;
   }
   MTLTextureDescriptor* descriptor =
       [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
@@ -1688,19 +1857,22 @@ bool EnsureProbeDepthStencilTexture(PipelineProbeContext* context, uint32_t widt
   }
   descriptor.usage = MTLTextureUsageRenderTarget;
   descriptor.storageMode = MTLStorageModePrivate;
-  target->texture = [target->device newTextureWithDescriptor:descriptor];
-  if (!target->texture) {
-    target->width = 0;
-    target->height = 0;
-    target->initialized = false;
+  id<MTLTexture> replacement_texture = [target->device newTextureWithDescriptor:descriptor];
+  if (!replacement_texture) {
     if (error_out) {
       *error_out = "failed to create persistent probe depth/stencil texture";
     }
     return false;
   }
+  target->open_owner = nullptr;
+  if (target->texture) {
+    [target->texture release];
+  }
+  target->texture = replacement_texture;
   target->width = width;
   target->height = height;
   target->initialized = false;
+  target->extent_locked = target->attached_contexts.size() > 1;
   return true;
 }
 
@@ -2188,12 +2360,22 @@ bool SharePipelineProbeDepthStencilTarget(void* opaque_destination_context,
   }
   ProbeDepthStencilTarget* source_target = source_context->depth_stencil_target;
   ProbeDepthStencilTarget* destination_target = destination_context->depth_stencil_target;
-  if (source_target->texture && ((destination_context->render_texture &&
-                                  (destination_context->width != source_target->width ||
-                                   destination_context->height != source_target->height)) ||
-                                 (destination_target && destination_target->texture &&
-                                  (destination_target->width != source_target->width ||
-                                   destination_target->height != source_target->height)))) {
+  uint32_t source_width = source_target->width;
+  uint32_t source_height = source_target->height;
+  if ((!source_width || !source_height) && source_context->render_texture) {
+    source_width = source_context->width;
+    source_height = source_context->height;
+  }
+  uint32_t destination_width =
+      destination_context->render_texture
+          ? destination_context->width
+          : (destination_target ? destination_target->width : 0);
+  uint32_t destination_height =
+      destination_context->render_texture
+          ? destination_context->height
+          : (destination_target ? destination_target->height : 0);
+  if (source_width && source_height && destination_width && destination_height &&
+      (source_width != destination_width || source_height != destination_height)) {
     if (error_out) {
       *error_out = "shared depth/stencil contexts have incompatible target dimensions";
     }
@@ -2201,6 +2383,10 @@ bool SharePipelineProbeDepthStencilTarget(void* opaque_destination_context,
   }
   if (!WaitPendingPipelineProbeCommands(destination_context, error_out, nullptr)) {
     return false;
+  }
+  if ((!source_width || !source_height) && destination_width && destination_height) {
+    source_target->width = destination_width;
+    source_target->height = destination_height;
   }
   AttachProbeDepthStencilTarget(destination_context, source_target);
   return true;
@@ -2265,6 +2451,7 @@ bool SetPipelineProbeContextSampleCount(void* opaque_context, uint32_t sample_co
     target->width = 0;
     target->height = 0;
     target->initialized = false;
+    target->extent_locked = false;
     return true;
   }
 }
@@ -2284,6 +2471,11 @@ void* CreatePipelineProbeSnapshotTexture(void* metal_device, uint32_t width, uin
                                                            width:width
                                                           height:height
                                                        mipmapped:NO];
+    // Guest 2D fetches are translated as texture2d_array so one-layer and
+    // stacked textures share a binding type. Keep the resolve snapshot directly
+    // bindable by those shaders while presentation continues to use slice 0.
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.arrayLength = 1;
     descriptor.storageMode = MTLStorageModePrivate;
     descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
@@ -2293,7 +2485,7 @@ void* CreatePipelineProbeSnapshotTexture(void* metal_device, uint32_t width, uin
       }
       return nullptr;
     }
-    texture.label = @"ReX Metal exact resolved presentation snapshot";
+    texture.label = @"ReX Metal exact resolved surface snapshot";
     return (void*)texture;
   }
 }
@@ -2397,8 +2589,42 @@ void ResetPipelineProbeContext(void* opaque_context) {
                      waited_submission_count, finalize_error.c_str());
       }
     }
-    InvalidateProbeContextTargets(context);
+    bool depth_stencil_exclusive =
+        context->depth_stencil_target &&
+        context->depth_stencil_target->attached_contexts.size() == 1;
+    InvalidateProbeContextColorTarget(context);
+    if (depth_stencil_exclusive) {
+      context->depth_stencil_target->initialized = false;
+    }
   }
+}
+
+void ResetPipelineProbeDepthStencilTarget(void* opaque_context) {
+  auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+  if (!context || !context->depth_stencil_target) {
+    return;
+  }
+  ProbeDepthStencilTarget* target = context->depth_stencil_target;
+  std::string wait_error;
+  for (PipelineProbeContext* attached_context : target->attached_contexts) {
+    uint32_t waited_submission_count = 0;
+    if (!WaitPendingPipelineProbeCommands(attached_context, &wait_error,
+                                          &waited_submission_count)) {
+      std::fprintf(stderr,
+                   "[metal] shared depth/stencil reset drained %u failed submission(s): %s\n",
+                   waited_submission_count, wait_error.c_str());
+      wait_error.clear();
+    }
+  }
+  target->open_owner = nullptr;
+  if (target->texture) {
+    [target->texture release];
+    target->texture = nil;
+  }
+  target->width = 0;
+  target->height = 0;
+  target->initialized = false;
+  target->extent_locked = target->attached_contexts.size() > 1;
 }
 
 void ReleasePipelineProbeContext(void* opaque_context) {
@@ -2417,6 +2643,9 @@ void ReleasePipelineProbeContext(void* opaque_context) {
   }
   if (context->depth_clear_pipeline_state) {
     [context->depth_clear_pipeline_state release];
+  }
+  if (context->multisample_select_resolve_pipeline_state) {
+    [context->multisample_select_resolve_pipeline_state release];
   }
   if (context->tiled_resolve_pipeline_state) {
     [context->tiled_resolve_pipeline_state release];
@@ -2655,6 +2884,7 @@ bool QueuePipelineProbeContextClearRect(void* opaque_context, uint32_t width, ui
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     [encoder setCullMode:MTLCullModeNone];
     [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+    [encoder setDepthBias:0.0 slopeScale:0.0 clamp:0.0];
     [encoder setDepthClipMode:MTLDepthClipModeClip];
     [encoder setBlendColorRed:0.0 green:0.0 blue:0.0 alpha:0.0];
     [encoder setRenderPipelineState:context->clear_pipeline_state];
@@ -2739,6 +2969,7 @@ bool QueuePipelineProbeContextDepthStencilClearRect(void* opaque_context, uint32
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     [encoder setCullMode:MTLCullModeNone];
     [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+    [encoder setDepthBias:0.0 slopeScale:0.0 clamp:0.0];
     [encoder setDepthClipMode:MTLDepthClipModeClip];
     [encoder setRenderPipelineState:context->depth_clear_pipeline_state];
     [encoder setDepthStencilState:metal_clear_state];
@@ -2802,7 +3033,7 @@ bool RenderPipelineProbeToContext(
     }
     if (!IsProbeRasterizationStateValid(rasterization_state, width, height)) {
       if (error_out) {
-        *error_out = "invalid probe viewport or scissor";
+        *error_out = "invalid probe rasterization state";
       }
       return false;
     }
@@ -2955,6 +3186,12 @@ bool RenderPipelineProbeToContext(
     [encoder setFrontFacingWinding:rasterization_state && rasterization_state->front_face_clockwise
                                        ? MTLWindingClockwise
                                        : MTLWindingCounterClockwise];
+    [encoder setDepthBias:rasterization_state ? rasterization_state->depth_bias : 0.0
+               slopeScale:rasterization_state ? rasterization_state->depth_bias_slope_scale : 0.0
+                    clamp:0.0];
+    [encoder setDepthClipMode:rasterization_state && rasterization_state->depth_clamp_enabled
+                                  ? MTLDepthClipModeClamp
+                                  : MTLDepthClipModeClip];
     [encoder setDepthStencilState:metal_depth_stencil_state];
     [encoder
         setStencilFrontReferenceValue:depth_stencil_state ? depth_stencil_state->front.reference : 0
@@ -3194,6 +3431,139 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
   }
 }
 
+bool ReadPipelineProbeContextRectSampleSelected(
+    void* opaque_context, uint32_t width, uint32_t height, uint32_t x, uint32_t y,
+    uint32_t read_width, uint32_t read_height, uint32_t color_sample_select,
+    std::vector<uint8_t>& bgra_out, std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    bgra_out.clear();
+    if (!context) {
+      if (error_out) {
+        *error_out = "missing probe context";
+      }
+      return false;
+    }
+    auto reject_and_drain = [&](const std::string& reason) {
+      std::string drain_error;
+      bool drained = WaitPendingPipelineProbeCommands(context, &drain_error, nullptr);
+      if (error_out) {
+        *error_out = reason;
+        if (!drained && !drain_error.empty()) {
+          error_out->append("; prior render work failed: ");
+          error_out->append(drain_error);
+        }
+      }
+      return false;
+    };
+
+    bool texture_valid = context->render_texture && context->initialized && width && height &&
+                         context->width == width && context->height == height;
+    if (!texture_valid) {
+      return reject_and_drain(
+          "persistent multisample probe texture is unavailable or has a different size");
+    }
+    uint32_t host_sample_mask = 0;
+    if (!GetProbeColorSampleMask(context->sample_count, color_sample_select,
+                                 host_sample_mask)) {
+      return reject_and_drain("probe read sample selection is invalid for the sample count");
+    }
+    uint32_t full_host_sample_mask = (uint32_t(1) << context->sample_count) - 1;
+    if (host_sample_mask == full_host_sample_mask) {
+      return ReadPipelineProbeContextRect(opaque_context, width, height, x, y, read_width,
+                                          read_height, bgra_out, error_out);
+    }
+    if (!context->multisample_render_texture) {
+      return reject_and_drain("persistent multisample probe texture is unavailable");
+    }
+    if (!read_width || !read_height || x >= width || y >= height || read_width > width - x ||
+        read_height > height - y || size_t(read_width) > SIZE_MAX / 4 ||
+        size_t(read_height) > SIZE_MAX / (size_t(read_width) * 4)) {
+      return reject_and_drain("persistent probe read rectangle is empty or out of bounds");
+    }
+
+    std::string setup_error;
+    if (!EnsureMultisampleSelectResolvePipelineState(context, &setup_error)) {
+      return reject_and_drain(setup_error);
+    }
+    size_t row_pitch = (size_t(read_width) * 4 + 255) & ~size_t(255);
+    id<MTLBuffer> readback_buffer =
+        EnsureProbeReadbackBuffer(context, width, height, row_pitch, read_height, &setup_error);
+    if (!readback_buffer) {
+      return reject_and_drain(setup_error);
+    }
+    if (!FinalizeOpenPipelineProbeCommandBuffer(context, &setup_error)) {
+      return reject_and_drain(setup_error.empty()
+                                  ? "failed to finalize pending render work for selected read"
+                                  : setup_error);
+    }
+
+    id<MTLCommandBuffer> command_buffer = [context->command_queue commandBuffer];
+    if (!command_buffer) {
+      return reject_and_drain("failed to create selected-sample read command buffer");
+    }
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (!encoder) {
+      return reject_and_drain("failed to create selected-sample read compute encoder");
+    }
+    MultisampleSelectResolveConstants constants = {
+        x, y, read_width, read_height, uint32_t(row_pitch), host_sample_mask};
+    id<MTLComputePipelineState> pipeline_state =
+        context->multisample_select_resolve_pipeline_state;
+    [encoder setComputePipelineState:pipeline_state];
+    [encoder setTexture:context->multisample_render_texture atIndex:0];
+    [encoder setBuffer:readback_buffer offset:0 atIndex:0];
+    [encoder setBytes:&constants length:sizeof(constants) atIndex:1];
+    NSUInteger thread_width = std::max<NSUInteger>(
+        1, std::min<NSUInteger>(read_width, [pipeline_state threadExecutionWidth]));
+    NSUInteger max_threads = [pipeline_state maxTotalThreadsPerThreadgroup];
+    NSUInteger thread_height =
+        std::max<NSUInteger>(1, std::min<NSUInteger>(read_height, max_threads / thread_width));
+    [encoder dispatchThreads:MTLSizeMake(read_width, read_height, 1)
+       threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
+    [encoder endEncoding];
+    ++context->multisample_resolve_count;
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+
+    std::string prior_error;
+    bool prior_commands_succeeded = ConsumeCompletedPipelineProbeCommands(context, &prior_error);
+    bool read_succeeded = [command_buffer status] == MTLCommandBufferStatusCompleted;
+    if (!prior_commands_succeeded || !read_succeeded) {
+      if (error_out) {
+        error_out->clear();
+        if (!prior_commands_succeeded) {
+          error_out->append("prior render work failed: ");
+          error_out->append(prior_error);
+        }
+        if (!read_succeeded) {
+          if (!error_out->empty()) {
+            error_out->append("; ");
+          }
+          NSError* command_error = [command_buffer error];
+          const char* description =
+              command_error ? [[command_error localizedDescription] UTF8String] : nullptr;
+          error_out->append(description ? description : "selected-sample read failed");
+        }
+      }
+      return false;
+    }
+
+    size_t tight_row_pitch = size_t(read_width) * 4;
+    bgra_out.resize(tight_row_pitch * read_height);
+    const uint8_t* source = static_cast<const uint8_t*>([readback_buffer contents]);
+    if (row_pitch == tight_row_pitch) {
+      std::memcpy(bgra_out.data(), source, tight_row_pitch * read_height);
+    } else {
+      for (uint32_t row = 0; row < read_height; ++row) {
+        std::memcpy(bgra_out.data() + size_t(row) * tight_row_pitch,
+                    source + size_t(row) * row_pitch, tight_row_pitch);
+      }
+    }
+    return true;
+  }
+}
+
 bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t width, uint32_t height,
                                              uint32_t source_x, uint32_t source_y,
                                              uint32_t resolve_width, uint32_t resolve_height,
@@ -3230,6 +3600,14 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
     if (!texture_valid) {
       return reject_and_drain("persistent probe texture is unavailable or has a different size");
     }
+    uint32_t host_sample_mask = 0;
+    if (!GetProbeColorSampleMask(context->sample_count, destination.color_sample_select,
+                                 host_sample_mask)) {
+      return reject_and_drain("tiled resolve sample selection is invalid for the sample count");
+    }
+    uint32_t full_host_sample_mask = (uint32_t(1) << context->sample_count) - 1;
+    bool selective_multisample_resolve =
+        context->sample_count > 1 && host_sample_mask != full_host_sample_mask;
     if (!resolve_width || !resolve_height || source_x >= width || source_y >= height ||
         resolve_width > width - source_x || resolve_height > height - source_y ||
         !destination.metal_buffer || !destination.pitch || !destination.height ||
@@ -3285,7 +3663,9 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
     }
 
     std::string setup_error;
-    if (!EnsureTiledResolvePipelineState(context, &setup_error)) {
+    if (!EnsureTiledResolvePipelineState(context, &setup_error) ||
+        (selective_multisample_resolve &&
+         !EnsureMultisampleSelectResolvePipelineState(context, &setup_error))) {
       return reject_and_drain(setup_error);
     }
     size_t row_pitch = (size_t(resolve_width) * 4 + 255) & ~size_t(255);
@@ -3298,7 +3678,11 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
     // Commit render work without waiting. The blit and compute command buffer is
     // on the same queue, so waiting for it completes every earlier submission.
     std::string finalize_error;
-    if (!FinalizeProbeColorForConsumer(context, &finalize_error)) {
+    bool color_finalized =
+        selective_multisample_resolve
+            ? FinalizeOpenPipelineProbeCommandBuffer(context, &finalize_error)
+            : FinalizeProbeColorForConsumer(context, &finalize_error);
+    if (!color_finalized) {
       return reject_and_drain(finalize_error.empty()
                                   ? "failed to finalize pending render work for tiled resolve"
                                   : finalize_error);
@@ -3307,35 +3691,83 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
     if (!command_buffer) {
       return reject_and_drain("failed to create tiled resolve command buffer");
     }
-    id<MTLBlitCommandEncoder> blit_encoder = [command_buffer blitCommandEncoder];
-    if (!blit_encoder) {
-      return reject_and_drain("failed to create tiled resolve blit encoder");
-    }
-    [blit_encoder copyFromTexture:context->render_texture
-                      sourceSlice:0
-                      sourceLevel:0
-                     sourceOrigin:MTLOriginMake(source_x, source_y, 0)
-                       sourceSize:MTLSizeMake(resolve_width, resolve_height, 1)
-                         toBuffer:staging_buffer
-                destinationOffset:0
-           destinationBytesPerRow:row_pitch
-         destinationBytesPerImage:row_pitch * resolve_height];
-    if (presentation_snapshot) {
+    if (selective_multisample_resolve) {
+      id<MTLComputeCommandEncoder> sample_resolve_encoder =
+          [command_buffer computeCommandEncoder];
+      if (!sample_resolve_encoder) {
+        return reject_and_drain("failed to create multisample select resolve encoder");
+      }
+      MultisampleSelectResolveConstants sample_resolve_constants = {
+          source_x, source_y, resolve_width, resolve_height, uint32_t(row_pitch), host_sample_mask};
+      id<MTLComputePipelineState> sample_resolve_pipeline_state =
+          context->multisample_select_resolve_pipeline_state;
+      [sample_resolve_encoder setComputePipelineState:sample_resolve_pipeline_state];
+      [sample_resolve_encoder setTexture:context->multisample_render_texture atIndex:0];
+      [sample_resolve_encoder setBuffer:staging_buffer offset:0 atIndex:0];
+      [sample_resolve_encoder setBytes:&sample_resolve_constants
+                                length:sizeof(sample_resolve_constants)
+                               atIndex:1];
+      NSUInteger sample_thread_width = std::max<NSUInteger>(
+          1, std::min<NSUInteger>(resolve_width,
+                                  [sample_resolve_pipeline_state threadExecutionWidth]));
+      NSUInteger sample_max_threads = [sample_resolve_pipeline_state maxTotalThreadsPerThreadgroup];
+      NSUInteger sample_thread_height = std::max<NSUInteger>(
+          1, std::min<NSUInteger>(resolve_height, sample_max_threads / sample_thread_width));
+      [sample_resolve_encoder
+          dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
+          threadsPerThreadgroup:MTLSizeMake(sample_thread_width, sample_thread_height, 1)];
+      [sample_resolve_encoder endEncoding];
+      ++context->multisample_resolve_count;
+
+      if (presentation_snapshot) {
+        id<MTLBlitCommandEncoder> snapshot_encoder = [command_buffer blitCommandEncoder];
+        if (!snapshot_encoder) {
+          return reject_and_drain("failed to create selected-sample snapshot blit encoder");
+        }
+        [snapshot_encoder
+               copyFromBuffer:staging_buffer
+                 sourceOffset:0
+            sourceBytesPerRow:row_pitch
+          sourceBytesPerImage:row_pitch * resolve_height
+                  sourceSize:MTLSizeMake(resolve_width, resolve_height, 1)
+                   toTexture:presentation_snapshot
+            destinationSlice:0
+            destinationLevel:0
+           destinationOrigin:MTLOriginMake(destination.presentation_snapshot_x,
+                                           destination.presentation_snapshot_y, 0)];
+        [snapshot_encoder endEncoding];
+      }
+    } else {
+      id<MTLBlitCommandEncoder> blit_encoder = [command_buffer blitCommandEncoder];
+      if (!blit_encoder) {
+        return reject_and_drain("failed to create tiled resolve blit encoder");
+      }
       [blit_encoder copyFromTexture:context->render_texture
                         sourceSlice:0
                         sourceLevel:0
                        sourceOrigin:MTLOriginMake(source_x, source_y, 0)
                          sourceSize:MTLSizeMake(resolve_width, resolve_height, 1)
-                          toTexture:presentation_snapshot
-                   destinationSlice:0
-                   destinationLevel:0
-                  destinationOrigin:MTLOriginMake(destination.presentation_snapshot_x,
-                                                  destination.presentation_snapshot_y, 0)];
+                           toBuffer:staging_buffer
+                  destinationOffset:0
+             destinationBytesPerRow:row_pitch
+           destinationBytesPerImage:row_pitch * resolve_height];
+      if (presentation_snapshot) {
+        [blit_encoder copyFromTexture:context->render_texture
+                          sourceSlice:0
+                          sourceLevel:0
+                         sourceOrigin:MTLOriginMake(source_x, source_y, 0)
+                           sourceSize:MTLSizeMake(resolve_width, resolve_height, 1)
+                            toTexture:presentation_snapshot
+                     destinationSlice:0
+                     destinationLevel:0
+                    destinationOrigin:MTLOriginMake(destination.presentation_snapshot_x,
+                                                    destination.presentation_snapshot_y, 0)];
+      }
+      [blit_encoder endEncoding];
     }
-    [blit_encoder endEncoding];
 
-    id<MTLComputeCommandEncoder> compute_encoder = [command_buffer computeCommandEncoder];
-    if (!compute_encoder) {
+    id<MTLComputeCommandEncoder> tiled_compute_encoder = [command_buffer computeCommandEncoder];
+    if (!tiled_compute_encoder) {
       return reject_and_drain("failed to create tiled resolve compute encoder");
     }
     TiledResolveConstants constants = {
@@ -3345,18 +3777,18 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
         resolve_height,      destination.endian,
     };
     id<MTLComputePipelineState> pipeline_state = context->tiled_resolve_pipeline_state;
-    [compute_encoder setComputePipelineState:pipeline_state];
-    [compute_encoder setBuffer:staging_buffer offset:0 atIndex:0];
-    [compute_encoder setBuffer:destination_buffer offset:0 atIndex:1];
-    [compute_encoder setBytes:&constants length:sizeof(constants) atIndex:2];
+    [tiled_compute_encoder setComputePipelineState:pipeline_state];
+    [tiled_compute_encoder setBuffer:staging_buffer offset:0 atIndex:0];
+    [tiled_compute_encoder setBuffer:destination_buffer offset:0 atIndex:1];
+    [tiled_compute_encoder setBytes:&constants length:sizeof(constants) atIndex:2];
     NSUInteger thread_width = std::max<NSUInteger>(
         1, std::min<NSUInteger>(resolve_width, [pipeline_state threadExecutionWidth]));
     NSUInteger max_threads = [pipeline_state maxTotalThreadsPerThreadgroup];
     NSUInteger thread_height =
         std::max<NSUInteger>(1, std::min<NSUInteger>(resolve_height, max_threads / thread_width));
-    [compute_encoder dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
-               threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
-    [compute_encoder endEncoding];
+    [tiled_compute_encoder dispatchThreads:MTLSizeMake(resolve_width, resolve_height, 1)
+                     threadsPerThreadgroup:MTLSizeMake(thread_width, thread_height, 1)];
+    [tiled_compute_encoder endEncoding];
 
     if (guest_memory_buffer) {
       id<MTLBlitCommandEncoder> mirror_encoder = [command_buffer blitCommandEncoder];
@@ -3388,10 +3820,19 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
         }
         return false;
       }
+      if (destination.submission_callback && destination.submission_length) {
+        destination.submission_callback(destination.submission_callback_context,
+                                        destination.submission_start,
+                                        destination.submission_length);
+      }
       [command_buffer commit];
       return true;
     }
 
+    if (destination.submission_callback && destination.submission_length) {
+      destination.submission_callback(destination.submission_callback_context,
+                                      destination.submission_start, destination.submission_length);
+    }
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
 
@@ -3477,7 +3918,7 @@ bool RenderPipelineProbe(
   }
   if (!IsProbeRasterizationStateValid(rasterization_state, width, height)) {
     if (error_out) {
-      *error_out = "invalid probe viewport or scissor";
+      *error_out = "invalid probe rasterization state";
     }
     return false;
   }
@@ -3705,6 +4146,12 @@ bool RenderPipelineProbe(
   [encoder setFrontFacingWinding:rasterization_state && rasterization_state->front_face_clockwise
                                      ? MTLWindingClockwise
                                      : MTLWindingCounterClockwise];
+  [encoder setDepthBias:rasterization_state ? rasterization_state->depth_bias : 0.0
+             slopeScale:rasterization_state ? rasterization_state->depth_bias_slope_scale : 0.0
+                  clamp:0.0];
+  [encoder setDepthClipMode:rasterization_state && rasterization_state->depth_clamp_enabled
+                                ? MTLDepthClipModeClamp
+                                : MTLDepthClipModeClip];
   [encoder setDepthStencilState:metal_depth_stencil_state];
   [encoder
       setStencilFrontReferenceValue:depth_stencil_state ? depth_stencil_state->front.reference : 0

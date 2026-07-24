@@ -329,6 +329,60 @@ void DumpTranslatedMsl(const MetalShader& shader, uint64_t modification,
   }
 }
 
+bool TranslateSpirvToMslSource(const std::vector<uint8_t>& spirv_bytes,
+                               xenos::ShaderType shader_type, uint64_t shader_hash,
+                               uint64_t modification, std::string& msl_source_out,
+                               std::string* error_out) {
+#if REX_HAS_SPIRV_CROSS_MSL
+  if (spirv_bytes.empty() || (spirv_bytes.size() & 3)) {
+    if (error_out) {
+      *error_out = "invalid SPIR-V byte size " + std::to_string(spirv_bytes.size());
+    }
+    REXLOG_ERROR("Metal MSL translation failed: invalid SPIR-V byte size {}", spirv_bytes.size());
+    return false;
+  }
+
+  std::vector<uint32_t> spirv_words(spirv_bytes.size() / sizeof(uint32_t));
+  std::memcpy(spirv_words.data(), spirv_bytes.data(), spirv_bytes.size());
+
+  try {
+    spirv_cross::CompilerMSL compiler(spirv_words);
+    spirv_cross::CompilerMSL::Options options = compiler.get_msl_options();
+    options.platform = spirv_cross::CompilerMSL::Options::macOS;
+    options.msl_version = spirv_cross::CompilerMSL::Options::make_msl_version(3, 2, 0);
+    compiler.set_msl_options(options);
+    msl_source_out = compiler.compile();
+    SanitizeDiagnosticPragmas(msl_source_out);
+    if (shader_type == xenos::ShaderType::kVertex) {
+      SanitizeVertexMsl(msl_source_out, shader_hash, modification);
+    }
+    SanitizeSharedMemoryMsl(msl_source_out, shader_hash, modification);
+  } catch (const std::exception& e) {
+    if (error_out) {
+      *error_out = std::string("SPIRV-Cross MSL exception: ") + e.what();
+    }
+    std::fprintf(stderr, "[metal] SPIRV-Cross MSL exception: %s\n", e.what());
+    std::fflush(stderr);
+    REXLOG_ERROR("Metal MSL translation failed: {}", e.what());
+    return false;
+  }
+
+  if (msl_source_out.empty()) {
+    if (error_out) {
+      *error_out = "SPIRV-Cross produced empty MSL source";
+    }
+    return false;
+  }
+  return true;
+#else
+  if (error_out) {
+    *error_out = "SPIRV-Cross MSL support was not linked";
+  }
+  REXLOG_ERROR("Metal MSL translation unavailable: SPIRV-Cross MSL support was not linked");
+  return false;
+#endif
+}
+
 }  // namespace
 
 MetalShader::MetalShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
@@ -372,42 +426,13 @@ void MetalShader::MetalTranslation::ReflectMslSource() {
 }
 
 bool MetalShader::MetalTranslation::TranslateMslFromSpirv() {
-#if REX_HAS_SPIRV_CROSS_MSL
-  const std::vector<uint8_t>& spirv_bytes = translated_binary();
-  if (spirv_bytes.empty() || (spirv_bytes.size() & 3)) {
-    REXLOG_ERROR("Metal MSL translation failed: invalid SPIR-V byte size {}", spirv_bytes.size());
+  if (!TranslateSpirvToMslSource(translated_binary(), shader().type(), shader().ucode_data_hash(),
+                                 modification(), msl_source_, nullptr)) {
     return false;
   }
-
-  std::vector<uint32_t> spirv_words(spirv_bytes.size() / sizeof(uint32_t));
-  std::memcpy(spirv_words.data(), spirv_bytes.data(), spirv_bytes.size());
-
-  try {
-    spirv_cross::CompilerMSL compiler(spirv_words);
-    spirv_cross::CompilerMSL::Options options = compiler.get_msl_options();
-    options.platform = spirv_cross::CompilerMSL::Options::macOS;
-    options.msl_version = spirv_cross::CompilerMSL::Options::make_msl_version(3, 2, 0);
-    compiler.set_msl_options(options);
-    msl_source_ = compiler.compile();
-    SanitizeDiagnosticPragmas(msl_source_);
-    if (shader().type() == xenos::ShaderType::kVertex) {
-      SanitizeVertexMsl(msl_source_, shader().ucode_data_hash(), modification());
-    }
-    SanitizeSharedMemoryMsl(msl_source_, shader().ucode_data_hash(), modification());
-    ReflectMslSource();
-    DumpTranslatedMsl(static_cast<const MetalShader&>(shader()), modification(), msl_source_);
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "[metal] SPIRV-Cross MSL exception: %s\n", e.what());
-    std::fflush(stderr);
-    REXLOG_ERROR("Metal MSL translation failed: {}", e.what());
-    return false;
-  }
-
-  return !msl_source_.empty();
-#else
-  REXLOG_ERROR("Metal MSL translation unavailable: SPIRV-Cross MSL support was not linked");
-  return false;
-#endif
+  ReflectMslSource();
+  DumpTranslatedMsl(static_cast<const MetalShader&>(shader()), modification(), msl_source_);
+  return true;
 }
 
 bool MetalShader::MetalTranslation::CompileMslLibrary(void* metal_device, std::string* error_out) {
@@ -416,6 +441,20 @@ bool MetalShader::MetalTranslation::CompileMslLibrary(void* metal_device, std::s
   }
   metal_library_ = CreateMslLibrary(metal_device, msl_source_, error_out);
   return metal_library_ != nullptr;
+}
+
+void* CreateDepthOnlyFragmentMslLibrary(
+    void* metal_device, SpirvShaderTranslator& shader_translator,
+    SpirvShaderTranslator::Modification::DepthStencilMode depth_stencil_mode,
+    std::string* error_out) {
+  std::vector<uint8_t> spirv = shader_translator.CreateDepthOnlyFragmentShader(depth_stencil_mode);
+  std::string msl_source;
+  if (!TranslateSpirvToMslSource(spirv, xenos::ShaderType::kPixel, 0,
+                                 static_cast<uint64_t>(depth_stencil_mode), msl_source,
+                                 error_out)) {
+    return nullptr;
+  }
+  return CreateMslLibrary(metal_device, msl_source, error_out);
 }
 
 }  // namespace rex::graphics::metal

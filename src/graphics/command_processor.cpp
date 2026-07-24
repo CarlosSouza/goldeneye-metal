@@ -1029,6 +1029,30 @@ void CommandProcessor::PrepareForWait() {
 
 void CommandProcessor::ReturnFromWait() {}
 
+bool CommandProcessor::WaitForGpuCompletionMemoryWrite(uint32_t address, uint32_t length) {
+  (void)address;
+  (void)length;
+  return false;
+}
+
+bool CommandProcessor::BeginWaitRegMemMemoryChange(uint32_t address, uint32_t length) {
+  (void)address;
+  (void)length;
+  return false;
+}
+
+bool CommandProcessor::WaitForWaitRegMemMemoryChange(std::chrono::milliseconds timeout) {
+  (void)timeout;
+  return false;
+}
+
+void CommandProcessor::EndWaitRegMemMemoryChange() {}
+
+void CommandProcessor::NotifyWaitRegMemMemoryWrite(uint32_t address, uint32_t length) {
+  (void)address;
+  (void)length;
+}
+
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index,
                                                 uint32_t primary_buffer_ptr,
                                                 uint32_t primary_buffer_size) {
@@ -1646,8 +1670,17 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool matched = false;
   bool timed_out = false;
+  bool wait_prepared = false;
+  bool backend_completion_wait_attempted = false;
+  uint32_t first_value = 0;
   uint32_t last_value = 0;
   uint64_t poll_count = 0;
+  // Arm before the first read so a guest CPU write between that read and the
+  // first host wait can't be lost. Backends must still use bounded waits since
+  // direct physical-mapping writes may bypass memory invalidation callbacks.
+  bool memory_change_wait_armed =
+      is_memory && wait >= 0x100 &&
+      BeginWaitRegMemMemoryChange(poll_reg_addr & ~uint32_t(0x3), sizeof(uint32_t));
   do {
     ++poll_count;
     uint32_t value = 0;
@@ -1667,6 +1700,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         MakeCoherent();
         value = ReadRegisterValue(poll_reg_addr);
       }
+    }
+    if (poll_count == 1) {
+      first_value = value;
     }
     last_value = value;
     switch (wait_info & 0x7) {
@@ -1709,11 +1745,36 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
       // Wait.
       if (wait >= 0x100) {
-        PrepareForWait();
-        if (!REXCVAR_GET(vsync)) {
+        // Enter the backend wait lifecycle once for this packet. Repeating
+        // trace flushes and completion-queue scans on every poll adds millions
+        // of calls to GoldenEye's CPU-written frame fence without exposing any
+        // additional work—the command processor can't execute another packet
+        // until this wait finishes.
+        if (!wait_prepared) {
+          PrepareForWait();
+          wait_prepared = true;
+        }
+        // Backends that publish EVENT_WRITE_SHD through the host GPU can wait
+        // for the exact queued write once instead of burning CPU on thousands
+        // of volatile polls. The value is always re-read by the normal loop.
+        if (is_memory && !backend_completion_wait_attempted) {
+          backend_completion_wait_attempted = true;
+          if (WaitForGpuCompletionMemoryWrite(poll_reg_addr & ~uint32_t(0x3),
+                                              sizeof(uint32_t))) {
+            rex::thread::SyncMemory();
+            continue;
+          }
+        }
+        // Guest CPU memory notifications avoid burning an entire host core on
+        // frame fences. A notification may be early or spurious, so this wait
+        // is capped at 1 ms and the predicate is always re-read above.
+        bool backend_memory_change_waited =
+            memory_change_wait_armed &&
+            WaitForWaitRegMemMemoryChange(std::chrono::milliseconds(1));
+        if (!backend_memory_change_waited && !REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
-        } else {
+        } else if (!backend_memory_change_waited) {
           // Cap the poll interval. The packet's `wait` field can encode a huge
           // delay (wait/0x100 ms = many minutes/hours); sleeping that long in
           // one shot means the loop never re-checks the value OR the deadline
@@ -1722,15 +1783,22 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           rex::thread::Sleep(std::chrono::milliseconds(std::min<uint32_t>(wait / 0x100, 1u)));
         }
         rex::thread::SyncMemory();
-        ReturnFromWait();
 
         if (!worker_running_) {
           // Short-circuited exit.
+          if (memory_change_wait_armed) {
+            EndWaitRegMemMemoryChange();
+            memory_change_wait_armed = false;
+          }
+          if (wait_prepared) {
+            ReturnFromWait();
+            wait_prepared = false;
+          }
           uint64_t duration_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               std::chrono::steady_clock::now() - wait_started)
                                               .count());
           OnWaitRegMemComplete(is_memory, poll_reg_addr, ref, mask, wait_info & 0x7, wait,
-                               last_value, poll_count, duration_ns, matched, timed_out);
+                               last_value, first_value, poll_count, duration_ns, matched, timed_out);
           return false;
         }
       } else {
@@ -1739,11 +1807,17 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
 
+  if (memory_change_wait_armed) {
+    EndWaitRegMemMemoryChange();
+  }
+  if (wait_prepared) {
+    ReturnFromWait();
+  }
   uint64_t duration_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - wait_started)
                                       .count());
   OnWaitRegMemComplete(is_memory, poll_reg_addr, ref, mask, wait_info & 0x7, wait, last_value,
-                       poll_count, duration_ns, matched, timed_out);
+                       first_value, poll_count, duration_ns, matched, timed_out);
 
   return true;
 }
@@ -1949,7 +2023,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
   assert_true(endianness == xenos::Endian::k8in16);
   uint16_t swapped_extents[rex::countof(extents)];
   memory::copy_and_swap_16_unaligned(swapped_extents, extents, rex::countof(extents));
-  if (!WriteGpuCompletionMemory(address, swapped_extents, sizeof(swapped_extents))) {
+  // SCREEN_EXT_RPT returns the driver's (currently fabricated) affected
+  // rectangle. It is not a shader-completion fence, so don't force backends to
+  // order it behind all earlier host-GPU work.
+  if (!WriteGpuMemory(address, swapped_extents, sizeof(swapped_extents))) {
     return false;
   }
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(swapped_extents), swapped_extents);

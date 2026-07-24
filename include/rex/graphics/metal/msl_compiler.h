@@ -67,8 +67,11 @@ struct ProbeRasterizationState {
   double blend_green = 0.0;
   double blend_blue = 0.0;
   double blend_alpha = 0.0;
+  double depth_bias = 0.0;
+  double depth_bias_slope_scale = 0.0;
   ProbeCullMode cull_mode = ProbeCullMode::kNone;
   bool front_face_clockwise = false;
+  bool depth_clamp_enabled = false;
 };
 
 struct ProbeStencilFaceState {
@@ -120,6 +123,13 @@ struct ProbeTiledResolveTarget {
   uint32_t guest_memory_copy_source_offset = 0;
   uint32_t guest_memory_copy_destination_offset = 0;
   uint32_t guest_memory_copy_length = 0;
+  // Optional notification invoked immediately before the resolve command
+  // buffer is committed. Callers use this to publish GPU ownership metadata
+  // before the write can race with a guest CPU invalidation.
+  void (*submission_callback)(void* context, uint32_t start, uint32_t length) = nullptr;
+  void* submission_callback_context = nullptr;
+  uint32_t submission_start = 0;
+  uint32_t submission_length = 0;
   // Optional notification for a deferred resolve that fails after this
   // function has returned success. The callback is invoked when the owning
   // command buffer is consumed, before its retained resources are released.
@@ -133,6 +143,9 @@ struct ProbeTiledResolveTarget {
   void* presentation_snapshot_texture = nullptr;
   uint32_t presentation_snapshot_x = 0;
   uint32_t presentation_snapshot_y = 0;
+  // xenos::CopySampleSelect (0 through 6). UINT32_MAX requests the full
+  // multisample average used by normal reads and presentation.
+  uint32_t color_sample_select = UINT32_MAX;
 };
 
 struct PipelineProbeUploadStats {
@@ -218,6 +231,11 @@ bool QueuePipelineProbeSnapshotCopy(void* metal_command_queue, void* source_text
                                     void* destination_texture, uint32_t width, uint32_t height,
                                     std::string* error_out);
 void ResetPipelineProbeContext(void* context);
+// Invalidates the depth/stencil target shared by this context and every color
+// context attached to it. Unlike ResetPipelineProbeContext, this is an explicit
+// coordinated depth reset and drains all attached contexts before releasing the
+// old attachment.
+void ResetPipelineProbeDepthStencilTarget(void* context);
 void ReleasePipelineProbeContext(void* context);
 // Ends and commits the context's currently open draw command buffer without
 // waiting for GPU completion. Used to place an ordered shared-memory upload
@@ -288,6 +306,12 @@ bool ReadPipelineProbeContext(void* context, uint32_t width, uint32_t height,
 bool ReadPipelineProbeContextRect(void* context, uint32_t width, uint32_t height, uint32_t x,
                                   uint32_t y, uint32_t read_width, uint32_t read_height,
                                   std::vector<uint8_t>& bgra_out, std::string* error_out);
+// Reads the selected Xenos MSAA sample or sample pair. Full-sample selectors
+// use the normal hardware resolve.
+bool ReadPipelineProbeContextRectSampleSelected(
+    void* context, uint32_t width, uint32_t height, uint32_t x, uint32_t y, uint32_t read_width,
+    uint32_t read_height, uint32_t color_sample_select, std::vector<uint8_t>& bgra_out,
+    std::string* error_out);
 // Resolves a BGRA8 rectangle from the persistent render texture into an
 // externally owned MTLBuffer using the exact Xenos 32bpp tiled layout. Pending
 // render work, texture-to-staging blit, compute conversion, and optional guest

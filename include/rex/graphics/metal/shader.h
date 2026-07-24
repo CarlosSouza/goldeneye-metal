@@ -54,4 +54,11 @@ class MetalShader : public SpirvShader {
   Translation* CreateTranslationInstance(uint64_t modification) override;
 };
 
+// Creates the special no-color fragment shader used to quantize interpolated
+// depth to the Xbox 360 float24 representation before host depth testing.
+void* CreateDepthOnlyFragmentMslLibrary(
+    void* metal_device, SpirvShaderTranslator& shader_translator,
+    SpirvShaderTranslator::Modification::DepthStencilMode depth_stencil_mode,
+    std::string* error_out);
+
 }  // namespace rex::graphics::metal

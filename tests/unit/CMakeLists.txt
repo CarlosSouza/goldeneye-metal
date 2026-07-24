@@ -39,11 +39,16 @@ endif()
 if(REXGLUE_USE_METAL)
     target_sources(unit_tests PRIVATE
         graphics/metal_completion_packet_test.cpp
+        graphics/metal_depth_float24_test.mm
+        graphics/metal_exact_resolved_surface_test.cpp
+        graphics/metal_shared_memory_test.mm
         graphics/metal_sampler_util_test.cpp
     )
     target_link_libraries(unit_tests PRIVATE
         glslang::SPIRV
         xxHash::xxhash
+        "-framework Metal"
+        "-framework Foundation"
     )
 endif()
 

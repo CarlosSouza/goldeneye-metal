@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -20,6 +21,8 @@ constexpr uint32_t kWatchedSwapBase = 0x1efc8000u;
 constexpr uint32_t kWatchedSwapLength = 1280u * 720u * 4u;
 constexpr size_t kMaxPendingUploadCount = 128;
 constexpr size_t kMaxPendingUploadBytes = size_t(128) << 20;
+constexpr size_t kCompletionStagingCapacity = 256;
+constexpr size_t kMaxIdleCompletionStagingBuffers = 16;
 
 bool RangesOverlap(uint32_t a_start, uint32_t a_length, uint32_t b_start, uint32_t b_length) {
   uint64_t a_end = uint64_t(a_start) + a_length;
@@ -141,6 +144,7 @@ void MetalSharedMemory::Shutdown(bool from_destructor) {
   // reaches here. Waiting for the last upload also completes all earlier work
   // on the common queue, allowing the staging buffers and destination to go.
   WaitForPendingUploads();
+  ReleaseIdleCompletionStagingBuffers();
   host_resource_mutation_callback_ = {};
   gpu_resource_mutation_callback_ = {};
   if (guest_memory_buffer_) {
@@ -177,6 +181,54 @@ void MetalSharedMemory::InvalidateUploadRanges(
       MemoryInvalidationCallback(range.first, range.second, true);
     }
   }
+}
+
+void* MetalSharedMemory::AcquireCompletionStagingBuffer(size_t length, bool& recyclable) {
+  recyclable = length <= kCompletionStagingCapacity;
+  if (recyclable && !idle_completion_staging_buffers_.empty()) {
+    void* buffer = idle_completion_staging_buffers_.back();
+    idle_completion_staging_buffers_.pop_back();
+    ++completion_staging_reuse_count_;
+    return buffer;
+  }
+  if (!metal_device_ || !length) {
+    return nullptr;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)metal_device_;
+  NSUInteger allocation_length =
+      recyclable ? NSUInteger(kCompletionStagingCapacity) : NSUInteger(length);
+  id<MTLBuffer> buffer = [device newBufferWithLength:allocation_length
+                                             options:MTLResourceStorageModeShared];
+  if (buffer) {
+    ++completion_staging_allocation_count_;
+    buffer.label = recyclable ? @"ReX Metal pooled completion staging"
+                              : @"ReX Metal completion staging";
+  }
+  return (void*)buffer;
+}
+
+void MetalSharedMemory::RecycleCompletionStagingBuffer(void* buffer) {
+  if (!buffer) {
+    return;
+  }
+  if (idle_completion_staging_buffers_.size() < kMaxIdleCompletionStagingBuffers) {
+    try {
+      idle_completion_staging_buffers_.push_back(buffer);
+      return;
+    } catch (...) {
+    }
+  }
+  [(id<MTLBuffer>)buffer release];
+}
+
+void MetalSharedMemory::ReleaseIdleCompletionStagingBuffers() {
+  for (void* buffer : idle_completion_staging_buffers_) {
+    if (buffer) {
+      [(id<MTLBuffer>)buffer release];
+    }
+  }
+  idle_completion_staging_buffers_.clear();
 }
 
 bool MetalSharedMemory::ReapPendingUploads(bool wait_for_all) {
@@ -223,7 +275,15 @@ bool MetalSharedMemory::ReapPendingUploads(bool wait_for_all) {
         [(id<MTLCommandBuffer>)front.command_buffer release];
       }
       if (front.staging_buffer) {
-        [(id<MTLBuffer>)front.staging_buffer release];
+        if (front.recycle_completion_staging) {
+          assert(completion_staging_in_flight_count_ != 0);
+          if (completion_staging_in_flight_count_) {
+            --completion_staging_in_flight_count_;
+          }
+          RecycleCompletionStagingBuffer(front.staging_buffer);
+        } else {
+          [(id<MTLBuffer>)front.staging_buffer release];
+        }
       }
       pending_upload_bytes_ -= std::min(pending_upload_bytes_, front.staging_size);
       pending_uploads_.pop_front();
@@ -234,6 +294,43 @@ bool MetalSharedMemory::ReapPendingUploads(bool wait_for_all) {
 
 bool MetalSharedMemory::WaitForPendingUploads() {
   return ReapPendingUploads(true);
+}
+
+bool MetalSharedMemory::WaitForGpuOrderedGuestMemoryWrite(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize || length > kBufferSize - start) {
+    return false;
+  }
+
+  @autoreleasepool {
+    id<MTLCommandBuffer> target = nil;
+    for (auto pending_it = pending_uploads_.rbegin();
+         pending_it != pending_uploads_.rend() && !target; ++pending_it) {
+      for (const auto& range : pending_it->completion_write_ranges) {
+        if (RangesOverlap(start, length, range.first, range.second)) {
+          target = (id<MTLCommandBuffer>)pending_it->command_buffer;
+          break;
+        }
+      }
+    }
+    if (!target) {
+      return false;
+    }
+
+    MTLCommandBufferStatus status = [target status];
+    bool target_succeeded = status == MTLCommandBufferStatusCompleted;
+    bool reaped = ReapPendingUploads(false);
+    return target_succeeded && reaped;
+  }
+}
+
+MetalSharedMemory::CompletionStagingStats MetalSharedMemory::completion_staging_stats() const {
+  CompletionStagingStats stats;
+  stats.allocations = completion_staging_allocation_count_;
+  stats.reuses = completion_staging_reuse_count_;
+  stats.idle_buffers = idle_completion_staging_buffers_.size();
+  stats.in_flight_buffers = completion_staging_in_flight_count_;
+  stats.peak_in_flight_buffers = completion_staging_peak_in_flight_count_;
+  return stats;
 }
 
 bool MetalSharedMemory::UploadRanges(
@@ -382,6 +479,29 @@ bool MetalSharedMemory::CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length
   if (!length || start >= kBufferSize || !buffer_) {
     return false;
   }
+  if (!SynchronizeBeforeHostResourceMutation()) {
+    return false;
+  }
+  return CommitGuestCpuWriteAsGpuAfterSynchronization(start, length);
+}
+
+bool MetalSharedMemory::CommitSynchronizedGuestCpuWriteAsGpu(
+    uint32_t start, uint32_t length, const GuestCpuWriteCallback& guest_write) {
+  if (!guest_write || !length || start >= kBufferSize || !buffer_) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  if (!SynchronizeBeforeHostResourceMutation()) {
+    return false;
+  }
+  return CommitGuestCpuWriteAsGpuAfterSynchronization(start, length, &guest_write);
+}
+
+bool MetalSharedMemory::CommitGuestCpuWriteAsGpuAfterSynchronization(
+    uint32_t start, uint32_t length, const GuestCpuWriteCallback* guest_write) {
+  if (!length || start >= kBufferSize || !buffer_) {
+    return false;
+  }
   length = std::min(length, kBufferSize - start);
 
   uint32_t original_start = start;
@@ -398,16 +518,16 @@ bool MetalSharedMemory::CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length
     return false;
   }
 
-  if (!SynchronizeBeforeHostResourceMutation()) {
+  // Publish and protect before either the optional host write or the copy,
+  // matching UploadRanges' race contract. A guest store whose first fault has
+  // already invalidated an older generation must fault again if it retries
+  // during this transaction, so exact-cache publication observes the newer
+  // invalidation epoch rather than resurrecting stale source data.
+  RangeWrittenByGpu(original_start, original_length);
+  if (guest_write && !(*guest_write)()) {
+    MemoryInvalidationCallback(original_start, original_length, true);
     return false;
   }
-
-  // Publish and protect before copying, matching UploadRanges' race contract.
-  // If the guest CPU writes this range during the copy, the protection callback
-  // invalidates it again and the next RequestRange performs a fresh upload.
-  // Texture watches only mark resources outdated here; their reload happens on
-  // a later command-processor request, after this synchronous copy completes.
-  RangeWrittenByGpu(original_start, original_length);
   std::memcpy(buffer_contents + copy_start, guest_source, copy_length);
   return true;
 }
@@ -534,22 +654,30 @@ bool MetalSharedMemory::EnqueueGpuOrderedGuestMemoryPublicationAndWrites(
   }
 
   @autoreleasepool {
-    id<MTLDevice> device = (id<MTLDevice>)metal_device_;
     id<MTLBuffer> resident_buffer = (id<MTLBuffer>)buffer_;
     id<MTLBuffer> guest_buffer = (id<MTLBuffer>)guest_memory_buffer_;
     id<MTLCommandQueue> command_queue = (id<MTLCommandQueue>)command_queue_;
-    id<MTLBuffer> staging_buffer = [device newBufferWithBytes:completion_data
-                                                       length:completion_data_length
-                                                      options:MTLResourceStorageModeShared];
+    bool recycle_completion_staging = false;
+    id<MTLBuffer> staging_buffer = (id<MTLBuffer>)AcquireCompletionStagingBuffer(
+        completion_data_length, recycle_completion_staging);
+    uint8_t* staging_contents =
+        staging_buffer ? reinterpret_cast<uint8_t*>([staging_buffer contents]) : nullptr;
+    if (staging_contents) {
+      std::memcpy(staging_contents, completion_data, completion_data_length);
+    }
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     id<MTLBlitCommandEncoder> blit_encoder =
         command_buffer ? [command_buffer blitCommandEncoder] : nil;
-    if (!staging_buffer || !command_buffer || !blit_encoder) {
+    if (!staging_contents || !command_buffer || !blit_encoder) {
       if (blit_encoder) {
         [blit_encoder endEncoding];
       }
       if (staging_buffer) {
-        [staging_buffer release];
+        if (recycle_completion_staging) {
+          RecycleCompletionStagingBuffer((void*)staging_buffer);
+        } else {
+          [staging_buffer release];
+        }
       }
       return false;
     }
@@ -562,7 +690,11 @@ bool MetalSharedMemory::EnqueueGpuOrderedGuestMemoryPublicationAndWrites(
     // guest-visible completion point for everything encoded before this packet.
     if (gpu_resource_mutation_callback_ && !gpu_resource_mutation_callback_()) {
       [blit_encoder endEncoding];
-      [staging_buffer release];
+      if (recycle_completion_staging) {
+        RecycleCompletionStagingBuffer((void*)staging_buffer);
+      } else {
+        [staging_buffer release];
+      }
       return false;
     }
     for (const auto& range : publication_ranges) {
@@ -590,15 +722,29 @@ bool MetalSharedMemory::EnqueueGpuOrderedGuestMemoryPublicationAndWrites(
     pending.command_buffer = (void*)[command_buffer retain];
     pending.staging_buffer = (void*)staging_buffer;
     pending.staging_size = completion_data_length;
+    pending.recycle_completion_staging = recycle_completion_staging;
     pending.byte_ranges = publication_ranges;
     pending.byte_ranges.insert(pending.byte_ranges.end(), completion_ranges.begin(),
                                completion_ranges.end());
+    pending.completion_write_ranges = completion_ranges;
+    void* retained_command_buffer = pending.command_buffer;
+    void* retained_staging_buffer = pending.staging_buffer;
     try {
       pending_uploads_.push_back(std::move(pending));
     } catch (...) {
-      [(id<MTLCommandBuffer>)pending.command_buffer release];
-      [(id<MTLBuffer>)pending.staging_buffer release];
+      [(id<MTLCommandBuffer>)retained_command_buffer release];
+      if (recycle_completion_staging) {
+        RecycleCompletionStagingBuffer(retained_staging_buffer);
+      } else {
+        [(id<MTLBuffer>)retained_staging_buffer release];
+      }
       return false;
+    }
+    if (recycle_completion_staging) {
+      ++completion_staging_in_flight_count_;
+      completion_staging_peak_in_flight_count_ =
+          std::max(completion_staging_peak_in_flight_count_,
+                   completion_staging_in_flight_count_);
     }
 
     // Publish before commit, matching UploadRanges' invalidation race

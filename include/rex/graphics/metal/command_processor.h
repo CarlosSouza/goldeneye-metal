@@ -1,7 +1,8 @@
 #pragma once
 
-#include <filesystem>
 #include <array>
+#include <atomic>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,6 +28,40 @@
 
 namespace rex::graphics::metal {
 
+// Tracks a top-to-bottom snapshot assembled from full-width resolve bands.
+// Row zero always begins a new generation. Later bands must continue exactly
+// where the previous one ended, preventing incomplete or mixed-frame snapshots
+// from becoming sampleable.
+inline bool UpdateExactResolvedSurfaceRowCoverage(std::vector<uint8_t>& row_valid,
+                                                  uint32_t& valid_row_count,
+                                                  uint32_t total_rows, uint32_t first_row,
+                                                  uint32_t row_count) {
+  if (!total_rows || !row_count || first_row > total_rows ||
+      row_count > total_rows - first_row) {
+    return false;
+  }
+  if (!first_row) {
+    if (row_valid.size() != total_rows) {
+      row_valid.assign(total_rows, uint8_t(0));
+    } else {
+      for (uint8_t& row : row_valid) {
+        row = 0;
+      }
+    }
+    valid_row_count = 0;
+  } else if (row_valid.size() != total_rows || valid_row_count != first_row) {
+    return false;
+  }
+  for (uint32_t row = first_row; row < first_row + row_count; ++row) {
+    if (row_valid[row]) {
+      return false;
+    }
+    row_valid[row] = 1;
+  }
+  valid_row_count += row_count;
+  return true;
+}
+
 class MetalCommandProcessor final : public CommandProcessor {
  public:
   MetalCommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
@@ -38,20 +73,26 @@ class MetalCommandProcessor final : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
   void RestoreEdramSnapshot(const void* snapshot) override;
+  void NotifyWaitRegMemMemoryWrite(uint32_t address, uint32_t length) override;
 
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
   void WriteRegister(uint32_t index, uint32_t value) override;
+  bool WriteGpuMemory(uint32_t address, const void* data, size_t length) override;
   bool WriteGpuCompletionMemory(uint32_t address, const void* data, size_t length) override;
   bool FlushGpuCompletionMemoryWrites() override;
   void PrepareForWait() override;
+  bool WaitForGpuCompletionMemoryWrite(uint32_t address, uint32_t length) override;
+  bool BeginWaitRegMemMemoryChange(uint32_t address, uint32_t length) override;
+  bool WaitForWaitRegMemMemoryChange(std::chrono::milliseconds timeout) override;
+  void EndWaitRegMemMemoryChange() override;
   void OnPrimaryBufferEnd() override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   void OnWaitRegMemComplete(bool is_memory, uint32_t poll_address, uint32_t reference,
                             uint32_t mask, uint32_t operation, uint32_t wait, uint32_t last_value,
-                            uint64_t poll_count, uint64_t duration_ns, bool matched,
-                            bool timed_out) override;
+                            uint32_t first_value, uint64_t poll_count, uint64_t duration_ns,
+                            bool matched, bool timed_out) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -188,12 +229,30 @@ class MetalCommandProcessor final : public CommandProcessor {
                                        const std::vector<uint8_t>& bgra, uint32_t width,
                                        uint32_t source_height, uint32_t source_x, uint32_t source_y,
                                        uint32_t dest_x, uint32_t dest_y, uint32_t write_width,
-                                       uint32_t write_height, xenos::Endian128 dest_endian);
+                                       uint32_t write_height, xenos::Endian128 dest_endian,
+                                       uint64_t expected_invalidation_epoch);
   bool EnsureExactResolvedSurfaceSnapshot(uint32_t width, uint32_t height);
+  void RememberCompatibleExactResolvedSurfaceFetch(
+      const xenos::xe_gpu_texture_fetch_t& fetch);
+  bool HasCompatibleExactResolvedSurfaceFetch(uint32_t base, uint32_t pitch, uint32_t height,
+                                              xenos::Endian128 endian) const;
+  bool PrepareExactResolvedSurfaceGpuBand(
+      uint32_t dest_base, uint32_t pitch, uint32_t surface_height, uint32_t snapshot_y,
+      uint32_t write_height, xenos::Endian128 dest_endian, uint64_t resolve_signature,
+      void*& texture_out, uint64_t& invalidation_epoch_out);
   void UpdateExactResolvedSurfaceGpuCache(uint32_t dest_base, uint32_t pitch,
                                           uint32_t surface_height, uint32_t snapshot_width,
-                                          uint32_t snapshot_height, xenos::Endian128 dest_endian);
+                                          uint32_t snapshot_height, uint32_t snapshot_y,
+                                          uint32_t write_height, xenos::Endian128 dest_endian,
+                                          uint64_t resolve_signature,
+                                          uint64_t expected_invalidation_epoch);
+  bool GetExactResolvedSurfaceTextureForFetch(
+      const xenos::xe_gpu_texture_fetch_t& fetch, void*& texture_out, uint32_t& width_out,
+      uint32_t& height_out, uint32_t& host_swizzle_out, uint8_t& swizzled_signs_out) const;
   void ReleaseExactResolvedSurfaceSnapshot();
+  static void WaitRegMemMemoryChangeWatchCallback(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
   static void ExactResolvedSurfaceWatchCallback(
       const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
@@ -229,6 +288,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   void* host_fallback_pixel_fragment_library_ = nullptr;
   void* host_vertex_color_pixel_fragment_library_ = nullptr;
   void* dummy_fragment_library_ = nullptr;
+  void* depth_float24_truncating_fragment_library_ = nullptr;
+  void* depth_float24_rounding_fragment_library_ = nullptr;
   void* solid_fragment_library_ = nullptr;
   void* pipeline_probe_context_ = nullptr;
   void* host_pixel_probe_context_ = nullptr;
@@ -323,8 +384,10 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t draw_count = 0;
   };
   // Unlike the score-based diagnostic frame retention above, this is an exact
-  // mirror of a complete top-origin tiled resolve write. A persistent shared-
-  // memory watch invalidates it on overlapping CPU or GPU writes.
+  // mirror of a tiled resolve surface. GPU snapshots may be assembled from
+  // multiple full-width bands; they become usable only after every row has
+  // been written. A persistent shared-memory watch invalidates them on
+  // overlapping CPU or unrelated GPU writes.
   struct ExactResolvedSurface {
     std::vector<uint8_t> bgra;
     void* metal_texture = nullptr;
@@ -339,6 +402,9 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t tiled_extent = 0;
     uint32_t texture_width = 0;
     uint32_t texture_height = 0;
+    std::vector<uint8_t> gpu_snapshot_row_valid;
+    uint32_t gpu_snapshot_valid_row_count = 0;
+    uint64_t resolve_signature = 0;
     bool gpu_snapshot = false;
     xenos::Endian128 endian = xenos::Endian128::kNone;
   };
@@ -379,14 +445,23 @@ class MetalCommandProcessor final : public CommandProcessor {
     std::array<uint8_t, kMaxDataLength> data = {};
   };
   std::unordered_map<uint32_t, RetainedResolvedFrame> retained_resolve_frames_by_base_;
+  mutable std::recursive_mutex exact_resolved_surface_mutex_;
   ExactResolvedSurface exact_resolved_surface_;
+  std::unique_ptr<rex::thread::Event> wait_reg_mem_memory_change_event_;
+  SharedMemory::GlobalWatchHandle wait_reg_mem_memory_change_watch_ = nullptr;
+  std::atomic<uint32_t> wait_reg_mem_memory_change_first_{UINT32_MAX};
+  std::atomic<uint32_t> wait_reg_mem_memory_change_last_{0};
   SharedMemory::GlobalWatchHandle exact_resolved_surface_watch_ = nullptr;
+  std::atomic<uint64_t> exact_resolved_surface_invalidation_epoch_{0};
+  std::atomic<bool> exact_resolved_surface_expected_gpu_write_active_{false};
+  std::atomic<uint32_t> exact_resolved_surface_expected_gpu_write_first_{0};
+  std::atomic<uint32_t> exact_resolved_surface_expected_gpu_write_last_{0};
+  std::unordered_set<uint64_t> observed_exact_resolved_surface_fetches_;
   std::unordered_map<uint64_t, HostRenderTarget> host_render_targets_;
   std::unordered_map<uint64_t, HostDepthStencilTarget> host_depth_stencil_targets_;
   std::vector<PendingReadbackResolveSlice> pending_readback_resolve_slices_;
-  // GPU tiled resolves stay resident until the next guest-visible completion
-  // event. All ranges before that event are coalesced into one Metal blit
-  // command, avoiding a large mirror command per resolve.
+  // Fallback publication queue for resolve paths that can't mirror directly
+  // into guest memory. Normal tiled resolves mirror in their own Metal command.
   std::vector<std::pair<uint32_t, uint32_t>> pending_gpu_tiled_resolve_publication_ranges_;
   std::vector<PendingGpuCompletionWrite> pending_gpu_completion_writes_;
   std::vector<uint8_t> pending_gpu_completion_staging_;
@@ -445,6 +520,10 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t gpu_tiled_resolve_count_ = 0;
   uint64_t gpu_tiled_resolve_pixel_count_ = 0;
   uint64_t gpu_tiled_resolve_fallback_count_ = 0;
+  uint64_t gpu_tiled_resolve_mirror_count_ = 0;
+  uint64_t gpu_tiled_resolve_mirror_byte_count_ = 0;
+  uint64_t gpu_resolved_texture_draw_count_ = 0;
+  uint64_t gpu_resolved_texture_binding_count_ = 0;
   uint64_t gpu_publication_event_count_ = 0;
   uint64_t gpu_publication_input_range_count_ = 0;
   uint64_t gpu_publication_merged_range_count_ = 0;
@@ -462,6 +541,7 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t mask = 0;
     uint32_t operation = 0;
     uint32_t wait = 0;
+    uint32_t first_value = 0;
     uint32_t last_value = 0;
     uint64_t call_count = 0;
     uint64_t poll_count = 0;

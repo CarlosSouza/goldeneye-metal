@@ -14,6 +14,14 @@ namespace rex::graphics::metal {
 
 class MetalSharedMemory final : public SharedMemory {
  public:
+  struct CompletionStagingStats {
+    uint64_t allocations = 0;
+    uint64_t reuses = 0;
+    size_t idle_buffers = 0;
+    size_t in_flight_buffers = 0;
+    size_t peak_in_flight_buffers = 0;
+  };
+
   struct OrderedGuestMemoryWrite {
     uint32_t start = 0;
     uint32_t data_offset = 0;
@@ -22,6 +30,7 @@ class MetalSharedMemory final : public SharedMemory {
 
   using HostResourceMutationCallback = std::function<bool()>;
   using GpuResourceMutationCallback = std::function<bool()>;
+  using GuestCpuWriteCallback = std::function<bool()>;
 
   // trace_writer records every uploaded guest page range into the GPU trace
   // (mirrors VulkanSharedMemory). Without it a Metal-captured trace omits the
@@ -70,6 +79,14 @@ class MetalSharedMemory final : public SharedMemory {
   // is used by the current CPU readback/resolve path: RangeWrittenByGpu alone
   // would mark the Metal copy valid without actually updating its bytes.
   bool CommitGuestCpuWriteAsGpu(uint32_t start, uint32_t length);
+  // Waits for all older Metal work, publishes write ownership, invokes
+  // guest_write, then copies the guest pages to the resident Metal buffer.
+  // guest_write must complete synchronously and must not submit GPU work.
+  // Publishing before the write closes the invalidation/fault-retry race, while
+  // keeping the write inside this transaction prevents an older queued
+  // guest-alias write from winning during synchronization.
+  bool CommitSynchronizedGuestCpuWriteAsGpu(uint32_t start, uint32_t length,
+                                            const GuestCpuWriteCallback& guest_write);
 
   // Publishes a completed GPU write already present in the Metal buffer back
   // to the guest physical mapping. The caller must have waited for the Metal
@@ -94,13 +111,18 @@ class MetalSharedMemory final : public SharedMemory {
   bool EnqueueGpuOrderedGuestMemoryPublicationAndWrite(
       const std::vector<std::pair<uint32_t, uint32_t>>& publication_byte_ranges,
       uint32_t completion_start, const void* completion_data, size_t completion_length);
-  // Batched form used at command-ring boundaries. All writes are encoded in
-  // descriptor order after the publication blits, and their source bytes are
-  // slices of completion_data.
+  // Batched form encoding all writes in descriptor order after any publication
+  // blits. Their source bytes are slices of completion_data.
   bool EnqueueGpuOrderedGuestMemoryPublicationAndWrites(
       const std::vector<std::pair<uint32_t, uint32_t>>& publication_byte_ranges,
       const std::vector<OrderedGuestMemoryWrite>& completion_writes, const void* completion_data,
       size_t completion_data_length);
+  // Checks the newest queued ordered completion write overlapping the range
+  // and reaps it if Metal has completed it. This is deliberately non-blocking:
+  // WAIT_REG_MEM owns the bounded retry/deadline loop, so a stalled Metal
+  // command buffer must not trap the command-processor thread here.
+  bool WaitForGpuOrderedGuestMemoryWrite(uint32_t start, uint32_t length);
+  CompletionStagingStats completion_staging_stats() const;
 
  protected:
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
@@ -110,21 +132,34 @@ class MetalSharedMemory final : public SharedMemory {
     void* command_buffer = nullptr;  // Owned id<MTLCommandBuffer>.
     void* staging_buffer = nullptr;  // Owned id<MTLBuffer>.
     size_t staging_size = 0;
+    bool recycle_completion_staging = false;
     std::vector<std::pair<uint32_t, uint32_t>> byte_ranges;
+    std::vector<std::pair<uint32_t, uint32_t>> completion_write_ranges;
   };
 
   bool ReapPendingUploads(bool wait_for_all);
+  bool CommitGuestCpuWriteAsGpuAfterSynchronization(
+      uint32_t start, uint32_t length,
+      const GuestCpuWriteCallback* guest_write = nullptr);
   void InvalidateUploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges);
+  void* AcquireCompletionStagingBuffer(size_t length, bool& recyclable);
+  void RecycleCompletionStagingBuffer(void* buffer);
+  void ReleaseIdleCompletionStagingBuffers();
 
-  TraceWriter& trace_writer_;      // Records uploaded ranges into the GPU trace.
-  void* metal_device_ = nullptr;   // Non-owning id<MTLDevice>.
-  void* buffer_ = nullptr;         // Owned id<MTLBuffer>, MTLStorageModeShared.
+  TraceWriter& trace_writer_;            // Records uploaded ranges into the GPU trace.
+  void* metal_device_ = nullptr;         // Non-owning id<MTLDevice>.
+  void* buffer_ = nullptr;               // Owned id<MTLBuffer>, MTLStorageModeShared.
   void* guest_memory_buffer_ = nullptr;  // Owned no-copy id<MTLBuffer>.
-  void* command_queue_ = nullptr;  // Owned id<MTLCommandQueue>.
+  void* command_queue_ = nullptr;        // Owned id<MTLCommandQueue>.
   HostResourceMutationCallback host_resource_mutation_callback_;
   GpuResourceMutationCallback gpu_resource_mutation_callback_;
   std::deque<PendingUpload> pending_uploads_;
   size_t pending_upload_bytes_ = 0;
+  std::vector<void*> idle_completion_staging_buffers_;
+  uint64_t completion_staging_allocation_count_ = 0;
+  uint64_t completion_staging_reuse_count_ = 0;
+  size_t completion_staging_in_flight_count_ = 0;
+  size_t completion_staging_peak_in_flight_count_ = 0;
 };
 
 }  // namespace rex::graphics::metal

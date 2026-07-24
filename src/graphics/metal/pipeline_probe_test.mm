@@ -50,14 +50,17 @@ using rex::graphics::metal::QueuePipelineProbeContextDepthStencilClearRect;
 using rex::graphics::metal::QueuePipelineProbeSnapshotCopy;
 using rex::graphics::metal::ReadPipelineProbeContext;
 using rex::graphics::metal::ReadPipelineProbeContextRect;
+using rex::graphics::metal::ReadPipelineProbeContextRectSampleSelected;
 using rex::graphics::metal::ReleaseMetalPipelineBinaryArchive;
 using rex::graphics::metal::ReleaseMslLibrary;
 using rex::graphics::metal::ReleasePipelineProbeContext;
 using rex::graphics::metal::ReleasePipelineProbeSnapshotTexture;
 using rex::graphics::metal::ReleaseRenderPipelineState;
 using rex::graphics::metal::RenderPipelineCacheTelemetry;
+using rex::graphics::metal::RenderPipelineProbe;
 using rex::graphics::metal::RenderPipelineProbeToContext;
 using rex::graphics::metal::ResetPipelineProbeContext;
+using rex::graphics::metal::ResetPipelineProbeDepthStencilTarget;
 using rex::graphics::metal::ResolvePipelineProbeContextToXenosTiled;
 using rex::graphics::metal::SerializeMetalPipelineBinaryArchive;
 using rex::graphics::metal::SetPipelineProbeContextSampleCount;
@@ -141,6 +144,24 @@ using namespace metal;
 
 fragment void main0(device atomic_uint* shared_words [[buffer(7)]]) {
   atomic_store_explicit(shared_words, 0x4750534Du, memory_order_relaxed);
+}
+)MSL";
+
+constexpr char kSampleIdFragmentMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+fragment float4 main0(uint sample_id [[sample_id]]) {
+  switch (sample_id) {
+    case 0:
+      return float4(1.0, 0.0, 0.0, 1.0);
+    case 1:
+      return float4(0.0, 1.0, 0.0, 1.0);
+    case 2:
+      return float4(0.0, 0.0, 1.0, 1.0);
+    default:
+      return float4(1.0, 1.0, 1.0, 1.0);
+  }
 }
 )MSL";
 
@@ -847,10 +868,11 @@ int RunPipelineProbeTest() {
     depth_rasterization_state.viewport_height = kHeight;
     depth_rasterization_state.scissor_width = kWidth;
     depth_rasterization_state.scissor_height = kHeight;
-    auto render_depth_quad_with_pipeline = [&](void* draw_pipeline,
-                                               const std::array<float, 12>& positions,
-                                               const ProbeTextureSlot& draw_texture,
-                                               const ProbeDepthStencilState& depth_stencil_state) {
+    auto render_depth_quad_with_pipeline_and_raster =
+        [&](void* draw_pipeline, const std::array<float, 12>& positions,
+            const ProbeTextureSlot& draw_texture,
+            const ProbeDepthStencilState& depth_stencil_state,
+            const ProbeRasterizationState& rasterization_state) {
       return RenderPipelineProbeToContext(
           context, draw_pipeline, kUnusedSystemConstants.data(), sizeof(kUnusedSystemConstants),
           nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0, &draw_texture, 1, 1,
@@ -858,7 +880,15 @@ int RunPipelineProbeTest() {
           /*vertex_shared_memory_buffer_index=*/UINT32_MAX, UINT32_MAX, UINT32_MAX, nullptr, 0,
           UINT32_MAX, UINT32_MAX, nullptr, &sampler, positions.data(), sizeof(positions),
           /*vertex_data_buffer_index=*/3, nullptr, 0, UINT32_MAX, UINT32_MAX, &fan_index_buffer,
-          &depth_rasterization_state, &depth_stencil_state);
+          &rasterization_state, &depth_stencil_state);
+    };
+    auto render_depth_quad_with_pipeline = [&](void* draw_pipeline,
+                                               const std::array<float, 12>& positions,
+                                               const ProbeTextureSlot& draw_texture,
+                                               const ProbeDepthStencilState& depth_stencil_state) {
+      return render_depth_quad_with_pipeline_and_raster(
+          draw_pipeline, positions, draw_texture, depth_stencil_state,
+          depth_rasterization_state);
     };
     auto render_depth_quad = [&](const std::array<float, 12>& positions,
                                  const ProbeTextureSlot& draw_texture,
@@ -930,11 +960,181 @@ int RunPipelineProbeTest() {
     bool stencil_persistence_ok = stencil_center && PixelNear(stencil_center, kRedBgra);
     bool depth_stencil_ok = depth_persistence_ok && depth_write_mask_ok && stencil_persistence_ok;
 
+    constexpr std::array<float, 12> kCoplanarDepthPositions = {
+        -0.8f, -0.8f, 0.5f, 0.8f, -0.8f, 0.5f, 0.8f, 0.8f, 0.5f, -0.8f, 0.8f, 0.5f,
+    };
+    ProbeRasterizationState negative_bias_state = depth_rasterization_state;
+    negative_bias_state.depth_bias = -4096.0;
+    bool depth_bias_cleared =
+        depth_stencil_ok &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool depth_bias_base_rendered =
+        depth_bias_cleared &&
+        render_depth_quad(kCoplanarDepthPositions, green_texture, depth_less_write);
+    bool depth_bias_offset_rendered =
+        depth_bias_base_rendered &&
+        render_depth_quad_with_pipeline_and_raster(
+            depth_pipeline_state, kCoplanarDepthPositions, red_texture, depth_less_write,
+            negative_bias_state);
+    // The following zero-bias draw must restore the encoder state and fail
+    // LESS against the slightly nearer biased depth.
+    bool depth_bias_restored =
+        depth_bias_offset_rendered &&
+        render_depth_quad(kCoplanarDepthPositions, blue_texture, depth_less_write);
+    std::vector<uint8_t> depth_bias_bgra;
+    const uint8_t* depth_bias_center =
+        depth_bias_restored ? read_center(depth_bias_bgra) : nullptr;
+    bool depth_bias_ok = depth_bias_center && PixelNear(depth_bias_center, kRedBgra);
+
+    constexpr std::array<float, 12> kSlopedDepthPositions = {
+        -0.8f, -0.8f, 0.4f, 0.8f, -0.8f, 0.6f, 0.8f, 0.8f, 0.6f, -0.8f, 0.8f, 0.4f,
+    };
+    ProbeRasterizationState negative_slope_bias_state = depth_rasterization_state;
+    negative_slope_bias_state.depth_bias_slope_scale = -4.0;
+    bool slope_bias_cleared =
+        depth_bias_ok &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool slope_bias_base_rendered =
+        slope_bias_cleared &&
+        render_depth_quad(kSlopedDepthPositions, green_texture, depth_less_write);
+    bool slope_bias_offset_rendered =
+        slope_bias_base_rendered &&
+        render_depth_quad_with_pipeline_and_raster(
+            depth_pipeline_state, kSlopedDepthPositions, red_texture, depth_less_write,
+            negative_slope_bias_state);
+    bool slope_bias_restored =
+        slope_bias_offset_rendered &&
+        render_depth_quad(kSlopedDepthPositions, blue_texture, depth_less_write);
+    std::vector<uint8_t> slope_bias_bgra;
+    const uint8_t* slope_bias_center =
+        slope_bias_restored ? read_center(slope_bias_bgra) : nullptr;
+    bool slope_bias_ok = slope_bias_center && PixelNear(slope_bias_center, kRedBgra);
+
+    ProbeDepthStencilState depth_equal_write = depth_less_write;
+    depth_equal_write.depth_compare_function = 2;  // CompareFunction::kEqual.
+    bool queued_depth_bias_cleared =
+        slope_bias_ok &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool queued_depth_bias_seeded =
+        queued_depth_bias_cleared &&
+        render_depth_quad_with_pipeline_and_raster(
+            depth_pipeline_state, kCoplanarDepthPositions, green_texture, depth_less_write,
+            negative_bias_state);
+    bool queued_depth_bias_clear =
+        queued_depth_bias_seeded &&
+        QueuePipelineProbeContextDepthStencilClearRect(
+            context, kWidth, kHeight, 0, 0, kWidth, kHeight, 0.5f, 0, &error);
+    bool queued_depth_bias_equal =
+        queued_depth_bias_clear &&
+        render_depth_quad(kCoplanarDepthPositions, red_texture, depth_equal_write);
+    std::vector<uint8_t> queued_depth_bias_bgra;
+    const uint8_t* queued_depth_bias_center =
+        queued_depth_bias_equal ? read_center(queued_depth_bias_bgra) : nullptr;
+    bool queued_depth_bias_ok =
+        queued_depth_bias_center && PixelNear(queued_depth_bias_center, kRedBgra);
+
+    constexpr std::array<float, 12> kFarPlanePositions = {
+        -0.8f, -0.8f, 1.0f, 0.8f, -0.8f, 1.0f, 0.8f, 0.8f, 1.0f, -0.8f, 0.8f, 1.0f,
+    };
+    std::vector<uint8_t> one_shot_bias_bgra;
+    bool one_shot_bias_rendered = RenderPipelineProbe(
+        device, depth_pipeline_state, kUnusedSystemConstants.data(),
+        sizeof(kUnusedSystemConstants), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0,
+        &red_texture, 1, 1,
+        /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight,
+        one_shot_bias_bgra, &error,
+        /*vertex_shared_memory_buffer_index=*/UINT32_MAX,
+        /*vertex_float_constants_buffer_index=*/UINT32_MAX,
+        /*vertex_fetch_constants_buffer_index=*/UINT32_MAX,
+        /*initial_bgra=*/nullptr, /*initial_bgra_row_pitch=*/0,
+        /*fragment_float_constants=*/nullptr, /*fragment_float_constants_size=*/0,
+        /*fragment_float_constants_buffer_index=*/UINT32_MAX,
+        /*fragment_fetch_constants_buffer_index=*/UINT32_MAX,
+        /*vertex_samplers=*/nullptr, &sampler, kFarPlanePositions.data(),
+        sizeof(kFarPlanePositions),
+        /*vertex_data_buffer_index=*/3,
+        /*bool_loop_constants=*/nullptr, /*bool_loop_constants_size=*/0,
+        /*vertex_bool_loop_constants_buffer_index=*/UINT32_MAX,
+        /*fragment_bool_loop_constants_buffer_index=*/UINT32_MAX, &fan_index_buffer,
+        &negative_bias_state, &depth_less_write);
+    const uint8_t* one_shot_bias_center =
+        one_shot_bias_rendered &&
+                one_shot_bias_bgra.size() == size_t(kWidth) * kHeight * 4
+            ? one_shot_bias_bgra.data() +
+                  (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+            : nullptr;
+    bool one_shot_bias_ok =
+        one_shot_bias_center && PixelNear(one_shot_bias_center, kRedBgra);
+
+    constexpr std::array<float, 12> kBeyondFarPlanePositions = {
+        -0.8f, -0.8f, 2.0f, 0.8f, -0.8f, 2.0f, 0.8f, 0.8f, 2.0f, -0.8f, 0.8f, 2.0f,
+    };
+    ProbeRasterizationState depth_clamp_state = depth_rasterization_state;
+    depth_clamp_state.depth_clamp_enabled = true;
+    ProbeDepthStencilState depth_disabled;
+    std::vector<uint8_t> one_shot_clamp_bgra;
+    bool one_shot_clamp_rendered = RenderPipelineProbe(
+        device, depth_pipeline_state, kUnusedSystemConstants.data(),
+        sizeof(kUnusedSystemConstants), nullptr, 0, nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0,
+        &red_texture, 1, 1,
+        /*primitive_type=TriangleList=*/4, uint32_t(kFanIndices.size()), kWidth, kHeight,
+        one_shot_clamp_bgra, &error,
+        /*vertex_shared_memory_buffer_index=*/UINT32_MAX,
+        /*vertex_float_constants_buffer_index=*/UINT32_MAX,
+        /*vertex_fetch_constants_buffer_index=*/UINT32_MAX,
+        /*initial_bgra=*/nullptr, /*initial_bgra_row_pitch=*/0,
+        /*fragment_float_constants=*/nullptr, /*fragment_float_constants_size=*/0,
+        /*fragment_float_constants_buffer_index=*/UINT32_MAX,
+        /*fragment_fetch_constants_buffer_index=*/UINT32_MAX,
+        /*vertex_samplers=*/nullptr, &sampler, kBeyondFarPlanePositions.data(),
+        sizeof(kBeyondFarPlanePositions),
+        /*vertex_data_buffer_index=*/3,
+        /*bool_loop_constants=*/nullptr, /*bool_loop_constants_size=*/0,
+        /*vertex_bool_loop_constants_buffer_index=*/UINT32_MAX,
+        /*fragment_bool_loop_constants_buffer_index=*/UINT32_MAX, &fan_index_buffer,
+        &depth_clamp_state, &depth_disabled);
+    const uint8_t* one_shot_clamp_center =
+        one_shot_clamp_rendered &&
+                one_shot_clamp_bgra.size() == size_t(kWidth) * kHeight * 4
+            ? one_shot_clamp_bgra.data() +
+                  (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+            : nullptr;
+    bool one_shot_clamp_ok =
+        one_shot_clamp_center && PixelNear(one_shot_clamp_center, kRedBgra);
+    bool depth_clamp_cleared =
+        one_shot_clamp_ok &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool depth_clamp_rendered =
+        depth_clamp_cleared &&
+        render_depth_quad_with_pipeline_and_raster(
+            depth_pipeline_state, kBeyondFarPlanePositions, red_texture, depth_disabled,
+            depth_clamp_state);
+    std::vector<uint8_t> depth_clamp_bgra;
+    const uint8_t* depth_clamp_center =
+        depth_clamp_rendered ? read_center(depth_clamp_bgra) : nullptr;
+    bool depth_clamp_visible = depth_clamp_center && PixelNear(depth_clamp_center, kRedBgra);
+    bool depth_clip_cleared =
+        depth_clamp_visible &&
+        ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
+    bool depth_clip_rendered =
+        depth_clip_cleared &&
+        render_depth_quad_with_pipeline_and_raster(
+            depth_pipeline_state, kBeyondFarPlanePositions, red_texture, depth_disabled,
+            depth_rasterization_state);
+    std::vector<uint8_t> depth_clip_bgra;
+    const uint8_t* depth_clip_center =
+        depth_clip_rendered ? read_center(depth_clip_bgra) : nullptr;
+    bool depth_clip_restored =
+        depth_clip_center && PixelNear(depth_clip_center, std::array<uint8_t, 4>{0, 0, 0, 255});
+    bool raster_depth_state_ok =
+        depth_bias_ok && slope_bias_ok && queued_depth_bias_ok && one_shot_bias_ok &&
+        one_shot_clamp_ok && depth_clamp_visible && depth_clip_restored;
+
     // A depth-only pipeline must update depth without touching color. Then a
     // rectangular resolve-time depth/stencil clear should affect only its half
     // of the target and preserve the other half's depth and clear color.
     bool depth_only_cleared =
-        depth_stencil_ok &&
+        raster_depth_state_ok &&
         ClearPipelineProbeContext(context, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0, &error);
     bool depth_only_rendered =
         depth_only_cleared &&
@@ -1038,6 +1238,9 @@ int RunPipelineProbeTest() {
         render_shared_depth_quad(shared_depth_context_a, kNearDepthPositions, green_texture);
     uint32_t shared_depth_a_pending_before_handoff =
         GetPipelineProbeContextPendingSubmissionCount(shared_depth_context_a);
+    // Resetting an unrelated color target must not invalidate the depth target
+    // it shares with A.
+    ResetPipelineProbeContext(shared_depth_context_b);
     bool shared_depth_far_rendered =
         shared_depth_near_rendered &&
         render_shared_depth_quad(shared_depth_context_b, kFarDepthPositions, red_texture);
@@ -1074,6 +1277,43 @@ int RunPipelineProbeTest() {
                                               shared_depth_context_a,
                                               &incompatible_dimensions_error) &&
         !incompatible_dimensions_error.empty();
+    std::string uninitialized_source_error;
+    void* uninitialized_source_context =
+        shared_depth_queue ? CreateHostRenderTargetContext(device, shared_depth_queue,
+                                                           &uninitialized_source_error)
+                           : nullptr;
+    void* initialized_destination_context =
+        uninitialized_source_context
+            ? CreateHostRenderTargetContext(device, shared_depth_queue, &uninitialized_source_error)
+            : nullptr;
+    bool initialized_destination_ready =
+        initialized_destination_context &&
+        ClearPipelineProbeContext(initialized_destination_context, kWidth / 2, kHeight / 2, 0.0,
+                                  0.0, 0.0, 1.0, &uninitialized_source_error);
+    bool uninitialized_source_shared =
+        initialized_destination_ready &&
+        SharePipelineProbeDepthStencilTarget(initialized_destination_context,
+                                             uninitialized_source_context,
+                                             &uninitialized_source_error);
+    bool shared_extent_resize_rejected =
+        uninitialized_source_shared &&
+        !ClearPipelineProbeContext(uninitialized_source_context, kWidth, kHeight, 0.0, 0.0, 0.0,
+                                   1.0, &uninitialized_source_error) &&
+        !uninitialized_source_error.empty();
+    std::vector<uint8_t> initialized_destination_bgra;
+    bool initialized_destination_preserved =
+        shared_extent_resize_rejected &&
+        ReadPipelineProbeContext(initialized_destination_context, kWidth / 2, kHeight / 2,
+                                 initialized_destination_bgra, &uninitialized_source_error);
+    const uint8_t* initialized_destination_center =
+        initialized_destination_preserved &&
+                initialized_destination_bgra.size() == size_t(kWidth / 2) * (kHeight / 2) * 4
+            ? initialized_destination_bgra.data() +
+                  (size_t(kHeight / 4) * (kWidth / 2) + kWidth / 4) * 4
+            : nullptr;
+    initialized_destination_preserved =
+        initialized_destination_center &&
+        PixelNear(initialized_destination_center, std::array<uint8_t, 4>{0, 0, 0, 255});
     std::string incompatible_samples_error;
     void* incompatible_samples_context =
         [device supportsTextureSampleCount:4] && shared_depth_queue
@@ -1087,6 +1327,41 @@ int RunPipelineProbeTest() {
          !SharePipelineProbeDepthStencilTarget(incompatible_samples_context, shared_depth_context_a,
                                                &incompatible_samples_error) &&
          !incompatible_samples_error.empty());
+    bool shared_depth_reset_pending_rendered =
+        incompatible_samples_rejected &&
+        render_shared_depth_quad(shared_depth_context_a, kNearDepthPositions, green_texture);
+    uint32_t shared_depth_reset_pending_before =
+        GetPipelineProbeContextPendingSubmissionCount(shared_depth_context_a);
+    ResetPipelineProbeDepthStencilTarget(shared_depth_context_a);
+    uint32_t shared_depth_reset_a_pending_after =
+        GetPipelineProbeContextPendingSubmissionCount(shared_depth_context_a);
+    uint32_t shared_depth_reset_b_pending_after =
+        GetPipelineProbeContextPendingSubmissionCount(shared_depth_context_b);
+    bool shared_depth_reset_cleared =
+        shared_depth_reset_pending_rendered &&
+        ClearPipelineProbeContext(shared_depth_context_b, kWidth, kHeight, 0.0, 0.0, 0.0, 1.0,
+                                  &shared_depth_error);
+    bool shared_depth_reset_near_rendered =
+        shared_depth_reset_cleared &&
+        render_shared_depth_quad(shared_depth_context_a, kNearDepthPositions, green_texture);
+    bool shared_depth_reset_far_rendered =
+        shared_depth_reset_near_rendered &&
+        render_shared_depth_quad(shared_depth_context_b, kFarDepthPositions, red_texture);
+    std::vector<uint8_t> shared_depth_reset_bgra;
+    bool shared_depth_reset_read =
+        shared_depth_reset_far_rendered &&
+        ReadPipelineProbeContext(shared_depth_context_b, kWidth, kHeight, shared_depth_reset_bgra,
+                                 &shared_depth_error);
+    const uint8_t* shared_depth_reset_center =
+        shared_depth_reset_read &&
+                shared_depth_reset_bgra.size() == size_t(kWidth) * kHeight * 4
+            ? shared_depth_reset_bgra.data() +
+                  (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+            : nullptr;
+    bool shared_depth_reset_ok =
+        shared_depth_reset_pending_before > 0 && !shared_depth_reset_a_pending_after &&
+        !shared_depth_reset_b_pending_after && shared_depth_reset_center &&
+        PixelNear(shared_depth_reset_center, std::array<uint8_t, 4>{0, 0, 0, 255});
     void* rebound_depth_context =
         shared_depth_queue
             ? CreateHostRenderTargetContext(device, shared_depth_queue, &shared_depth_error)
@@ -1111,11 +1386,15 @@ int RunPipelineProbeTest() {
                            shared_depth_a_pending_before_handoff == 1 &&
                            shared_depth_a_pending_after_handoff == 1 &&
                            incompatible_queue_rejected && incompatible_dimensions_rejected &&
-                           incompatible_samples_rejected && rebound_color_center &&
+                           uninitialized_source_shared && shared_extent_resize_rejected &&
+                           initialized_destination_preserved && incompatible_samples_rejected &&
+                           shared_depth_reset_ok && rebound_color_center &&
                            PixelNear(rebound_color_center, kGreenBgra);
     ReleasePipelineProbeContext(incompatible_samples_context);
     ReleasePipelineProbeContext(incompatible_dimensions_context);
     ReleasePipelineProbeContext(incompatible_depth_context);
+    ReleasePipelineProbeContext(initialized_destination_context);
+    ReleasePipelineProbeContext(uninitialized_source_context);
     ReleasePipelineProbeContext(shared_depth_context_b);
     ReleasePipelineProbeContext(shared_depth_context_a);
     ReleasePipelineProbeContext(rebound_depth_context);
@@ -1210,6 +1489,124 @@ int RunPipelineProbeTest() {
     ReleasePipelineProbeContext(msaa_depth_clear_context);
     ReleasePipelineProbeContext(msaa_context);
 
+    // Give every host sample a distinct color, then verify each Xenos selector.
+    // Uniform-color MSAA tests cannot distinguish a correct selected-sample copy
+    // from the old behavior that always performed a full hardware average.
+    std::string sample_select_error;
+    void* sample_vertex_library = CreateMslLibrary(device, kVertexMsl, &sample_select_error);
+    void* sample_fragment_library =
+        sample_vertex_library ? CreateMslLibrary(device, kSampleIdFragmentMsl, &sample_select_error)
+                              : nullptr;
+    void* sample_2x_pipeline =
+        sample_fragment_library && [device supportsTextureSampleCount:2]
+            ? CreateRenderPipelineState(device, sample_vertex_library, sample_fragment_library,
+                                        &sample_select_error, nullptr, nullptr, nullptr, 2)
+            : nullptr;
+    void* sample_4x_pipeline =
+        sample_fragment_library && [device supportsTextureSampleCount:4]
+            ? CreateRenderPipelineState(device, sample_vertex_library, sample_fragment_library,
+                                        &sample_select_error, nullptr, nullptr, nullptr, 4)
+            : nullptr;
+    ReleaseMslLibrary(sample_fragment_library);
+    ReleaseMslLibrary(sample_vertex_library);
+    auto test_sample_selects =
+        [&](uint32_t sample_count, void* sample_pipeline, const uint32_t* selectors,
+            const std::array<uint8_t, 4>* expected_values, size_t selector_count) {
+          if (![device supportsTextureSampleCount:sample_count]) {
+            return true;
+          }
+          void* sample_context = sample_pipeline
+                                     ? CreateHostRenderTargetContext(device, &sample_select_error)
+                                     : nullptr;
+          bool sample_context_ready =
+              sample_context &&
+              SetPipelineProbeContextSampleCount(sample_context, sample_count, &sample_select_error);
+          bool sample_rendered =
+              sample_context_ready &&
+              render_indexed_fan_to_context(sample_context, sample_pipeline, &texture, kWidth,
+                                            kHeight);
+          constexpr uint32_t kSampleTiledPitch = 64;
+          constexpr uint32_t kSampleTiledHeight = 64;
+          constexpr size_t kSampleTiledBufferSize = 32 * 1024;
+          id<MTLBuffer> sample_tiled_buffer =
+              sample_rendered
+                  ? [device newBufferWithLength:kSampleTiledBufferSize
+                                       options:MTLResourceStorageModeShared]
+                  : nil;
+          bool selections_match = sample_tiled_buffer != nil;
+          for (size_t i = 0; i < selector_count && selections_match; ++i) {
+            ProbeTiledResolveTarget target;
+            target.metal_buffer = sample_tiled_buffer;
+            target.pitch = kSampleTiledPitch;
+            target.height = kSampleTiledHeight;
+            target.color_sample_select = selectors[i];
+            std::vector<uint8_t> selected_bgra;
+            bool selected = ResolvePipelineProbeContextToXenosTiled(
+                sample_context, kWidth, kHeight, 0, 0, kWidth, kHeight, target, &selected_bgra,
+                &sample_select_error);
+            const uint8_t* center =
+                selected && selected_bgra.size() == size_t(kWidth) * kHeight * 4
+                    ? selected_bgra.data() +
+                          (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+                    : nullptr;
+            std::vector<uint8_t> fallback_bgra;
+            bool fallback_selected = ReadPipelineProbeContextRectSampleSelected(
+                sample_context, kWidth, kHeight, 0, 0, kWidth, kHeight, selectors[i],
+                fallback_bgra, &sample_select_error);
+            const uint8_t* fallback_center =
+                fallback_selected && fallback_bgra.size() == size_t(kWidth) * kHeight * 4
+                    ? fallback_bgra.data() +
+                          (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+                    : nullptr;
+            selections_match = center && fallback_center &&
+                               PixelNear(center, expected_values[i]) &&
+                               PixelNear(fallback_center, expected_values[i]);
+          }
+          if (sample_tiled_buffer) {
+            [sample_tiled_buffer release];
+          }
+          ReleasePipelineProbeContext(sample_context);
+          return sample_rendered && selections_match;
+        };
+    constexpr std::array<uint32_t, 3> k2xSelectors = {0, 1, 4};
+    // Native Metal 2x uses host sample 1 for the guest top sample (k0).
+    constexpr std::array<std::array<uint8_t, 4>, 3> k2xExpected = {
+        std::array<uint8_t, 4>{0, 255, 0, 255},
+        std::array<uint8_t, 4>{0, 0, 255, 255},
+        std::array<uint8_t, 4>{0, 128, 128, 255},
+    };
+    constexpr std::array<uint32_t, 7> k4xSelectors = {0, 1, 2, 3, 4, 5, 6};
+    // Guest 4x order is TL, BL, TR, BR. Metal's host sample IDs are ordered
+    // TL, TR, BL, BR, so guest samples 1 and 2 map to host IDs 2 and 1.
+    constexpr std::array<std::array<uint8_t, 4>, 7> k4xExpected = {
+        std::array<uint8_t, 4>{0, 0, 255, 255},
+        std::array<uint8_t, 4>{255, 0, 0, 255},
+        std::array<uint8_t, 4>{0, 255, 0, 255},
+        std::array<uint8_t, 4>{255, 255, 255, 255},
+        std::array<uint8_t, 4>{128, 0, 128, 255},
+        std::array<uint8_t, 4>{128, 255, 128, 255},
+        std::array<uint8_t, 4>{128, 128, 128, 255},
+    };
+    bool sample_select_2x_ok =
+        test_sample_selects(2, sample_2x_pipeline, k2xSelectors.data(), k2xExpected.data(),
+                            k2xSelectors.size());
+    bool sample_select_4x_ok =
+        test_sample_selects(4, sample_4x_pipeline, k4xSelectors.data(), k4xExpected.data(),
+                            k4xSelectors.size());
+    std::vector<uint8_t> sample_select_1x_bgra;
+    std::vector<uint8_t> sample_select_1x_reference_bgra;
+    bool sample_select_1x_ok =
+        ReadPipelineProbeContextRectSampleSelected(
+            context, kWidth, kHeight, 0, 0, kWidth, kHeight, 0, sample_select_1x_bgra,
+            &sample_select_error) &&
+        ReadPipelineProbeContext(context, kWidth, kHeight, sample_select_1x_reference_bgra,
+                                 &sample_select_error) &&
+        sample_select_1x_bgra == sample_select_1x_reference_bgra;
+    bool sample_select_ok =
+        sample_select_1x_ok && sample_select_2x_ok && sample_select_4x_ok;
+    ReleaseRenderPipelineState(sample_4x_pipeline);
+    ReleaseRenderPipelineState(sample_2x_pipeline);
+
     // Host render targets use private Metal storage. Their regional readback
     // must enqueue the blit behind pending draws and fence both with one wait.
     id<MTLCommandQueue> private_queue = [device newCommandQueue];
@@ -1285,8 +1682,29 @@ int RunPipelineProbeTest() {
       partial_target.y = 9;
       partial_target.endian = endian;
       partial_target.guest_memory_metal_buffer = tiled_guest_mirror_buffer;
-      partial_target.guest_memory_copy_length = kTiledBufferSize;
-      std::memset([tiled_guest_mirror_buffer contents], uint8_t(0x50 + endian), kTiledBufferSize);
+      constexpr uint32_t kMirrorSourceOffset = 128;
+      constexpr uint32_t kMirrorDestinationOffset = 384;
+      constexpr uint32_t kMirrorLength =
+          uint32_t(kTiledBufferSize) - kMirrorDestinationOffset - 256;
+      partial_target.guest_memory_copy_source_offset = kMirrorSourceOffset;
+      partial_target.guest_memory_copy_destination_offset = kMirrorDestinationOffset;
+      partial_target.guest_memory_copy_length = kMirrorLength;
+      struct SubmissionCallbackState {
+        bool called = false;
+        uint32_t start = 0;
+        uint32_t length = 0;
+      } submission_callback_state;
+      partial_target.submission_callback = [](void* context, uint32_t start, uint32_t length) {
+        auto* state = static_cast<SubmissionCallbackState*>(context);
+        state->called = true;
+        state->start = start;
+        state->length = length;
+      };
+      partial_target.submission_callback_context = &submission_callback_state;
+      partial_target.submission_start = kMirrorDestinationOffset;
+      partial_target.submission_length = kMirrorLength;
+      uint8_t mirror_sentinel = uint8_t(0x50 + endian);
+      std::memset([tiled_guest_mirror_buffer contents], mirror_sentinel, kTiledBufferSize);
       bool partial_resolved = ResolvePipelineProbeContextToXenosTiled(
           private_context, kWidth, kHeight, 18, 18, 4, 4, partial_target,
           /*bgra_out=*/nullptr, &error);
@@ -1304,12 +1722,18 @@ int RunPipelineProbeTest() {
       bool partial_expected_valid =
           partial_resolved && partial_pending_before_wait == 1 && partial_waited &&
           partial_waited_submission_count == 1 && partial_pending_after_wait == 0 &&
+          submission_callback_state.called &&
+          submission_callback_state.start == kMirrorDestinationOffset &&
+          submission_callback_state.length == kMirrorLength &&
           ApplyExpectedTiledRect(partial_expected, kPartialTiledBufferOffset, kTiledPitch, 7, 9,
                                  partial_source, kWidth, 4, 4, endian);
+      std::vector<uint8_t> mirror_expected(kTiledBufferSize, mirror_sentinel);
+      std::memcpy(mirror_expected.data() + kMirrorDestinationOffset,
+                  partial_expected.data() + kMirrorSourceOffset, kMirrorLength);
       bool partial_matches =
           partial_expected_valid &&
           std::memcmp([tiled_buffer contents], partial_expected.data(), kTiledBufferSize) == 0 &&
-          std::memcmp([tiled_guest_mirror_buffer contents], partial_expected.data(),
+          std::memcmp([tiled_guest_mirror_buffer contents], mirror_expected.data(),
                       kTiledBufferSize) == 0;
       tiled_resolve_ok = full_matches && partial_matches;
       tiled_case_count += full_matches ? 1 : 0;
@@ -1325,13 +1749,17 @@ int RunPipelineProbeTest() {
     std::string snapshot_error;
     void* snapshot_texture =
         CreatePipelineProbeSnapshotTexture(device, kWidth, kHeight, &snapshot_error);
+    bool snapshot_type_ok =
+        snapshot_texture &&
+        [(id<MTLTexture>)snapshot_texture textureType] == MTLTextureType2DArray &&
+        [(id<MTLTexture>)snapshot_texture arrayLength] == 1;
     ProbeTiledResolveTarget snapshot_target;
     snapshot_target.metal_buffer = tiled_buffer;
     snapshot_target.buffer_offset = kFullTiledBufferOffset;
     snapshot_target.pitch = kTiledPitch;
     snapshot_target.height = kTiledHeight;
     snapshot_target.presentation_snapshot_texture = snapshot_texture;
-    bool snapshot_resolved = snapshot_rendered && snapshot_texture &&
+    bool snapshot_resolved = snapshot_rendered && snapshot_type_ok &&
                              ResolvePipelineProbeContextToXenosTiled(
                                  private_context, kWidth, kHeight, 0, 0, kWidth, kHeight,
                                  snapshot_target, /*bgra_out=*/nullptr, &snapshot_error);
@@ -1380,7 +1808,32 @@ int RunPipelineProbeTest() {
       snapshot_clear_matches = PixelNear(cleared_after_snapshot.data() + pixel * 4,
                                          std::array<uint8_t, 4>{0, 0, 0, 255});
     }
-    bool snapshot_ok = snapshot_bgra == indexed_bgra && snapshot_clear_matches;
+    // The same private 2D-array snapshot must also be usable directly as a
+    // translated guest texture, without a CPU readback or upload in between.
+    ProbeTextureSlot snapshot_texture_slot;
+    snapshot_texture_slot.metal_texture = snapshot_texture;
+    snapshot_texture_slot.width = kWidth;
+    snapshot_texture_slot.height = kHeight;
+    snapshot_texture_slot.array_length = 1;
+    ResetPipelineProbeContext(private_context);
+    bool snapshot_sampled_rendered =
+        snapshot_clear_matches && render_indexed_fan_to_context(
+                                      private_context, pipeline_state, &snapshot_texture_slot,
+                                      kWidth, kHeight);
+    std::vector<uint8_t> snapshot_sampled_bgra;
+    bool snapshot_sampled_read =
+        snapshot_sampled_rendered &&
+        ReadPipelineProbeContext(private_context, kWidth, kHeight, snapshot_sampled_bgra,
+                                 &snapshot_error);
+    const uint8_t* snapshot_sampled_center =
+        snapshot_sampled_read
+            ? snapshot_sampled_bgra.data() +
+                  (size_t(kHeight / 2) * kWidth + kWidth / 2) * 4
+            : nullptr;
+    bool snapshot_sampled_ok =
+        snapshot_sampled_center && PixelNear(snapshot_sampled_center, kExpectedBgra);
+    bool snapshot_ok = snapshot_type_ok && snapshot_bgra == indexed_bgra &&
+                       snapshot_clear_matches && snapshot_sampled_ok;
     if (snapshot_readback_texture) {
       [snapshot_readback_texture release];
     }
@@ -1698,6 +2151,45 @@ int RunPipelineProbeTest() {
           stencil_center ? stencil_center[2] : 0, stencil_center ? stencil_center[3] : 0);
       return 1;
     }
+    if (!raster_depth_state_ok) {
+      std::fprintf(
+          stderr,
+          "[metal_pipeline_probe_test] FAIL: depth bias/clip state: %s "
+          "bias=(clear=%d base=%d offset=%d restore=%d center=%u,%u,%u,%u) "
+          "slope=(clear=%d base=%d offset=%d restore=%d center=%u,%u,%u,%u) "
+          "queued_clear=(clear=%d seed=%d depth_clear=%d equal=%d center=%u,%u,%u,%u) "
+          "one_shot=(draw=%d center=%u,%u,%u,%u) "
+          "clamp=(one_shot=%d center=%u,%u,%u,%u clear=%d draw=%d visible=%d) "
+          "clip=(clear=%d draw=%d restored=%d)\n",
+          error.c_str(), int(depth_bias_cleared), int(depth_bias_base_rendered),
+          int(depth_bias_offset_rendered), int(depth_bias_restored),
+          depth_bias_center ? depth_bias_center[0] : 0,
+          depth_bias_center ? depth_bias_center[1] : 0,
+          depth_bias_center ? depth_bias_center[2] : 0,
+          depth_bias_center ? depth_bias_center[3] : 0, int(slope_bias_cleared),
+          int(slope_bias_base_rendered), int(slope_bias_offset_rendered),
+          int(slope_bias_restored), slope_bias_center ? slope_bias_center[0] : 0,
+          slope_bias_center ? slope_bias_center[1] : 0,
+          slope_bias_center ? slope_bias_center[2] : 0,
+          slope_bias_center ? slope_bias_center[3] : 0, int(queued_depth_bias_cleared),
+          int(queued_depth_bias_seeded), int(queued_depth_bias_clear),
+          int(queued_depth_bias_equal),
+          queued_depth_bias_center ? queued_depth_bias_center[0] : 0,
+          queued_depth_bias_center ? queued_depth_bias_center[1] : 0,
+          queued_depth_bias_center ? queued_depth_bias_center[2] : 0,
+          queued_depth_bias_center ? queued_depth_bias_center[3] : 0,
+          int(one_shot_bias_rendered), one_shot_bias_center ? one_shot_bias_center[0] : 0,
+          one_shot_bias_center ? one_shot_bias_center[1] : 0,
+          one_shot_bias_center ? one_shot_bias_center[2] : 0,
+          one_shot_bias_center ? one_shot_bias_center[3] : 0,
+          int(one_shot_clamp_rendered), one_shot_clamp_center ? one_shot_clamp_center[0] : 0,
+          one_shot_clamp_center ? one_shot_clamp_center[1] : 0,
+          one_shot_clamp_center ? one_shot_clamp_center[2] : 0,
+          one_shot_clamp_center ? one_shot_clamp_center[3] : 0, int(depth_clamp_cleared),
+          int(depth_clamp_rendered), int(depth_clamp_visible), int(depth_clip_cleared),
+          int(depth_clip_rendered), int(depth_clip_restored));
+      return 1;
+    }
     if (!depth_only_ok || !discard_depth_ok) {
       std::fprintf(
           stderr,
@@ -1728,14 +2220,23 @@ int RunPipelineProbeTest() {
           stderr,
           "[metal_pipeline_probe_test] FAIL: shared depth/stencil ownership: %s "
           "attach=%d clear=%d near=%d far=%d read=%d reject_queue=%d "
-          "reject_dimensions=%d reject_samples=%d rebind=(%d,%d,%d) pending_a=(%u,%u) "
+          "reject_dimensions=%d reject_samples=%d uninitialized=(shared=%d reject_resize=%d "
+          "preserved=%d error=%s) reset=(seed=%d pending=%u after=%u,%u clear=%d near=%d "
+          "far=%d read=%d ok=%d) rebind=(%d,%d,%d) pending_a=(%u,%u) "
           "center=%u,%u,%u,%u rebound=%u,%u,%u,%u\n",
           shared_depth_error.c_str(), int(shared_depth_attached), int(shared_depth_cleared),
           int(shared_depth_near_rendered), int(shared_depth_far_rendered), int(shared_depth_read),
           int(incompatible_queue_rejected), int(incompatible_dimensions_rejected),
-          int(incompatible_samples_rejected), int(rebound_depth_initialized),
-          int(color_depth_rebound), int(rebound_color_read), shared_depth_a_pending_before_handoff,
-          shared_depth_a_pending_after_handoff, shared_depth_center ? shared_depth_center[0] : 0,
+          int(incompatible_samples_rejected), int(uninitialized_source_shared),
+          int(shared_extent_resize_rejected), int(initialized_destination_preserved),
+          uninitialized_source_error.c_str(), int(shared_depth_reset_pending_rendered),
+          shared_depth_reset_pending_before, shared_depth_reset_a_pending_after,
+          shared_depth_reset_b_pending_after, int(shared_depth_reset_cleared),
+          int(shared_depth_reset_near_rendered), int(shared_depth_reset_far_rendered),
+          int(shared_depth_reset_read), int(shared_depth_reset_ok),
+          int(rebound_depth_initialized), int(color_depth_rebound), int(rebound_color_read),
+          shared_depth_a_pending_before_handoff, shared_depth_a_pending_after_handoff,
+          shared_depth_center ? shared_depth_center[0] : 0,
           shared_depth_center ? shared_depth_center[1] : 0,
           shared_depth_center ? shared_depth_center[2] : 0,
           shared_depth_center ? shared_depth_center[3] : 0,
@@ -1768,6 +2269,14 @@ int RunPipelineProbeTest() {
                    msaa_depth_clear_center ? msaa_depth_clear_center[1] : 0,
                    msaa_depth_clear_center ? msaa_depth_clear_center[2] : 0,
                    msaa_depth_clear_center ? msaa_depth_clear_center[3] : 0);
+      return 1;
+    }
+    if (!sample_select_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: Xenos MSAA sample selection: %s "
+                   "2x=%d 4x=%d\n",
+                   sample_select_error.c_str(), int(sample_select_2x_ok),
+                   int(sample_select_4x_ok));
       return 1;
     }
     if (!blend_ok) {
@@ -1826,7 +2335,9 @@ int RunPipelineProbeTest() {
                  "pixels; indexed fan remap rasterized %zu; scissor clipped its right half "
                  "(%zu clear); all four cull/winding combinations plus persistent and shared "
                  "cross-color-target depth, depth-only writes, rectangular resolve clears, "
-                 "void-fragment discard depth, 4x MSAA target defers resolves across 64-draw "
+                 "void-fragment discard depth, persistent/queued/one-shot depth bias and clip "
+                 "restoration, 1x/2x/4x selected-sample fallback and tiled resolves, 4x MSAA "
+                 "target defers resolves across 64-draw "
                  "batches, depth write masking, and stencil "
                  "replace/equal/reject matched; ordered multi-draw "
                  "batch, R/B color write mask, 64-draw command buffers, 256-draw oldest-buffer "

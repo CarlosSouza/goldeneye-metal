@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -148,6 +149,11 @@ class CommandProcessor {
 
   void ExecutePacket(uint32_t ptr, uint32_t count);
 
+  // May be called by recompiled guest code immediately after a CPU memory
+  // store. Backends use this as a precise, post-store wake hint for an active
+  // WAIT_REG_MEM; the packet still re-reads and evaluates its own predicate.
+  virtual void NotifyWaitRegMemMemoryWrite(uint32_t address, uint32_t length);
+
   bool is_paused() const { return paused_; }
   void Pause();
   void Resume();
@@ -207,8 +213,19 @@ class CommandProcessor {
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
+  // Gives a backend one chance to wait directly for a queued GPU completion
+  // write rather than repeatedly polling its guest-memory destination. Returns
+  // true only if a matching write was found and completed.
+  virtual bool WaitForGpuCompletionMemoryWrite(uint32_t address, uint32_t length);
+  // A backend may arm a notification for guest CPU writes to a WAIT_REG_MEM
+  // destination before the packet's first authoritative read. Waiting is
+  // always bounded by the caller and notifications are only hints: the packet
+  // re-reads and evaluates its predicate after every wake or timeout.
+  virtual bool BeginWaitRegMemMemoryChange(uint32_t address, uint32_t length);
+  virtual bool WaitForWaitRegMemMemoryChange(std::chrono::milliseconds timeout);
+  virtual void EndWaitRegMemMemoryChange();
   virtual void OnWaitRegMemComplete(bool, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-                                    uint32_t, uint64_t, uint64_t, bool, bool) {}
+                                    uint32_t, uint32_t, uint64_t, uint64_t, bool, bool) {}
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index,
                                 uint32_t primary_buffer_ptr, uint32_t primary_buffer_size);
