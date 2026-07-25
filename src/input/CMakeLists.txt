@@ -17,5 +17,8 @@ if(WIN32)
 else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
 endif()
+if(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    target_sources(rexinput PRIVATE sdl/sdl_virtual_gamepad_harness.cpp)
+endif()
 
 target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)

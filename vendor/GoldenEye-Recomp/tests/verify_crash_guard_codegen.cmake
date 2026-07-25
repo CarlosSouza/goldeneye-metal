@@ -182,6 +182,120 @@ foreach(return_address IN ITEMS 0x823CFC88 0x823CFCBC)
     endif()
 endforeach()
 
+function(verify_audio_callback_guard function_name dispatch_site return_address)
+    extract_generated_function("${function_name}" audio_callback_body)
+    set(enter_call "ge_audio_callback_enter_${dispatch_site}(")
+    set(leave_call "ge_audio_callback_leave(")
+    set(indirect_call "REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);")
+
+    string(FIND "${audio_callback_body}" "${enter_call}" enter_position)
+    string(FIND "${audio_callback_body}"
+        "ctx.lr = ${return_address};" return_position)
+    string(LENGTH "${audio_callback_body}" audio_callback_body_length)
+    if(return_position LESS 0)
+        set(after_return "")
+    else()
+        math(EXPR after_return_length
+            "${audio_callback_body_length} - ${return_position}")
+        string(SUBSTRING "${audio_callback_body}" ${return_position}
+            ${after_return_length} after_return)
+    endif()
+    string(FIND "${after_return}" "${indirect_call}" indirect_position)
+    string(FIND "${after_return}" "${leave_call}" leave_position)
+    if(enter_position LESS 0 OR return_position LESS 0 OR
+       indirect_position LESS 0 OR leave_position LESS 0 OR
+       NOT enter_position LESS return_position OR
+       NOT indirect_position LESS leave_position)
+        message(FATAL_ERROR
+            "${function_name} callback 0x${dispatch_site} is not wrapped by the "
+            "audio nonvolatile-register guard")
+    endif()
+
+    math(EXPR before_dispatch_length "${return_position} - ${enter_position}")
+    string(SUBSTRING "${audio_callback_body}" ${enter_position}
+        ${before_dispatch_length} before_dispatch)
+    string(FIND "${before_dispatch}" "${indirect_call}" earlier_indirect)
+    string(FIND "${before_dispatch}" "${leave_call}" earlier_leave)
+    if(NOT earlier_indirect LESS 0 OR NOT earlier_leave LESS 0)
+        message(FATAL_ERROR
+            "${function_name} callback 0x${dispatch_site} does not take a fresh "
+            "snapshot immediately before dispatch")
+    endif()
+
+    math(EXPR guarded_return_length "${leave_position}")
+    string(SUBSTRING "${after_return}" 0
+        ${guarded_return_length} guarded_return)
+    string(LENGTH "${guarded_return}" guarded_return_size)
+    string(LENGTH "${indirect_call}" indirect_call_size)
+    string(REPLACE "${indirect_call}" "" guarded_without_indirect
+        "${guarded_return}")
+    string(LENGTH "${guarded_without_indirect}" guarded_without_indirect_size)
+    math(EXPR removed_indirect_size
+        "${guarded_return_size} - ${guarded_without_indirect_size}")
+    if(NOT removed_indirect_size EQUAL indirect_call_size)
+        message(FATAL_ERROR
+            "${function_name} callback 0x${dispatch_site} must retain exactly one "
+            "indirect dispatch before state restoration")
+    endif()
+
+    # These hooks are intentionally limited to straight-line return addresses.
+    # A branch target at the restore would let a callback-skip or shared join
+    # execute leave without the matching enter and consume an outer snapshot.
+    string(REPLACE "0x" "" return_site "${return_address}")
+    string(TOUPPER "${return_site}" return_site)
+    string(FIND "${audio_callback_body}" "loc_${return_site}:" return_label)
+    string(FIND "${audio_callback_body}" "goto loc_${return_site};" branch_to_return)
+    if(NOT return_label LESS 0 OR NOT branch_to_return LESS 0)
+        message(FATAL_ERROR
+            "${function_name} callback 0x${dispatch_site} restore address "
+            "${return_address} is a control-flow join")
+    endif()
+endfunction()
+
+verify_audio_callback_guard("sub_823E4B60" "823E4BA8" "0x823E4BAC")
+verify_audio_callback_guard("sub_823E4B60" "823E4BDC" "0x823E4BE0")
+
+# Reject stale codegen that still contains any of the unsafe broad family
+# hooks. Exactly two enters and two paired leaves are allowed.
+set(all_generated_source "")
+foreach(generated_path IN LISTS generated_sources)
+    file(READ "${generated_path}" generated_source_part)
+    string(APPEND all_generated_source "${generated_source_part}")
+endforeach()
+string(REGEX MATCHALL "ge_audio_callback_enter_[0-9A-F]+\\("
+    all_audio_enters "${all_generated_source}")
+string(REGEX MATCHALL "ge_audio_callback_leave\\("
+    all_audio_leaves "${all_generated_source}")
+list(LENGTH all_audio_enters all_audio_enter_count)
+list(LENGTH all_audio_leaves all_audio_leave_count)
+# Each hook appears once in an extern declaration and once at its call site.
+if(NOT all_audio_enter_count EQUAL 4 OR NOT all_audio_leave_count EQUAL 4)
+    message(FATAL_ERROR
+        "Generated GoldenEye code must contain only the two straight-line "
+        "sub_823E4B60 audio callback guards; rerun rexglue codegen")
+endif()
+
+# Telemetry must run only after the title has dispatched every staged local-pad
+# record, not from the pre-dispatch injection hook.
+extract_generated_function("sub_823B2548" input_dispatch_body)
+string(FIND "${input_dispatch_body}" "ge_inject_keyboard(" input_injection)
+string(FIND "${input_dispatch_body}"
+    "if (ctx.cr6.lt) goto loc_823B25E8;" dispatch_loop_back)
+string(FIND "${input_dispatch_body}"
+    "ge_observe_dispatched_player_input();" dispatched_observation)
+string(REGEX MATCHALL "ge_observe_dispatched_player_input\\("
+    dispatched_observation_calls "${input_dispatch_body}")
+list(LENGTH dispatched_observation_calls dispatched_observation_count)
+if(input_injection LESS 0 OR dispatch_loop_back LESS 0 OR
+   dispatched_observation LESS 0 OR
+   NOT input_injection LESS dispatch_loop_back OR
+   NOT dispatch_loop_back LESS dispatched_observation OR
+   NOT dispatched_observation_count EQUAL 1)
+    message(FATAL_ERROR
+        "Player-stuck telemetry must sample exactly once after the title's "
+        "local-pad dispatch loop")
+endif()
+
 extract_generated_function("sub_823DACE0" child_cleanup_body)
 set(child_node_guard
     "ge_guard_cleanup_child_node(ctx.r11, ctx.r30, ctx.r1)")
@@ -235,4 +349,4 @@ if(critical_section_argument_position LESS 0 OR
 endif()
 
 message(STATUS
-    "Verified cleanup guards, child-list containment, and lock-wait diagnostic callsite")
+    "Verified audio/cleanup guards, child-list containment, and lock-wait diagnostic callsite")

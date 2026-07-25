@@ -346,7 +346,7 @@ void GeMenuDialog::OnClose() {
 }
 
 void GeMenuDialog::OnDraw(ImGuiIO& io) {
-  UpdateControllerSnapshot();
+  UpdateControllerSnapshots();
 
   // Keyboard tab navigation -- suppressed while a rebind is capturing, so the
   // arrow keys you press to bind are listened for, not used to switch tabs.
@@ -410,29 +410,39 @@ void GeMenuDialog::OnDraw(ImGuiIO& io) {
   ImGui::PopStyleVar();
 }
 
-void GeMenuDialog::UpdateControllerSnapshot() {
-  controller_snapshot_ = {};
-  controller_snapshot_valid_ = false;
+void GeMenuDialog::UpdateControllerSnapshots() {
+  controller_snapshots_ = {};
+  controller_snapshot_valid_.fill(false);
   auto* runtime = rex::Runtime::instance();
   auto* input = runtime && runtime->input_system()
                     ? static_cast<rex::input::InputSystem*>(runtime->input_system())
                     : nullptr;
-  if (input) {
-    controller_snapshot_valid_ = input->GetControllerSnapshot(0, &controller_snapshot_);
+  if (!input) {
+    return;
+  }
+  for (uint32_t slot = 0; slot < kControllerSlotCount; ++slot) {
+    controller_snapshot_valid_[slot] =
+        input->GetControllerSnapshot(slot, &controller_snapshots_[slot]);
   }
 }
 
 void GeMenuDialog::DrawControllerTest() {
-  if (!controller_snapshot_valid_ || !controller_snapshot_.connected) {
-    TextWrappedColored(kInkDim,
-                       "No physical controller detected. Connect one over USB or "
-                       "Bluetooth; this panel updates automatically.");
+  const size_t slot = static_cast<size_t>(
+      std::clamp(selected_controller_slot_, 0, static_cast<int>(kControllerSlotCount) - 1));
+  const auto& snapshot = controller_snapshots_[slot];
+  if (!controller_snapshot_valid_[slot] || !snapshot.connected) {
+    char message[128];
+    std::snprintf(message, sizeof(message),
+                  "Player %zu is empty. Connect a controller over USB or "
+                  "Bluetooth; this panel updates automatically.",
+                  slot + 1);
+    TextWrappedColored(kInkDim, message);
     return;
   }
 
-  ImGui::TextColored(ImColor(kTitle), "%s", controller_snapshot_.name.c_str());
-  const auto& gamepad = controller_snapshot_.gamepad;
-  const auto& raw = controller_snapshot_.raw_gamepad;
+  ImGui::TextColored(ImColor(kTitle), "PLAYER %zu  %s", slot + 1, snapshot.name.c_str());
+  const auto& gamepad = snapshot.gamepad;
+  const auto& raw = snapshot.raw_gamepad;
   auto axis = [](const rex::be<int16_t>& value) {
     return rex::input::controller::AxisToUnit(static_cast<int16_t>(value));
   };
@@ -1167,7 +1177,57 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
           "Use the controller's south face button as A, east as B, west as X, north as Y, and "
           "Options/Menu as Start. RB switches original/remastered graphics. In these settings, "
           "A selects, B closes, and LB/RB changes tabs.");
+      ImGui::TextWrapped(
+          "Hold L3 + R3 together for about 0.75 seconds to open or close Host Settings.");
       ImGui::PopStyleColor();
+      ImGui::Spacing();
+
+      auto* runtime = rex::Runtime::instance();
+      auto* input = runtime && runtime->input_system()
+                        ? static_cast<rex::input::InputSystem*>(runtime->input_system())
+                        : nullptr;
+
+      ImGui::TextColored(ImColor(kTitle), "LOCAL PLAYER PORTS");
+      TextWrappedColored(
+          kInkDim,
+          "Controllers fill P1-P4 in connection order. If one disconnects, the other "
+          "players keep their ports. Select a controller below to test or reassign it.");
+      ImGui::Spacing();
+      for (size_t slot = 0; slot < kControllerSlotCount; ++slot) {
+        const bool connected =
+            controller_snapshot_valid_[slot] && controller_snapshots_[slot].connected;
+        std::string label = "P" + std::to_string(slot + 1) + "  ";
+        label += connected ? controller_snapshots_[slot].name : "Empty";
+        label += "##controller_port_" + std::to_string(slot);
+        if (ImGui::Selectable(label.c_str(), selected_controller_slot_ == static_cast<int>(slot))) {
+          selected_controller_slot_ = static_cast<int>(slot);
+        }
+      }
+
+      const size_t assignment_source = static_cast<size_t>(
+          std::clamp(selected_controller_slot_, 0, static_cast<int>(kControllerSlotCount) - 1));
+      const bool can_assign = input && controller_snapshot_valid_[assignment_source] &&
+                              controller_snapshots_[assignment_source].connected;
+      ImGui::TextUnformatted("Assign selected controller to:");
+      for (size_t target = 0; target < kControllerSlotCount; ++target) {
+        if (target != 0) {
+          ImGui::SameLine();
+        }
+        ImGui::PushID(static_cast<int>(target));
+        ImGui::BeginDisabled(!can_assign || target == assignment_source);
+        const std::string target_label = "P" + std::to_string(target + 1);
+        if (ImGui::Button(target_label.c_str()) && input &&
+            input->SwapControllerSlots(
+                static_cast<uint32_t>(assignment_source), static_cast<uint32_t>(target),
+                controller_snapshots_[assignment_source].device_id) == rex::X_RESULT{0}) {
+          selected_controller_slot_ = static_cast<int>(target);
+        }
+        ImGui::EndDisabled();
+        ImGui::PopID();
+      }
+      TextWrappedColored(kInkDim, "(an occupied destination swaps the two players)");
+      ImGui::Spacing();
+      ImGui::Separator();
       ImGui::Spacing();
 
       rex::input::controller::Layout controller_layout = rex::input::controller::Layout::kModern;
@@ -1201,7 +1261,7 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       }
       TextWrappedColored(kInkDim,
                          "Changing layout keeps your custom button remaps, sensitivity and "
-                         "deadzones.");
+                         "deadzones. These settings apply to every local controller.");
       ImGui::Spacing();
 
       float controller_sensitivity = GetCvarF(rex::input::kControllerLookSensitivityCvar);
@@ -1255,19 +1315,20 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
         callbacks_.persist_config();
       ImGui::EndDisabled();
 
-      auto* runtime = rex::Runtime::instance();
-      auto* input = runtime && runtime->input_system()
-                        ? static_cast<rex::input::InputSystem*>(runtime->input_system())
-                        : nullptr;
-      const bool can_test_rumble = input && controller_snapshot_valid_ &&
-                                   controller_snapshot_.rumble_supported && rumble_enabled &&
-                                   rumble_intensity > 0.0f;
+      const size_t rumble_slot = static_cast<size_t>(
+          std::clamp(selected_controller_slot_, 0, static_cast<int>(kControllerSlotCount) - 1));
+      const bool selected_controller_valid =
+          controller_snapshot_valid_[rumble_slot] && controller_snapshots_[rumble_slot].connected;
+      const bool can_test_rumble = input && selected_controller_valid &&
+                                   controller_snapshots_[rumble_slot].rumble_supported &&
+                                   rumble_enabled && rumble_intensity > 0.0f;
       ImGui::BeginDisabled(!can_test_rumble);
       if (ImGui::Button("Test Rumble") && input) {
-        input->PlayControllerTestRumble(0);
+        input->PlayControllerTestRumble(static_cast<uint32_t>(rumble_slot),
+                                        controller_snapshots_[rumble_slot].device_id);
       }
       ImGui::EndDisabled();
-      if (controller_snapshot_valid_ && !controller_snapshot_.rumble_supported) {
+      if (selected_controller_valid && !controller_snapshots_[rumble_slot].rumble_supported) {
         TextWrappedColored(kInkDim, "(this controller does not report rumble support)");
       }
 
@@ -1353,7 +1414,7 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       }
 
       ImGui::Spacing();
-      ImGui::TextColored(ImColor(kTitle), "LIVE CONTROLLER TEST");
+      ImGui::TextColored(ImColor(kTitle), "LIVE CONTROLLER TEST - P%zu", rumble_slot + 1);
       DrawControllerTest();
       ImGui::Spacing();
       ImGui::Separator();

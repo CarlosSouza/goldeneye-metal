@@ -60,9 +60,8 @@ class KeystrokeDriver final : public rex::input::InputDriver {
     has_controller_snapshot_ = true;
   }
 
-  bool GetControllerSnapshot(
-      uint32_t user_index,
-      rex::input::ControllerSnapshot* out_snapshot) override {
+  bool GetControllerSnapshot(uint32_t user_index,
+                             rex::input::ControllerSnapshot* out_snapshot) override {
     if (!has_controller_snapshot_ || user_index != controller_snapshot_.user_index) {
       if (out_snapshot) {
         *out_snapshot = {};
@@ -76,13 +75,51 @@ class KeystrokeDriver final : public rex::input::InputDriver {
     return true;
   }
 
-  void SetTestRumbleResult(rex::X_RESULT result) {
-    test_rumble_result_ = result;
+  void SetHostInputSnapshot(rex::input::HostInputSnapshot snapshot) {
+    host_input_snapshot_ = snapshot;
+    has_host_input_snapshot_ = true;
   }
 
-  rex::X_RESULT PlayControllerTestRumble(uint32_t) override {
+  bool GetHostInputSnapshot(rex::input::HostInputSnapshot* out_snapshot) const override {
+    if (!has_host_input_snapshot_) {
+      if (out_snapshot) {
+        *out_snapshot = {};
+      }
+      return false;
+    }
+    if (out_snapshot) {
+      *out_snapshot = host_input_snapshot_;
+    }
+    return true;
+  }
+
+  void SetTestRumbleResult(rex::X_RESULT result) { test_rumble_result_ = result; }
+
+  rex::X_RESULT PlayControllerTestRumble(uint32_t user_index,
+                                         uint64_t expected_device_id) override {
+    test_rumble_user_ = user_index;
+    test_rumble_device_id_ = expected_device_id;
     return test_rumble_result_;
   }
+
+  uint32_t test_rumble_user() const { return test_rumble_user_; }
+  uint64_t test_rumble_device_id() const { return test_rumble_device_id_; }
+
+  void SetSwapResult(rex::X_RESULT result) { swap_result_ = result; }
+
+  rex::X_RESULT SwapControllerSlots(uint32_t first_user_index, uint32_t second_user_index,
+                                    uint64_t expected_device_id) override {
+    swap_called_ = true;
+    swap_first_ = first_user_index;
+    swap_second_ = second_user_index;
+    swap_device_id_ = expected_device_id;
+    return swap_result_;
+  }
+
+  bool swap_called() const { return swap_called_; }
+  uint32_t swap_first() const { return swap_first_; }
+  uint32_t swap_second() const { return swap_second_; }
+  uint64_t swap_device_id() const { return swap_device_id_; }
 
   bool ConsumeApplicationMouseMotion(uint32_t user_index,
                                      rex::input::MouseMotionDelta* out_delta) override {
@@ -107,7 +144,16 @@ class KeystrokeDriver final : public rex::input::InputDriver {
   rex::input::MouseMotionDelta application_mouse_delta_ = {};
   bool has_controller_snapshot_ = false;
   rex::input::ControllerSnapshot controller_snapshot_ = {};
+  bool has_host_input_snapshot_ = false;
+  rex::input::HostInputSnapshot host_input_snapshot_ = {};
   rex::X_RESULT test_rumble_result_ = X_ERROR_DEVICE_NOT_CONNECTED;
+  uint32_t test_rumble_user_ = 0;
+  uint64_t test_rumble_device_id_ = 0;
+  rex::X_RESULT swap_result_ = X_ERROR_DEVICE_NOT_CONNECTED;
+  bool swap_called_ = false;
+  uint32_t swap_first_ = 0;
+  uint32_t swap_second_ = 0;
+  uint64_t swap_device_id_ = 0;
 };
 
 }  // namespace
@@ -128,10 +174,8 @@ TEST_CASE("Input system forwards application mouse mode to every driver", "[inpu
   MouseMotionMode second = MouseMotionMode::kRightStick;
 
   rex::input::InputSystem input(nullptr);
-  input.AddDriver(
-      std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY, 0, &first));
-  input.AddDriver(
-      std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY, 0, &second));
+  input.AddDriver(std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY, 0, &first));
+  input.AddDriver(std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY, 0, &second));
   input.SetMouseMotionMode(MouseMotionMode::kApplication);
 
   CHECK(first == MouseMotionMode::kApplication);
@@ -167,8 +211,7 @@ TEST_CASE("Input system consumes and combines paired application mouse motion", 
   CHECK(delta.y == 0);
 }
 
-TEST_CASE("Input system exposes the first physical controller snapshot",
-          "[input][controller]") {
+TEST_CASE("Input system exposes the first physical controller snapshot", "[input][controller]") {
   rex::input::InputSystem input(nullptr);
   input.AddDriver(std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY));
 
@@ -196,14 +239,62 @@ TEST_CASE("Input system exposes the first physical controller snapshot",
   CHECK(actual.name.empty());
 }
 
-TEST_CASE("Input system routes host rumble tests to a connected driver",
-          "[input][controller]") {
+TEST_CASE("Input system exposes a driver-published host input snapshot", "[input][mouse]") {
+  rex::input::InputSystem input(nullptr);
+  input.AddDriver(std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY));
+
+  auto host = std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY);
+  host->SetHostInputSnapshot({
+      .focused = true,
+      .input_active = true,
+      .mouse_capture_active = true,
+  });
+  input.AddDriver(std::move(host));
+
+  rex::input::HostInputSnapshot snapshot;
+  REQUIRE(input.GetHostInputSnapshot(&snapshot));
+  CHECK(snapshot.focused);
+  CHECK(snapshot.input_active);
+  CHECK(snapshot.mouse_capture_active);
+
+  rex::input::InputSystem empty(nullptr);
+  snapshot = {.focused = true, .input_active = true, .mouse_capture_active = true};
+  CHECK_FALSE(empty.GetHostInputSnapshot(&snapshot));
+  CHECK_FALSE(snapshot.focused);
+  CHECK_FALSE(snapshot.input_active);
+  CHECK_FALSE(snapshot.mouse_capture_active);
+}
+
+TEST_CASE("Input system routes host rumble tests to a connected driver", "[input][controller]") {
   rex::input::InputSystem input(nullptr);
   auto disconnected = std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY);
   disconnected->SetTestRumbleResult(X_ERROR_DEVICE_NOT_CONNECTED);
   input.AddDriver(std::move(disconnected));
   auto connected = std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY);
   connected->SetTestRumbleResult(X_ERROR_SUCCESS);
+  auto* connected_ptr = connected.get();
   input.AddDriver(std::move(connected));
-  REQUIRE(input.PlayControllerTestRumble(0) == X_ERROR_SUCCESS);
+  REQUIRE(input.PlayControllerTestRumble(2, 0xABCD) == X_ERROR_SUCCESS);
+  CHECK(connected_ptr->test_rumble_user() == 2);
+  CHECK(connected_ptr->test_rumble_device_id() == 0xABCD);
+}
+
+TEST_CASE("Input system routes intentional controller port swaps",
+          "[input][controller][multiplayer]") {
+  rex::input::InputSystem input(nullptr);
+  input.AddDriver(std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY));
+
+  auto controller = std::make_unique<KeystrokeDriver>(X_ERROR_EMPTY);
+  controller->SetSwapResult(X_ERROR_SUCCESS);
+  auto* controller_ptr = controller.get();
+  input.AddDriver(std::move(controller));
+
+  REQUIRE(input.SwapControllerSlots(1, 3, 0x1234) == X_ERROR_SUCCESS);
+  CHECK(controller_ptr->swap_called());
+  CHECK(controller_ptr->swap_first() == 1);
+  CHECK(controller_ptr->swap_second() == 3);
+  CHECK(controller_ptr->swap_device_id() == 0x1234);
+
+  controller_ptr->SetSwapResult(X_ERROR_BAD_ARGUMENTS);
+  CHECK(input.SwapControllerSlots(4, 0) == X_ERROR_BAD_ARGUMENTS);
 }

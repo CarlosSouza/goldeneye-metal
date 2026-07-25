@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -24,6 +25,7 @@ int failures = 0;
 using ge::testing::Tool;
 using ge::testing::detail::AvailabilityBlock;
 using ge::testing::detail::CheatDefinition;
+using ge::testing::detail::LocalMultiplayerReadinessTracker;
 using ge::testing::detail::MutationConditions;
 using ge::testing::detail::PendingToggle;
 using ge::testing::detail::RequestQueue;
@@ -75,6 +77,16 @@ static_assert(ge::testing::detail::IsAction(Tool::kUnlockOneLevel));
 static_assert(ge::testing::detail::IsAction(Tool::kUnlockAllLevels));
 static_assert(!ge::testing::detail::IsAction(Tool::kGodMode));
 static_assert(!ge::testing::detail::IsAction(Tool::kRestartMission));
+static_assert(ge::testing::detail::kTitleMenuStateAddress == 0x8272B35Cu);
+static_assert(ge::testing::detail::kLocalMultiplayerJoinedCountAddress == 0x82F6107Cu);
+static_assert(ge::testing::detail::kTitleReadyMenuState == 5);
+static_assert(ge::testing::detail::kDossierMenuState == 7);
+static_assert(ge::testing::detail::kCreateLocalGameMenuState == 15);
+static_assert(ge::testing::detail::kMultiplayerModesMenuState == 27);
+static_assert(std::string_view(ge::testing::detail::TitleMenuStateName(5)) == "title-ready");
+static_assert(std::string_view(ge::testing::detail::TitleMenuStateName(7)) == "dossier");
+static_assert(std::string_view(ge::testing::detail::TitleMenuStateName(15)) == "create-local-game");
+static_assert(std::string_view(ge::testing::detail::TitleMenuStateName(27)) == "multiplayer-modes");
 
 MutationConditions ReadyMission() {
   return {
@@ -227,6 +239,36 @@ void TestRequestValidationAndActions() {
   CHECK_TRUE(!queue.TakeAction(Tool::kUnlockAllLevels, 31));
 }
 
+void TestLocalMultiplayerReadiness() {
+  LocalMultiplayerReadinessTracker tracker;
+
+  for (uint32_t poll = 1; poll < ge::testing::detail::kLocalMultiplayerStablePolls; ++poll) {
+    CHECK_TRUE(!tracker.Observe(33, 2, false));
+    CHECK_TRUE(tracker.stable_polls() == poll);
+  }
+  CHECK_TRUE(tracker.Observe(33, 2, false));
+  CHECK_TRUE(tracker.level_id() == 33);
+  CHECK_TRUE(tracker.player_count() == 2);
+  CHECK_TRUE(!tracker.Observe(33, 2, false));
+
+  // A player-count or level transition starts a fresh stability window.
+  CHECK_TRUE(!tracker.Observe(33, 3, false));
+  CHECK_TRUE(tracker.stable_polls() == 1);
+  CHECK_TRUE(!tracker.Observe(34, 3, false));
+  CHECK_TRUE(tracker.stable_polls() == 1);
+
+  // Title, single-player and network sessions are never reported and reset
+  // any partially accumulated local-match window.
+  CHECK_TRUE(!tracker.Observe(90, 2, false));
+  CHECK_TRUE(tracker.stable_polls() == 0);
+  CHECK_TRUE(!tracker.Observe(33, 1, false));
+  CHECK_TRUE(tracker.stable_polls() == 0);
+  CHECK_TRUE(!tracker.Observe(33, 2, true));
+  CHECK_TRUE(tracker.stable_polls() == 0);
+  CHECK_TRUE(!tracker.Observe(33, 5, false));
+  CHECK_TRUE(tracker.stable_polls() == 0);
+}
+
 std::string ReadFile(const std::filesystem::path& path) {
   std::ifstream stream(path, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
@@ -247,6 +289,7 @@ void TestRuntimeSourceContract() {
   CHECK_TRUE(source.contains("0x82003264u"));
   CHECK_TRUE(source.contains("sub_82091D18(context, base)"));
   CHECK_TRUE(source.contains("sub_82091CA8(context, base)"));
+  CHECK_TRUE(source.contains("local multiplayer ready"));
 
   std::string generated_cheat_source;
   for (const auto& entry : std::filesystem::directory_iterator(GOLDENEYE_GENERATED_DIRECTORY)) {
@@ -333,6 +376,7 @@ int main() {
   TestLatestRequestWins();
   TestOldMissionRequestIsConsumedAndRejected();
   TestRequestValidationAndActions();
+  TestLocalMultiplayerReadiness();
   TestRuntimeSourceContract();
   return failures == 0 ? 0 : 1;
 }

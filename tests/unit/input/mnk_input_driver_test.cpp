@@ -65,6 +65,8 @@ class TestWindow final : public rex::ui::Window {
   uint32_t capture_calls() const { return capture_calls_; }
   uint32_t release_calls() const { return release_calls_; }
   bool capture_applied_on_ui_thread() const { return capture_applied_on_ui_thread_; }
+  void set_capture_succeeds(bool succeeds) { capture_succeeds_ = succeeds; }
+  void set_release_succeeds(bool succeeds) { release_succeeds_ = succeeds; }
 
  protected:
   bool OpenImpl() override {
@@ -87,15 +89,20 @@ class TestWindow final : public rex::ui::Window {
   void ApplyNewMouseCapture() override {
     ++capture_calls_;
     capture_applied_on_ui_thread_ &= app_context().IsInUIThread();
+    capture_active_ = capture_succeeds_;
   }
 
   void ApplyNewMouseRelease() override {
     ++release_calls_;
     capture_applied_on_ui_thread_ &= app_context().IsInUIThread();
+    if (release_succeeds_) {
+      capture_active_ = false;
+    }
   }
 
-  std::unique_ptr<rex::ui::Surface> CreateSurfaceImpl(
-      rex::ui::Surface::TypeFlags) override {
+  bool IsMouseCaptureActiveImpl() const override { return capture_active_; }
+
+  std::unique_ptr<rex::ui::Surface> CreateSurfaceImpl(rex::ui::Surface::TypeFlags) override {
     return nullptr;
   }
   void RequestPaintImpl() override {}
@@ -104,6 +111,9 @@ class TestWindow final : public rex::ui::Window {
   uint32_t capture_calls_ = 0;
   uint32_t release_calls_ = 0;
   bool capture_applied_on_ui_thread_ = true;
+  bool capture_succeeds_ = true;
+  bool release_succeeds_ = true;
+  bool capture_active_ = false;
 };
 
 void PumpUntilDone(TestAppContext& context, const std::atomic<bool>& done) {
@@ -116,8 +126,7 @@ void PumpUntilDone(TestAppContext& context, const std::atomic<bool>& done) {
 
 }  // namespace
 
-TEST_CASE("MnK driver maps native keyboard and mouse events to controller state",
-          "[input][mnk]") {
+TEST_CASE("MnK driver maps native keyboard and mouse events to controller state", "[input][mnk]") {
   ScopedValue<bool> enabled(REXCVAR_GET(mnk_mode), true);
   ScopedValue<double> sensitivity(REXCVAR_GET(mnk_sensitivity), 1.0);
   ScopedValue<std::string> start(REXCVAR_GET(keybind_start), "Return");
@@ -270,8 +279,7 @@ TEST_CASE("MnK application mouse motion is discarded across overlays and focus c
   CHECK(delta.y == -6);
 }
 
-TEST_CASE("MnK driver supports keyboard right-stick binds and modal suppression",
-          "[input][mnk]") {
+TEST_CASE("MnK driver supports keyboard right-stick binds and modal suppression", "[input][mnk]") {
   ScopedValue<bool> enabled(REXCVAR_GET(mnk_mode), true);
   ScopedValue<std::string> look_up(REXCVAR_GET(keybind_rstick_up), "I");
 
@@ -419,6 +427,95 @@ TEST_CASE("MnK driver serializes native capture and ignores a stale guest poll",
   CHECK_FALSE(window.IsMouseCaptureRequested());
   CHECK(window.capture_calls() == 2);
   CHECK(window.release_calls() == 2);
+}
+
+TEST_CASE("MnK snapshot reports only platform-confirmed mouse capture", "[input][mnk][window]") {
+  ScopedValue<bool> enabled(REXCVAR_GET(mnk_mode), true);
+  ScopedValue<bool> mouse_enabled(REXCVAR_GET(mnk_mouse_enabled), true);
+
+  TestAppContext context;
+  TestWindow window(context);
+  REQUIRE(window.Open());
+  window.set_capture_succeeds(false);
+
+  rex::input::mnk::MnkInputDriver driver(nullptr, 0);
+  REQUIRE(driver.Setup() == X_STATUS_SUCCESS);
+  driver.OnWindowAvailable(&window);
+  driver.set_is_active_callback([] { return true; });
+
+  auto poll_from_guest = [&] {
+    X_RESULT result = X_ERROR_DEVICE_NOT_CONNECTED;
+    std::atomic<bool> done{false};
+    std::thread poll([&] {
+      X_INPUT_STATE state = {};
+      result = driver.GetState(0, &state);
+      done.store(true, std::memory_order_release);
+    });
+    PumpUntilDone(context, done);
+    poll.join();
+    return result;
+  };
+
+  REQUIRE(poll_from_guest() == X_ERROR_SUCCESS);
+  CHECK(window.IsMouseCaptureRequested());
+  CHECK_FALSE(window.IsMouseCaptureActive());
+  CHECK(window.capture_calls() == 1);
+
+  rex::input::HostInputSnapshot snapshot;
+  REQUIRE(driver.GetHostInputSnapshot(&snapshot));
+  CHECK_FALSE(snapshot.mouse_capture_active);
+
+  // A failed native transition is retried rather than being treated as an
+  // applied capture merely because the common Window request exists.
+  window.set_capture_succeeds(true);
+  REQUIRE(poll_from_guest() == X_ERROR_SUCCESS);
+  CHECK(window.IsMouseCaptureRequested());
+  CHECK(window.IsMouseCaptureActive());
+  CHECK(window.capture_calls() == 2);
+  CHECK(window.release_calls() == 0);
+  REQUIRE(driver.GetHostInputSnapshot(&snapshot));
+  CHECK(snapshot.mouse_capture_active);
+
+  // A failed native release remains visible in diagnostics and is retried even
+  // though the common request count has already reached zero.
+  window.set_release_succeeds(false);
+  driver.OnInputActiveChanged(false);
+  CHECK_FALSE(window.IsMouseCaptureRequested());
+  CHECK(window.IsMouseCaptureActive());
+  CHECK(window.release_calls() == 1);
+  REQUIRE(driver.GetHostInputSnapshot(&snapshot));
+  CHECK(snapshot.mouse_capture_active);
+
+  window.set_release_succeeds(true);
+  driver.OnInputActiveChanged(false);
+  CHECK_FALSE(window.IsMouseCaptureRequested());
+  CHECK_FALSE(window.IsMouseCaptureActive());
+  CHECK(window.release_calls() == 2);
+  REQUIRE(driver.GetHostInputSnapshot(&snapshot));
+  CHECK_FALSE(snapshot.mouse_capture_active);
+
+  driver.OnWindowUnavailable();
+  CHECK_FALSE(window.IsMouseCaptureRequested());
+  CHECK_FALSE(window.IsMouseCaptureActive());
+  CHECK(window.release_calls() == 2);
+}
+
+TEST_CASE("MnK snapshot samples focus when attaching to an unfocused window",
+          "[input][mnk][window]") {
+  TestAppContext context;
+  TestWindow window(context);
+  CHECK_FALSE(window.HasFocus());
+
+  rex::input::mnk::MnkInputDriver driver(nullptr, 0);
+  REQUIRE(driver.Setup() == X_STATUS_SUCCESS);
+  driver.OnWindowAvailable(&window);
+
+  rex::input::HostInputSnapshot snapshot;
+  REQUIRE(driver.GetHostInputSnapshot(&snapshot));
+  CHECK_FALSE(snapshot.focused);
+  CHECK_FALSE(snapshot.input_active);
+
+  driver.OnWindowUnavailable();
 }
 
 TEST_CASE("MnK driver clears held state on focus loss", "[input][mnk]") {

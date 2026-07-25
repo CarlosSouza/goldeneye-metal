@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -53,7 +54,9 @@
 #include <string_view>
 
 #include "ge_crash_guards.h"
+#include "ge_controller_shortcut.h"
 #include "ge_host_pause.h"
+#include "ge_player_stuck_telemetry.h"
 #include "ge_testing_tools.h"
 
 namespace ge {
@@ -119,6 +122,8 @@ bool EnvironmentFlagEnabled(const char* name) {
 // This is diagnostic state only: XE_SWAP may execute before trailing primary-ring
 // packets retire, so a counter advance is not a completion fence.
 std::atomic<uint32_t> g_present_cpcnt{0};
+std::atomic<uint32_t> g_present_count{0};
+std::atomic<uint64_t> g_input_poll_count{0};
 std::atomic<uint64_t> g_gpu_wait_blocked_polls{0};
 std::atomic<uint64_t> g_gpu_wait_completed_polls{0};
 std::atomic<uint64_t> g_gpu_wait_drain_grace_polls{0};
@@ -238,6 +243,23 @@ void ge_flush_critical_section_diagnostics() {
     logger->flush();
   }
   std::fflush(stderr);
+}
+
+const char* ge_critical_section_mismatch_reason(
+    rex::system::CriticalSectionLeaveMismatchReason reason) {
+  using rex::system::CriticalSectionLeaveMismatchReason;
+  switch (reason) {
+    case CriticalSectionLeaveMismatchReason::kNoOwnershipRecord:
+      return "no-ownership-record";
+    case CriticalSectionLeaveMismatchReason::kGuestOwnerMismatch:
+      return "guest-owner-mismatch";
+    case CriticalSectionLeaveMismatchReason::kInvalidGuestRecursion:
+      return "invalid-guest-recursion";
+    case CriticalSectionLeaveMismatchReason::kRecordedDepthMismatch:
+      return "recorded-depth-mismatch";
+    default:
+      return "none";
+  }
 }
 
 void ge_log_main_critical_section_wait(const char* tag) {
@@ -414,6 +436,67 @@ void ge_log_main_critical_section_wait(const char* tag) {
                      "no PPC context\n",
                      tag, info.owning_thread, owner->thread_id(), owner_start,
                      owner->main_thread() ? 1u : 0u, owner->is_running() ? 1u : 0u);
+      }
+
+      rex::kernel::xboxkrnl::RtlCriticalSectionOwnershipDebugInfo ownership;
+      if (rex::kernel::xboxkrnl::QueryRtlCriticalSectionOwnershipDebugInfo(owner.get(), cs_address,
+                                                                           &ownership)) {
+        REXKRNL_INFO(
+            "{} CSLEDGER owner={:#x} cs={:#x} found={} first_enter_lr={:#x} "
+            "last_enter_lr={:#x} depth={} enters={} incomplete={} dropped={} "
+            "leave_mismatches={}",
+            tag, info.owning_thread, cs_address, ownership.ownership_found,
+            ownership.first_enter_lr, ownership.last_enter_lr, ownership.recorded_depth,
+            ownership.enter_count, ownership.provenance_incomplete,
+            ownership.dropped_ownership_records, ownership.total_leave_mismatches);
+        std::fprintf(stderr,
+                     "[ge] %s CSLEDGER owner=0x%08x cs=0x%08x found=%u "
+                     "first_enter_lr=0x%08x last_enter_lr=0x%08x depth=%u enters=%u "
+                     "incomplete=%u dropped=%u leave_mismatches=%llu\n",
+                     tag, info.owning_thread, cs_address, ownership.ownership_found ? 1u : 0u,
+                     ownership.first_enter_lr, ownership.last_enter_lr, ownership.recorded_depth,
+                     ownership.enter_count, ownership.provenance_incomplete ? 1u : 0u,
+                     ownership.dropped_ownership_records,
+                     static_cast<unsigned long long>(ownership.total_leave_mismatches));
+        if (ownership.recent_leave_mismatch_found) {
+          const auto& mismatch = ownership.recent_leave_mismatch;
+          REXKRNL_INFO(
+              "{} CSLEDGER matching leave mismatch cs={:#x} leave_lr={:#x} "
+              "current={:#x} observed_owner={:#x} recursion={} reason={}",
+              tag, mismatch.critical_section, mismatch.leave_lr, mismatch.current_thread,
+              mismatch.observed_owner, mismatch.observed_recursion,
+              ge_critical_section_mismatch_reason(mismatch.reason));
+          std::fprintf(stderr,
+                       "[ge] %s CSLEDGER matching_leave_mismatch cs=0x%08x leave_lr=0x%08x "
+                       "current=0x%08x observed_owner=0x%08x recursion=%d reason=%s\n",
+                       tag, mismatch.critical_section, mismatch.leave_lr, mismatch.current_thread,
+                       mismatch.observed_owner, mismatch.observed_recursion,
+                       ge_critical_section_mismatch_reason(mismatch.reason));
+        }
+        if (ownership.most_recent_leave_mismatch_found &&
+            (!ownership.recent_leave_mismatch_found ||
+             ownership.most_recent_leave_mismatch.sequence !=
+                 ownership.recent_leave_mismatch.sequence)) {
+          const auto& mismatch = ownership.most_recent_leave_mismatch;
+          REXKRNL_INFO(
+              "{} CSLEDGER latest owner-thread leave mismatch cs={:#x} leave_lr={:#x} "
+              "current={:#x} observed_owner={:#x} recursion={} reason={}",
+              tag, mismatch.critical_section, mismatch.leave_lr, mismatch.current_thread,
+              mismatch.observed_owner, mismatch.observed_recursion,
+              ge_critical_section_mismatch_reason(mismatch.reason));
+          std::fprintf(stderr,
+                       "[ge] %s CSLEDGER latest_owner_leave_mismatch cs=0x%08x "
+                       "leave_lr=0x%08x current=0x%08x observed_owner=0x%08x "
+                       "recursion=%d reason=%s\n",
+                       tag, mismatch.critical_section, mismatch.leave_lr, mismatch.current_thread,
+                       mismatch.observed_owner, mismatch.observed_recursion,
+                       ge_critical_section_mismatch_reason(mismatch.reason));
+        }
+      } else {
+        REXKRNL_INFO("{} CSLEDGER owner={:#x} cs={:#x}: snapshot unavailable", tag,
+                     info.owning_thread, cs_address);
+        std::fprintf(stderr, "[ge] %s CSLEDGER owner=0x%08x cs=0x%08x snapshot unavailable\n", tag,
+                     info.owning_thread, cs_address);
       }
       ge_flush_critical_section_diagnostics();
       return;
@@ -1142,8 +1225,7 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
   ge_start_watchdog_once();
 
-  static uint32_t n = 0;  // throttled fps heartbeat
-  uint32_t present_index = ++n;
+  uint32_t present_index = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
   static const bool force_presented_on_vdswap =
       std::getenv("GOLDENEYE_FORCE_PRESENTED_ON_VDSWAP") != nullptr;
   if (force_presented_on_vdswap && a1) {
@@ -1211,7 +1293,7 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     std::fflush(stderr);
   }
   if (submission_diagnostics && (present_index & 0x3F) == 0)
-    REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", n, a1, cpc);
+    REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", present_index, a1, cpc);
   if (std::getenv("GOLDENEYE_PRESENT_THREAD_SAMPLE") &&
       (present_index == 64 || present_index == 128 || (present_index & 0xFF) == 0)) {
     std::thread([base, present_index]() {
@@ -1962,16 +2044,49 @@ ge::host_pause::InputSample ge_physical_input_sample(uint32_t user_index) {
   return result;
 }
 
+void ge_poll_controller_menu_shortcut() {
+  static ge::controller_shortcut::HoldTracker hold_tracker;
+  std::array<ge::controller_shortcut::ControllerSample,
+             ge::controller_shortcut::kControllerSlotCount>
+      controllers = {};
+  auto* runtime = rex::Runtime::instance();
+  auto* input = runtime && runtime->input_system()
+                    ? static_cast<rex::input::InputSystem*>(runtime->input_system())
+                    : nullptr;
+  if (input) {
+    for (uint32_t slot = 0; slot < controllers.size(); ++slot) {
+      rex::input::ControllerSnapshot snapshot;
+      if (input->GetControllerSnapshot(slot, &snapshot) && snapshot.connected) {
+        controllers[slot].device_id = snapshot.device_id;
+        controllers[slot].buttons = static_cast<uint16_t>(snapshot.raw_gamepad.buttons);
+      }
+    }
+  }
+
+  const uint64_t now_ms =
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+  const std::optional<uint32_t> completed_slot = hold_tracker.Observe(controllers, now_ms);
+  if (completed_slot && ge::controller_shortcut::RequestToggle(*completed_slot)) {
+    REXKRNL_INFO("GEUI player {} L3+R3 hold requested Host Settings", *completed_slot + 1);
+  }
+}
+
+void ge_clear_guest_pad(uint8_t* base, uint32_t user_index) {
+  const uint32_t pad = GE_PAD0 + user_index * GE_PAD_STRIDE;
+  ST16(base, pad + 0, 0);
+  base[pad + 2] = 0;
+  base[pad + 3] = 0;
+  ST16(base, pad + 4, 0);
+  ST16(base, pad + 6, 0);
+  ST16(base, pad + 8, 0);
+  ST16(base, pad + 10, 0);
+}
+
 void ge_clear_guest_pads(uint8_t* base) {
   for (uint32_t user_index = 0; user_index < GE_LOCAL_PAD_COUNT; ++user_index) {
-    const uint32_t pad = GE_PAD0 + user_index * GE_PAD_STRIDE;
-    ST16(base, pad + 0, 0);
-    base[pad + 2] = 0;
-    base[pad + 3] = 0;
-    ST16(base, pad + 4, 0);
-    ST16(base, pad + 6, 0);
-    ST16(base, pad + 8, 0);
-    ST16(base, pad + 10, 0);
+    ge_clear_guest_pad(base, user_index);
   }
 }
 
@@ -2237,40 +2352,29 @@ REXCVAR_DEFINE_STRING(ge_key_look_down, "", "Input/Keybinds", "Look down (right 
 REXCVAR_DEFINE_STRING(ge_key_look_left, "", "Input/Keybinds", "Look left (right stick left)");
 REXCVAR_DEFINE_STRING(ge_key_look_right, "", "Input/Keybinds", "Look right (right stick right)");
 
-ge::host_pause::InputSample ge_resume_input_sample(uint8_t* base) {
+ge::host_pause::InputSample ge_resume_input_sample(uint8_t* base, uint32_t user_index) {
   // Raw SDL state stays visible while host UI suppresses guest input. Merge it
   // with the already-polled guest pad so keyboard/mouse emulation is covered as
   // soon as it becomes active again.
-  ge::host_pause::InputSample result;
+  ge::host_pause::InputSample result = ge_physical_input_sample(user_index);
   auto merge_axis = [](int16_t* destination, int16_t candidate) {
     if (std::abs(static_cast<int>(candidate)) > std::abs(static_cast<int>(*destination))) {
       *destination = candidate;
     }
   };
-  for (uint32_t user_index = 0; user_index < GE_LOCAL_PAD_COUNT; ++user_index) {
-    const ge::host_pause::InputSample physical = ge_physical_input_sample(user_index);
-    result.buttons |= physical.buttons;
-    result.left_trigger = std::max(result.left_trigger, physical.left_trigger);
-    result.right_trigger = std::max(result.right_trigger, physical.right_trigger);
-    merge_axis(&result.thumb_lx, physical.thumb_lx);
-    merge_axis(&result.thumb_ly, physical.thumb_ly);
-    merge_axis(&result.thumb_rx, physical.thumb_rx);
-    merge_axis(&result.thumb_ry, physical.thumb_ry);
-
-    const uint32_t pad = GE_PAD0 + user_index * GE_PAD_STRIDE;
-    result.buttons |= LD16(base, pad + 0);
-    result.left_trigger = std::max(result.left_trigger, base[pad + 2]);
-    result.right_trigger = std::max(result.right_trigger, base[pad + 3]);
-    merge_axis(&result.thumb_lx, static_cast<int16_t>(LD16(base, pad + 4)));
-    merge_axis(&result.thumb_ly, static_cast<int16_t>(LD16(base, pad + 6)));
-    merge_axis(&result.thumb_rx, static_cast<int16_t>(LD16(base, pad + 8)));
-    merge_axis(&result.thumb_ry, static_cast<int16_t>(LD16(base, pad + 10)));
-  }
+  const uint32_t pad = GE_PAD0 + user_index * GE_PAD_STRIDE;
+  result.buttons |= LD16(base, pad + 0);
+  result.left_trigger = std::max(result.left_trigger, base[pad + 2]);
+  result.right_trigger = std::max(result.right_trigger, base[pad + 3]);
+  merge_axis(&result.thumb_lx, static_cast<int16_t>(LD16(base, pad + 4)));
+  merge_axis(&result.thumb_ly, static_cast<int16_t>(LD16(base, pad + 6)));
+  merge_axis(&result.thumb_rx, static_cast<int16_t>(LD16(base, pad + 8)));
+  merge_axis(&result.thumb_ry, static_cast<int16_t>(LD16(base, pad + 10)));
 
 #if defined(_WIN32)
   // Win32's title-specific keyboard path is injected below this transition
   // gate, so sample its physical binds explicitly as well.
-  if (REXCVAR_GET(ge_keyboard_enable)) {
+  if (user_index == 0 && REXCVAR_GET(ge_keyboard_enable)) {
     auto merge_button = [&](const char* cvar, uint16_t button) {
       if (ge_key_down(cvar)) {
         result.buttons |= button;
@@ -2319,11 +2423,204 @@ ge::host_pause::InputSample ge_resume_input_sample(uint8_t* base) {
 void ge_mouse_camera(uint8_t* base, rex::input::MouseMotionDelta mouse_delta);  // defined above
 void ge_apply_ce_data_patches(uint8_t* base);                                   // ge_ce_patches.cpp
 
+namespace {
+ge::player_stuck::Tracker g_player_stuck_tracker;
+
+void ge_log_player_stuck_report(uint8_t* base, const ge::player_stuck::Report& report) {
+  if (report.sample_count == 0) {
+    return;
+  }
+  const auto& first = report.samples.front();
+  const auto& last = report.samples[report.sample_count - 1];
+  auto* command_processor = ge_cp();
+  const uint32_t ring_read = command_processor ? command_processor->read_ptr_index() : 0;
+  const uint32_t ring_write = command_processor ? command_processor->write_ptr_index() : 0;
+  const uint32_t swap_count = command_processor ? command_processor->swap_counter() : 0;
+  const bool ring_drained = command_processor && command_processor->primary_ring_drained();
+
+  REXKRNL_WARN(
+      "[GE-PLAYER-STUCK-v1] suspected live-render movement stall: samples={} window_ms={} "
+      "trailing_movement_samples={} frame_progress={}/{} present_progress={}/{} "
+      "max_position_delta={} player=0x{:08X} coords=0x{:08X} frames={}->{} "
+      "presents={}->{} input_polls={}->{}; staged movement input was dispatched "
+      "by the title while world position stayed fixed",
+      report.sample_count, last.monotonic_ms - first.monotonic_ms,
+      report.trailing_movement_sample_count, report.frame_progress_intervals,
+      report.trailing_frame_progress_intervals, report.present_progress_intervals,
+      report.trailing_present_progress_intervals, std::sqrt(report.maximum_distance_squared),
+      last.player, last.coordinates, first.guest_frame, last.guest_frame, first.present,
+      last.present, first.input_poll, last.input_poll);
+  REXKRNL_WARN(
+      "[GE-PLAYER-STUCK-v1] pipeline ring={}/{} drained={} swap={} dbgnow={} "
+      "render_gate=0x{:08X}",
+      ring_read, ring_write, ring_drained ? 1 : 0, swap_count,
+      g_dbgnow_calls.load(std::memory_order_relaxed), LD32(base, 0x8242043Cu));
+
+  for (size_t index = 0; index < report.sample_count; ++index) {
+    const auto& sample = report.samples[index];
+    REXKRNL_WARN(
+        "[GE-PLAYER-STUCK-v1] sample={}/{} t_ms=+{} poll={} frame={} present={} "
+        "focus={} active={} mouse_capture_active={} controller={} device={} "
+        "raw(btn=0x{:04X} lx={} ly={}) guest(btn=0x{:04X} lt={} rt={} "
+        "lx={} ly={} rx={} ry={}) player=0x{:08X} coords=0x{:08X} "
+        "pos=({:.3f},{:.3f},{:.3f}) camera=({:.4f},{:.4f}) "
+        "pause={} disabled={} watch={}",
+        index + 1, report.sample_count, sample.monotonic_ms - first.monotonic_ms, sample.input_poll,
+        sample.guest_frame, sample.present, sample.focused ? 1 : 0, sample.input_active ? 1 : 0,
+        sample.mouse_capture_active ? 1 : 0, sample.controller_connected ? 1 : 0,
+        sample.controller_device_id, sample.controller_buttons, sample.controller_lx,
+        sample.controller_ly, sample.guest_buttons, sample.guest_left_trigger,
+        sample.guest_right_trigger, sample.guest_lx, sample.guest_ly, sample.guest_rx,
+        sample.guest_ry, sample.player, sample.coordinates, sample.position_x, sample.position_y,
+        sample.position_z, sample.camera_yaw, sample.camera_pitch, sample.pause,
+        sample.control_disabled, sample.watch);
+  }
+  ge_flush_critical_section_diagnostics();
+}
+
+void ge_observe_player_stuck(uint8_t* base, uint64_t input_poll) {
+  const uint64_t now_ms =
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+  if (!g_player_stuck_tracker.Due(now_ms)) {
+    return;
+  }
+
+  ge::player_stuck::Sample sample;
+  sample.monotonic_ms = now_ms;
+  sample.input_poll = input_poll;
+  sample.guest_frame = LD32(base, 0x8308851Cu);
+  sample.present = g_present_count.load(std::memory_order_relaxed);
+
+  auto* runtime = rex::Runtime::instance();
+  auto* input = runtime && runtime->input_system()
+                    ? static_cast<rex::input::InputSystem*>(runtime->input_system())
+                    : nullptr;
+  rex::input::HostInputSnapshot host_input;
+  const bool has_host_input = input && input->GetHostInputSnapshot(&host_input);
+  sample.focused = has_host_input && host_input.focused;
+  sample.mouse_capture_active = has_host_input && host_input.mouse_capture_active;
+  sample.input_active = has_host_input && host_input.input_active &&
+                        !g_mouselook_suppressed.load(std::memory_order_relaxed) &&
+                        !g_rebind_capturing.load(std::memory_order_relaxed);
+
+  rex::input::ControllerSnapshot controller;
+  if (input && input->GetControllerSnapshot(0, &controller) && controller.connected) {
+    sample.controller_connected = true;
+    sample.controller_device_id = controller.device_id;
+    sample.controller_buttons = static_cast<uint16_t>(controller.raw_gamepad.buttons);
+    sample.controller_lx = static_cast<int16_t>(controller.raw_gamepad.thumb_lx);
+    sample.controller_ly = static_cast<int16_t>(controller.raw_gamepad.thumb_ly);
+    sample.focused = has_host_input ? sample.focused : controller.input_active;
+    sample.input_active = controller.input_active && (!has_host_input || host_input.input_active) &&
+                          !g_mouselook_suppressed.load(std::memory_order_relaxed) &&
+                          !g_rebind_capturing.load(std::memory_order_relaxed);
+  }
+
+  sample.guest_buttons = LD16(base, GE_PAD0 + 0);
+  sample.guest_left_trigger = base[GE_PAD0 + 2];
+  sample.guest_right_trigger = base[GE_PAD0 + 3];
+  sample.guest_lx = static_cast<int16_t>(LD16(base, GE_PAD0 + 4));
+  sample.guest_ly = static_cast<int16_t>(LD16(base, GE_PAD0 + 6));
+  sample.guest_rx = static_cast<int16_t>(LD16(base, GE_PAD0 + 8));
+  sample.guest_ry = static_cast<int16_t>(LD16(base, GE_PAD0 + 10));
+  sample.pause = LD32(base, GE_PAUSE_FLAG);
+
+  auto* memory = rex::system::kernel_state()->memory();
+  uint32_t player = 0;
+  for (uint32_t index = 0; index < GE_LOCAL_PAD_COUNT; ++index) {
+    const uint32_t candidate = LD32(base, GE_PLAYER_PTR + index * sizeof(uint32_t));
+    if (ge_guest_range_readable(memory, candidate, 0x908u) && LD32(base, candidate + 0x904u) == 0) {
+      player = candidate;
+      break;
+    }
+  }
+  if (!player) {
+    const uint32_t candidate = LD32(base, GE_BONDVIEW_CUR);
+    if (ge_guest_range_readable(memory, candidate, 0x908u)) {
+      player = candidate;
+    }
+  }
+  if (!player) {
+    const uint32_t candidate = LD32(base, GE_PLAYER_PTR);
+    if (ge_guest_range_readable(memory, candidate, 0x908u)) {
+      player = candidate;
+    }
+  }
+
+  if (player) {
+    sample.player_valid = true;
+    sample.player = player;
+    sample.control_disabled = LD32(base, player + GE_OFF_DISABLED);
+    sample.watch = LD32(base, player + GE_OFF_WATCH);
+    sample.camera_yaw = LDF32(base, player + GE_OFF_CAM_X);
+    sample.camera_pitch = LDF32(base, player + GE_OFF_CAM_Y);
+    const uint32_t coordinates = LD32(base, player + 0x1ACu);
+    if (ge_guest_range_readable(memory, coordinates, 0x18u)) {
+      const float x = LDF32(base, coordinates + 0x0Cu);
+      const float y = LDF32(base, coordinates + 0x10u);
+      const float z = LDF32(base, coordinates + 0x14u);
+      if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+        sample.position_valid = true;
+        sample.coordinates = coordinates;
+        sample.position_x = x;
+        sample.position_y = y;
+        sample.position_z = z;
+      }
+    }
+  }
+
+  if (auto report = g_player_stuck_tracker.Observe(sample)) {
+    ge_log_player_stuck_report(base, *report);
+  }
+}
+
+}  // namespace
+
+void ge_observe_dispatched_player_input() {
+  PPCContext* ctx;
+  uint8_t* base;
+  getcb(ctx, base);
+  (void)ctx;
+  ge_observe_player_stuck(base, g_input_poll_count.load(std::memory_order_relaxed));
+}
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+void ge_trace_local_multiplayer_test_state(uint8_t* base) {
+  static const bool enabled = EnvironmentFlagEnabled("GOLDENEYE_TEST_MENU_TRACE");
+  if (!enabled) {
+    return;
+  }
+
+  const uint32_t state = LD32(base, ge::testing::detail::kTitleMenuStateAddress);
+  const uint32_t joined = state == ge::testing::detail::kCreateLocalGameMenuState
+                              ? LD32(base, ge::testing::detail::kLocalMultiplayerJoinedCountAddress)
+                              : 0;
+  static uint32_t previous_state = UINT32_MAX;
+  static uint32_t previous_joined = UINT32_MAX;
+  if (state == previous_state && joined == previous_joined) {
+    return;
+  }
+  previous_state = state;
+  previous_joined = joined;
+  REXKRNL_INFO("[ge-test] menu state={} name={} joined={}", state,
+               ge::testing::detail::TitleMenuStateName(state), joined);
+}
+#endif
+
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   PPCContext* ctx;
   uint8_t* base;
   getcb(ctx, base);
   (void)ctx;
+  g_input_poll_count.fetch_add(1, std::memory_order_relaxed);
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  // Read-only state markers let the private integration harness wait for real
+  // title-menu transitions instead of guessing from renderer-dependent time.
+  ge_trace_local_multiplayer_test_state(base);
+#endif
 
   // Apply BeanTools community DATA bug-fixes once, before any level loads its
   // setup/fog/BG data. The data segment is live in guest RAM by the first input
@@ -2335,6 +2632,11 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     REXKRNL_INFO("GECE community data bug-fixes applied");
   }
 
+  // Physical L3+R3 on any one controller toggles Host Settings after a
+  // deliberate hold. Sampling raw controller state keeps keyboard bindings and
+  // per-button remaps out of the shortcut, and does not consume gameplay input.
+  ge_poll_controller_menu_shortcut();
+
   // Host UI requests are consumed here because this hook runs on GoldenEye's
   // game thread. The bridge preserves the live PPC register context around the
   // verified retail routines it invokes.
@@ -2345,14 +2647,28 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // still held. Wait for complete neutral input, keep the final neutral poll
   // swallowed, and discard mouse motion accumulated behind the transition.
   // This runs only after the retail resume is acknowledged.
-  static ge::host_pause::ResumeInputLatch resume_input_latch;
-  if (pause_result.input_resume_pulse || resume_input_latch.active()) {
-    const ge::host_pause::InputSample physical_input = ge_resume_input_sample(base);
-    if (pause_result.input_resume_pulse) {
-      resume_input_latch.Arm(physical_input);
+  static std::array<ge::host_pause::ResumeInputLatch, GE_LOCAL_PAD_COUNT> resume_input_latches;
+  const bool any_resume_latch_active =
+      std::any_of(resume_input_latches.begin(), resume_input_latches.end(),
+                  [](const ge::host_pause::ResumeInputLatch& latch) { return latch.active(); });
+  if (pause_result.input_resume_pulse || any_resume_latch_active) {
+    bool player_one_suppressed = false;
+    for (uint32_t user_index = 0; user_index < GE_LOCAL_PAD_COUNT; ++user_index) {
+      auto& latch = resume_input_latches[user_index];
+      if (!pause_result.input_resume_pulse && !latch.active()) {
+        continue;
+      }
+      const ge::host_pause::InputSample physical_input = ge_resume_input_sample(base, user_index);
+      if (pause_result.input_resume_pulse) {
+        latch.Arm(physical_input);
+      }
+      if (latch.ShouldSuppress(physical_input)) {
+        ge_clear_guest_pad(base, user_index);
+        player_one_suppressed |= user_index == 0;
+      }
     }
-    if (resume_input_latch.ShouldSuppress(physical_input)) {
-      ge_clear_guest_pads(base);
+    if (player_one_suppressed) {
+      // Player 1 also owns keyboard/mouse injection below this point.
       ge_discard_mouse_motion();
       return;
     }
@@ -2518,10 +2834,31 @@ struct GeCleanupCallbackSnapshot {
   uint32_t callback;
 };
 
+struct GeAudioCallbackSnapshot {
+  uint64_t r1;
+  uint64_t r27;
+  uint64_t r28;
+  uint64_t r29;
+  uint64_t r30;
+  uint64_t r31;
+  uint64_t f31;
+  uint32_t site;
+  uint32_t object;
+  uint32_t callback;
+  uint32_t critical_section;
+};
+
 constexpr size_t kGeCleanupCallbackMaximumDepth = 64;
+constexpr size_t kGeAudioCallbackMaximumDepth = 64;
 
 struct GeCleanupCallbackStack {
   std::array<GeCleanupCallbackSnapshot, kGeCleanupCallbackMaximumDepth> entries{};
+  size_t depth = 0;
+  size_t overflow_depth = 0;
+};
+
+struct GeAudioCallbackStack {
+  std::array<GeAudioCallbackSnapshot, kGeAudioCallbackMaximumDepth> entries{};
   size_t depth = 0;
   size_t overflow_depth = 0;
 };
@@ -2530,8 +2867,11 @@ struct GeCleanupCallbackStack {
 // stack per host thread so every ordinary nested return restores its own caller
 // without risking a heap exception while the guest holds two critical sections.
 thread_local GeCleanupCallbackStack g_ge_cleanup_callback_stack;
+thread_local GeAudioCallbackStack g_ge_audio_callback_stack;
 std::atomic<uint64_t> g_ge_cleanup_callback_repairs{0};
 std::atomic<uint64_t> g_ge_cleanup_callback_stack_errors{0};
+std::atomic<uint64_t> g_ge_audio_callback_repairs{0};
+std::atomic<uint64_t> g_ge_audio_callback_stack_errors{0};
 
 void ge_log_cleanup_callback_stack_error(std::string_view reason, uint32_t guest_sp, size_t depth) {
   const uint64_t hit =
@@ -2541,6 +2881,116 @@ void ge_log_cleanup_callback_stack_error(std::string_view reason, uint32_t guest
   }
   REXKRNL_WARN("[GE-GUARD-823CFC00-v2] callback snapshot {} hit={} depth={} guest_sp=0x{:08X}",
                reason, hit, depth, guest_sp);
+  if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+    logger->flush();
+  }
+}
+
+void ge_log_audio_callback_stack_error(std::string_view reason, uint32_t guest_sp, size_t depth) {
+  const uint64_t hit = g_ge_audio_callback_stack_errors.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (!ge_should_log_sparse_recovery(hit)) {
+    return;
+  }
+  REXKRNL_WARN("[GE-GUARD-AUDIO-CALLBACK-v1] snapshot {} hit={} depth={} guest_sp=0x{:08X}", reason,
+               hit, depth, guest_sp);
+  if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+    logger->flush();
+  }
+}
+
+uint32_t ge_audio_callback_critical_section(uint32_t site, const PPCRegister& r27,
+                                            const PPCRegister& r28, const PPCRegister& r29,
+                                            const PPCRegister& r30) {
+  switch (site) {
+    case 0x823E4BA8u:
+    case 0x823E4BDCu:
+      return r29.u32;
+    default:
+      (void)r27;
+      (void)r28;
+      (void)r30;
+      return 0;
+  }
+}
+
+void ge_audio_callback_snapshot_enter(uint32_t site, PPCRegister& r1, PPCRegister& r27,
+                                      PPCRegister& r28, PPCRegister& r29, PPCRegister& r30,
+                                      PPCRegister& r31, PPCRegister& f31, PPCRegister& r3,
+                                      PPCRegister& r11) {
+  if (g_ge_audio_callback_stack.overflow_depth != 0 ||
+      g_ge_audio_callback_stack.depth == kGeAudioCallbackMaximumDepth) {
+    ++g_ge_audio_callback_stack.overflow_depth;
+    ge_log_audio_callback_stack_error("overflow", r1.u32, g_ge_audio_callback_stack.depth);
+    return;
+  }
+  g_ge_audio_callback_stack.entries[g_ge_audio_callback_stack.depth++] = {
+      r1.u64,
+      r27.u64,
+      r28.u64,
+      r29.u64,
+      r30.u64,
+      r31.u64,
+      f31.u64,
+      site,
+      r3.u32,
+      r11.u32,
+      ge_audio_callback_critical_section(site, r27, r28, r29, r30),
+  };
+}
+
+void ge_audio_callback_snapshot_leave(PPCRegister& r1, PPCRegister& r27, PPCRegister& r28,
+                                      PPCRegister& r29, PPCRegister& r30, PPCRegister& r31,
+                                      PPCRegister& f31) {
+  if (g_ge_audio_callback_stack.overflow_depth != 0) {
+    --g_ge_audio_callback_stack.overflow_depth;
+    return;
+  }
+  if (g_ge_audio_callback_stack.depth == 0) {
+    ge_log_audio_callback_stack_error("underflow", r1.u32, 0);
+    return;
+  }
+
+  const GeAudioCallbackSnapshot saved =
+      g_ge_audio_callback_stack.entries[--g_ge_audio_callback_stack.depth];
+  uint32_t changed = 0;
+  changed |= r1.u64 != saved.r1 ? 1u << 0 : 0;
+  changed |= r27.u64 != saved.r27 ? 1u << 1 : 0;
+  changed |= r28.u64 != saved.r28 ? 1u << 2 : 0;
+  changed |= r29.u64 != saved.r29 ? 1u << 3 : 0;
+  changed |= r30.u64 != saved.r30 ? 1u << 4 : 0;
+  changed |= r31.u64 != saved.r31 ? 1u << 5 : 0;
+  changed |= f31.u64 != saved.f31 ? 1u << 6 : 0;
+
+  const uint32_t returned_r27 = r27.u32;
+  const uint32_t returned_r28 = r28.u32;
+  const uint32_t returned_r29 = r29.u32;
+  const uint32_t returned_r30 = r30.u32;
+  r1.u64 = saved.r1;
+  r27.u64 = saved.r27;
+  r28.u64 = saved.r28;
+  r29.u64 = saved.r29;
+  r30.u64 = saved.r30;
+  r31.u64 = saved.r31;
+  f31.u64 = saved.f31;
+
+  if (changed == 0) {
+    return;
+  }
+  const uint64_t hit = g_ge_audio_callback_repairs.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (!ge_should_log_sparse_recovery(hit)) {
+    return;
+  }
+  uint32_t guest_thread = 0;
+  if (auto* thread = rex::system::XThread::GetCurrentThread()) {
+    guest_thread = thread->guest_object();
+  }
+  REXKRNL_WARN(
+      "[GE-GUARD-AUDIO-CALLBACK-v1] repaired callback ABI hit={} site=0x{:08X} "
+      "changed=0x{:02X} thread=0x{:08X} cs=0x{:08X} object=0x{:08X} "
+      "callback=0x{:08X} returned_lock_regs={:08X}/{:08X}/{:08X}/{:08X} "
+      "guest_sp=0x{:08X}",
+      hit, saved.site, changed, guest_thread, saved.critical_section, saved.object, saved.callback,
+      returned_r27, returned_r28, returned_r29, returned_r30, static_cast<uint32_t>(saved.r1));
   if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
     logger->flush();
   }
@@ -2598,6 +3048,27 @@ bool ge_recover_packed_data_purecall(uint32_t call_site, uint32_t callback_targe
   return true;
 }
 }  // namespace
+
+// These are the two virtual callbacks in the reported sub_823E4B60 freeze path.
+// Both execute with the same title critical section held. Snapshot the live PPC
+// nonvolatile state and keep r3 untouched so the original callback result and
+// lock-release code continue normally.
+#define GE_AUDIO_CALLBACK_ENTER_WRAPPER(site)                                                 \
+  void ge_audio_callback_enter_##site(PPCRegister& r1, PPCRegister& r27, PPCRegister& r28,    \
+                                      PPCRegister& r29, PPCRegister& r30, PPCRegister& r31,   \
+                                      PPCRegister& f31, PPCRegister& r3, PPCRegister& r11) {  \
+    ge_audio_callback_snapshot_enter(0x##site##u, r1, r27, r28, r29, r30, r31, f31, r3, r11); \
+  }
+
+GE_AUDIO_CALLBACK_ENTER_WRAPPER(823E4BA8)
+GE_AUDIO_CALLBACK_ENTER_WRAPPER(823E4BDC)
+
+#undef GE_AUDIO_CALLBACK_ENTER_WRAPPER
+
+void ge_audio_callback_leave(PPCRegister& r1, PPCRegister& r27, PPCRegister& r28, PPCRegister& r29,
+                             PPCRegister& r30, PPCRegister& r31, PPCRegister& f31) {
+  ge_audio_callback_snapshot_leave(r1, r27, r28, r29, r30, r31, f31);
+}
 
 // sub_823CFC00 walks two intrusive cleanup lists while holding the owner's
 // critical sections. Both virtual callbacks (0x823CFC84 and 0x823CFCB8) are

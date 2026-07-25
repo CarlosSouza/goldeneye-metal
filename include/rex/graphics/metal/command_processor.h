@@ -614,6 +614,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t wait_reg_mem_event_unavailable_count_ = 0;
   uint32_t host_pixel_draws_this_swap_ = 0;
   uint32_t host_fallback_pixel_draws_this_swap_ = 0;
+  uint32_t host_rt_cpu_draws_this_swap_ = 0;
   uint32_t host_pixel_skipped_vertices_this_swap_ = 0;
   uint64_t latest_texture_candidate_score_ = 0;
   struct WaitRegMemProfileEntry {

@@ -87,8 +87,7 @@ void InputSystem::SetMouseMotionMode(MouseMotionMode mode) {
   }
 }
 
-bool InputSystem::ConsumeApplicationMouseMotion(uint32_t user_index,
-                                                MouseMotionDelta* out_delta) {
+bool InputSystem::ConsumeApplicationMouseMotion(uint32_t user_index, MouseMotionDelta* out_delta) {
   MouseMotionDelta combined = {};
   bool owned = false;
   auto saturating_add = [](int32_t lhs, int32_t rhs) {
@@ -113,8 +112,7 @@ bool InputSystem::ConsumeApplicationMouseMotion(uint32_t user_index,
   return owned;
 }
 
-bool InputSystem::GetControllerSnapshot(uint32_t user_index,
-                                        ControllerSnapshot* out_snapshot) {
+bool InputSystem::GetControllerSnapshot(uint32_t user_index, ControllerSnapshot* out_snapshot) {
   if (out_snapshot) {
     *out_snapshot = {};
     out_snapshot->user_index = user_index;
@@ -133,10 +131,27 @@ bool InputSystem::GetControllerSnapshot(uint32_t user_index,
   return false;
 }
 
-X_RESULT InputSystem::PlayControllerTestRumble(uint32_t user_index) {
+bool InputSystem::GetHostInputSnapshot(HostInputSnapshot* out_snapshot) const {
+  if (out_snapshot) {
+    *out_snapshot = {};
+  }
+  for (const auto& driver : drivers_) {
+    HostInputSnapshot snapshot = {};
+    if (!driver->GetHostInputSnapshot(&snapshot)) {
+      continue;
+    }
+    if (out_snapshot) {
+      *out_snapshot = snapshot;
+    }
+    return true;
+  }
+  return false;
+}
+
+X_RESULT InputSystem::PlayControllerTestRumble(uint32_t user_index, uint64_t expected_device_id) {
   bool any_connected = false;
   for (auto& driver : drivers_) {
-    X_RESULT result = driver->PlayControllerTestRumble(user_index);
+    X_RESULT result = driver->PlayControllerTestRumble(user_index, expected_device_id);
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
@@ -145,6 +160,26 @@ X_RESULT InputSystem::PlayControllerTestRumble(uint32_t user_index) {
     }
   }
   return any_connected ? X_ERROR_FUNCTION_FAILED : X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+X_RESULT InputSystem::SwapControllerSlots(uint32_t first_user_index, uint32_t second_user_index,
+                                          uint64_t expected_device_id) {
+  bool any_controller_driver = false;
+  X_RESULT first_driver_error = X_ERROR_FUNCTION_FAILED;
+  for (auto& driver : drivers_) {
+    const X_RESULT result =
+        driver->SwapControllerSlots(first_user_index, second_user_index, expected_device_id);
+    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+      if (!any_controller_driver) {
+        first_driver_error = result;
+      }
+      any_controller_driver = true;
+    }
+    if (result == X_ERROR_SUCCESS) {
+      return result;
+    }
+  }
+  return any_controller_driver ? first_driver_error : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,

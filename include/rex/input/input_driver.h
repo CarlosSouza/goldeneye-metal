@@ -25,6 +25,12 @@ namespace rex::input {
 
 class InputSystem;
 
+struct HostInputSnapshot {
+  bool focused = false;
+  bool input_active = false;
+  bool mouse_capture_active = false;
+};
+
 class InputDriver {
  public:
   virtual ~InputDriver() = default;
@@ -41,8 +47,16 @@ class InputDriver {
   // Raw and tuned physical-controller state for host settings and diagnostics.
   // This is deliberately separate from GetState so host UI remains usable
   // while guest input is suppressed by a modal overlay.
-  virtual bool GetControllerSnapshot(uint32_t /*user_index*/,
-                                     ControllerSnapshot* out_snapshot) {
+  virtual bool GetControllerSnapshot(uint32_t /*user_index*/, ControllerSnapshot* out_snapshot) {
+    if (out_snapshot) {
+      *out_snapshot = {};
+    }
+    return false;
+  }
+
+  // Thread-safe host focus/input/capture state for diagnostics. Implementations
+  // must publish this without reading UI-thread-owned Window fields.
+  virtual bool GetHostInputSnapshot(HostInputSnapshot* out_snapshot) const {
     if (out_snapshot) {
       *out_snapshot = {};
     }
@@ -51,7 +65,16 @@ class InputDriver {
 
   // A short host-initiated pulse used by controller setup UIs. Unlike guest
   // SetState, it is permitted while modal host UI has disabled guest input.
-  virtual X_RESULT PlayControllerTestRumble(uint32_t /*user_index*/) {
+  virtual X_RESULT PlayControllerTestRumble(uint32_t /*user_index*/,
+                                            uint64_t /*expected_device_id*/ = 0) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  // Intentionally reassign two local guest ports. Drivers that own physical
+  // controllers may swap an occupied destination or move into an empty one.
+  virtual X_RESULT SwapControllerSlots(uint32_t /*first_user_index*/,
+                                       uint32_t /*second_user_index*/,
+                                       uint64_t /*expected_device_id*/ = 0) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
@@ -71,8 +94,7 @@ class InputDriver {
   // Consume one paired sample when application mouse mode is active. Returns
   // true while this driver owns application mouse input, including frames with
   // no movement, so title hooks may still update their idle camera state.
-  virtual bool ConsumeApplicationMouseMotion(uint32_t /*user_index*/,
-                                             MouseMotionDelta* out_delta) {
+  virtual bool ConsumeApplicationMouseMotion(uint32_t /*user_index*/, MouseMotionDelta* out_delta) {
     if (out_delta) {
       *out_delta = {};
     }

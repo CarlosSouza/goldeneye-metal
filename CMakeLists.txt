@@ -17,6 +17,16 @@ option(REXGLUE_BUILD_TESTS       "Build unit tests and test infrastructure" OFF)
 option(REXGLUE_BUILD_PPC_TESTS   "Build PPC assembly instruction tests (requires a cross-binutils toolchain)" OFF)
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+option(REXGLUE_ENABLE_INPUT_TEST_HARNESS
+       "Enable the private virtual-gamepad integration harness (developer builds only)"
+       OFF)
+if(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    if(WIN32)
+        message(FATAL_ERROR
+            "REXGLUE_ENABLE_INPUT_TEST_HARNESS currently requires a POSIX host")
+    endif()
+    add_compile_definitions(REXGLUE_ENABLE_INPUT_TEST_HARNESS=1)
+endif()
 if(APPLE)
     set(REXGLUE_ENABLE_TRACY_DEFAULT OFF)
 else()
@@ -276,6 +286,7 @@ message(STATUS "  Graphics: D3D12=${REXGLUE_USE_D3D12} Vulkan=${REXGLUE_USE_VULK
 message(STATUS "  FidelityFX: ${REXGLUE_ENABLE_FIDELITYFX}")
 message(STATUS "  Tracy: ${REXGLUE_ENABLE_TRACY}")
 message(STATUS "  Perf Counters: ${REXGLUE_ENABLE_PERF_COUNTERS}")
+message(STATUS "  Input Test Harness: ${REXGLUE_ENABLE_INPUT_TEST_HARNESS}")
 message(STATUS "===========================================")
 
 # SDK install/export rules (skipped when consumed as a subdirectory)

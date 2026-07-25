@@ -37,8 +37,18 @@ FATAL_PATTERNS = (
     re.compile(r"direct guest output copy did not complete", re.I),
     re.compile(r"GPU tiled resolve failed", re.I),
     re.compile(r"shared-memory upload failed", re.I),
+    re.compile(r"\[vpad\] FAILED", re.I),
 )
 ACTIVE_PROCESS: subprocess.Popen[bytes] | None = None
+LOCAL_MULTIPLAYER_READY = re.compile(
+    r"\[ge\] local multiplayer ready level=(\d+) players=(\d+) "
+    r"network=0 stable_polls=(\d+)"
+)
+VPAD_ACK = re.compile(r"\[vpad\] ACK seq=(\d+)")
+VPAD_REJECT = re.compile(r"\[vpad\] REJECT reason=.*? command=\S+\s+(\d+)(?:\s|$)")
+GE_TEST_MENU_STATE = re.compile(
+    r"\[ge-test\] menu state=(\d+) name=([a-z0-9-]+) joined=(\d+)"
+)
 
 
 def positive_integer(value: str) -> int:
@@ -66,6 +76,30 @@ def safe_text(path: Path) -> str:
         return ""
 
 
+def binary_contains(path: Path, marker: bytes) -> bool:
+    overlap = max(len(marker) - 1, 0)
+    previous = b""
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                combined = previous + chunk
+                if marker in combined:
+                    return True
+                previous = combined[-overlap:] if overlap else b""
+    except OSError:
+        return False
+    return False
+
+
+def combined_cycle_text(raw_log_path: Path) -> str:
+    parts = [safe_text(raw_log_path)]
+    runtime_logs = raw_log_path.parent / "user-data" / "Logs"
+    if runtime_logs.is_dir():
+        for candidate in sorted(runtime_logs.glob("*.log")):
+            parts.append(safe_text(candidate))
+    return "\n".join(parts)
+
+
 def detect_fatal_logs(cycle_root: Path) -> list[str]:
     matches: list[str] = []
     candidates = [cycle_root / "raw.log"]
@@ -86,7 +120,10 @@ def collect_crash_reports(cycle_root: Path, started_epoch: float) -> list[str]:
     destination = cycle_root / "crash-reports"
     copied: list[str] = []
     for candidate in source.iterdir():
-        if not candidate.is_file() or candidate.suffix.lower() not in (".ips", ".crash"):
+        if not candidate.is_file() or candidate.suffix.lower() not in (
+            ".ips",
+            ".crash",
+        ):
             continue
         if not re.match(r"(?:GoldenEye|ge)[-_ ]", candidate.name, re.I):
             continue
@@ -198,8 +235,11 @@ def readiness(
     menu_settle_seconds: float,
     warmup: int,
     observe: int,
+    players: int,
+    expected_virtual_gamepad_ack: int = 0,
 ) -> tuple[bool, dict[str, Any]]:
     windows, violations, counts = profile.parse_log(log_path)
+    log_text = combined_cycle_text(log_path)
     details: dict[str, Any] = {
         "profile_windows": len(windows),
         "dam_windows": sum(window["dam_candidate"] for window in windows),
@@ -208,8 +248,43 @@ def readiness(
     }
     if details["profile_failures"]:
         return False, details
+    if mode == "local-multiplayer":
+        details["virtual_gamepads_ready"] = f"[vpad] READY pads={players}" in log_text
+        acknowledgements = {
+            int(match.group(1)) for match in VPAD_ACK.finditer(log_text)
+        }
+        details["last_virtual_gamepad_ack"] = (
+            max(acknowledgements) if acknowledgements else 0
+        )
+        matches = list(LOCAL_MULTIPLAYER_READY.finditer(log_text))
+        matching = [
+            match
+            for match in matches
+            if int(match.group(2)) == players and int(match.group(3)) >= 120
+        ]
+        if matching:
+            latest = matching[-1]
+            details["local_multiplayer"] = {
+                "level": int(latest.group(1)),
+                "players": int(latest.group(2)),
+                "stable_polls": int(latest.group(3)),
+            }
+        details["required_virtual_gamepad_ack"] = expected_virtual_gamepad_ack
+        missing_acknowledgements = [
+            sequence
+            for sequence in range(1, expected_virtual_gamepad_ack + 1)
+            if sequence not in acknowledgements
+        ]
+        details["missing_virtual_gamepad_acks"] = missing_acknowledgements
+        return (
+            bool(matching)
+            and details["virtual_gamepads_ready"]
+            and not missing_acknowledgements
+            and bool(windows),
+            details,
+        )
     if mode == "menu":
-        injected = "GOLDENEYE_AUTO_START=menu injecting Start" in safe_text(log_path)
+        injected = "GOLDENEYE_AUTO_START=menu injecting Start" in log_text
         details["auto_start_seen"] = injected
         return injected and elapsed >= menu_settle_seconds and bool(windows), details
     selected = profile.select_windows(windows, warmup, observe)
@@ -248,7 +323,11 @@ def compare_capture(
 
 
 def build_environment(
-    args: argparse.Namespace, cycle_root: Path, *, create_directories: bool = True
+    args: argparse.Namespace,
+    cycle_root: Path,
+    *,
+    create_directories: bool = True,
+    virtual_gamepad_fd: int | None = None,
 ) -> dict[str, str]:
     user_data = cycle_root / "user-data"
     cache = cycle_root / "cache"
@@ -258,6 +337,13 @@ def build_environment(
         for directory in (user_data, cache, home, temporary):
             directory.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
+    for variable in (
+        "REX_INPUT_TEST_HARNESS",
+        "REX_TEST_VIRTUAL_GAMEPADS",
+        "REX_TEST_VIRTUAL_GAMEPAD_FD",
+        "GOLDENEYE_TEST_MENU_TRACE",
+    ):
+        environment.pop(variable, None)
     environment.update(
         {
             "HOME": str(home),
@@ -280,7 +366,18 @@ def build_environment(
             "GOLDENEYE_LAUNCHER_BYPASS_UI": "1",
         }
     )
-    if args.mode == "dam":
+    if args.mode == "local-multiplayer":
+        environment["REX_INPUT_BACKEND"] = "sdl"
+        environment.pop("GOLDENEYE_AUTO_START", None)
+        environment.pop("GOLDENEYE_AUTO_MISSION", None)
+        environment["REX_CONTROLLER_LAYOUT"] = "modern"
+        environment["REX_CONTROLLER_BUTTON_MAP"] = ""
+        environment["GOLDENEYE_TEST_MENU_TRACE"] = "1"
+        if virtual_gamepad_fd is not None:
+            environment["REX_INPUT_TEST_HARNESS"] = "1"
+            environment["REX_TEST_VIRTUAL_GAMEPADS"] = str(args.players)
+            environment["REX_TEST_VIRTUAL_GAMEPAD_FD"] = str(virtual_gamepad_fd)
+    elif args.mode == "dam":
         environment["GOLDENEYE_AUTO_MISSION"] = "dam"
     else:
         environment.pop("GOLDENEYE_AUTO_MISSION", None)
@@ -291,13 +388,255 @@ def build_environment(
     return environment
 
 
-def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[str, Any]:
+class LocalMultiplayerInputDriver:
+    def __init__(self, players: int, command_fd: int):
+        self.players = players
+        self.command_fd = command_fd
+        self.ready_elapsed: float | None = None
+        self.phase = "waiting-for-harness"
+        self.sequence = 0
+        self.last_sequence = 0
+        self.last_ack = 0
+        self.acknowledged_sequences: set[int] = set()
+        self.next_action_at = 0.0
+        self.settled_at = 0.0
+        self.observed_state: int | None = None
+        self.observed_menu: str | None = None
+        self.observed_joined = 0
+        self.completed = False
+        self.sent: list[dict[str, Any]] = []
+        self.error: str | None = None
+
+    def _pulse_button(self, player: int, button: str, hold_ms: int = 250) -> str:
+        self.sequence += 1
+        return f"PULSE_BUTTON {self.sequence} {player} {button} {hold_ms}\n"
+
+    def _pulse_axis(
+        self, player: int, axis: str, value: int, hold_ms: int = 350
+    ) -> str:
+        self.sequence += 1
+        return f"PULSE_AXIS {self.sequence} {player} {axis} {value} {hold_ms}\n"
+
+    def _send(
+        self,
+        commands: list[str],
+        elapsed: float,
+        reason: str,
+        settle_seconds: float,
+    ) -> bool:
+        payload = "".join(commands).encode("ascii")
+        try:
+            written = os.write(self.command_fd, payload)
+            if written != len(payload):
+                raise OSError(f"short virtual-gamepad write: {written}/{len(payload)}")
+        except OSError as error:
+            self.error = str(error)
+            return False
+        self.last_sequence = self.sequence
+        self.settled_at = elapsed + settle_seconds
+        self.sent.append(
+            {
+                "phase": self.phase,
+                "reason": reason,
+                "sent_seconds": elapsed,
+                "commands": [command.rstrip() for command in commands],
+            }
+        )
+        return True
+
+    def _command_finished(self, elapsed: float) -> bool:
+        return elapsed >= self.settled_at and (
+            self.last_sequence == 0
+            or all(
+                sequence in self.acknowledged_sequences
+                for sequence in range(1, self.last_sequence + 1)
+            )
+        )
+
+    def advance(self, log_path: Path, elapsed: float) -> None:
+        if self.error or self.command_fd < 0:
+            return
+        log_text = combined_cycle_text(log_path)
+        if self.ready_elapsed is None:
+            if f"[vpad] READY pads={self.players}" not in log_text:
+                return
+            self.ready_elapsed = elapsed
+            self.phase = "boot"
+            self.next_action_at = elapsed
+
+        self.acknowledged_sequences = {
+            int(match.group(1)) for match in VPAD_ACK.finditer(log_text)
+        }
+        self.last_ack = max(self.acknowledged_sequences, default=0)
+        rejections = list(VPAD_REJECT.finditer(log_text))
+        if rejections:
+            rejected_sequence = int(rejections[-1].group(1))
+            self.error = f"virtual-gamepad command {rejected_sequence} was rejected"
+            return
+        menu_matches = list(GE_TEST_MENU_STATE.finditer(log_text))
+        if menu_matches:
+            latest = menu_matches[-1]
+            self.observed_state = int(latest.group(1))
+            self.observed_menu = latest.group(2)
+            self.observed_joined = int(latest.group(3))
+
+        if self.phase == "boot":
+            if self.observed_state == 7:
+                self.phase = "dossier-move"
+                self.next_action_at = max(elapsed + 0.75, self.settled_at)
+            elif (
+                self.observed_state == 5
+                and elapsed >= self.next_action_at
+                and self._command_finished(elapsed)
+            ):
+                hold_ms = 250
+                command = self._pulse_button(1, "START", hold_ms)
+                if self._send(
+                    [command],
+                    elapsed,
+                    "enter Dossier from input-ready title screen",
+                    0.75,
+                ):
+                    self.next_action_at = elapsed + 2.0
+            return
+
+        if self.phase == "dossier-move":
+            if (
+                self.observed_state == 7
+                and elapsed >= self.next_action_at
+                and self._command_finished(elapsed)
+            ):
+                command = self._pulse_axis(1, "LY", 32767, 80)
+                if self._send(
+                    [command],
+                    elapsed,
+                    "select Multiplayer in Dossier",
+                    0.6,
+                ):
+                    self.phase = "dossier-confirm"
+            return
+
+        if self.phase == "dossier-confirm":
+            if self.observed_state == 7 and self._command_finished(elapsed):
+                command = self._pulse_button(1, "SOUTH")
+                if self._send(
+                    [command],
+                    elapsed,
+                    "open Multiplayer Modes",
+                    0.75,
+                ):
+                    self.phase = "waiting-for-multiplayer-modes"
+            return
+
+        if self.phase == "waiting-for-multiplayer-modes":
+            if self.observed_state == 27:
+                self.phase = "multiplayer-modes-move"
+                self.next_action_at = elapsed + 0.75
+            return
+
+        if self.phase == "multiplayer-modes-move":
+            if (
+                self.observed_state == 27
+                and elapsed >= self.next_action_at
+                and self._command_finished(elapsed)
+            ):
+                command = self._pulse_axis(1, "LY", -32768, 80)
+                if self._send(
+                    [command],
+                    elapsed,
+                    "select Local in Multiplayer Modes",
+                    0.6,
+                ):
+                    self.phase = "multiplayer-modes-confirm"
+            return
+
+        if self.phase == "multiplayer-modes-confirm":
+            if self.observed_state == 27 and self._command_finished(elapsed):
+                command = self._pulse_button(1, "SOUTH")
+                if self._send(
+                    [command],
+                    elapsed,
+                    "choose Local multiplayer",
+                    0.75,
+                ):
+                    self.phase = "waiting-for-create-local-game"
+            return
+
+        if self.phase == "waiting-for-create-local-game":
+            if self.observed_state == 15 and self.observed_joined >= 1:
+                self.phase = "joining-guests"
+                self.next_action_at = elapsed + 0.75
+            return
+
+        if self.phase == "joining-guests":
+            if (
+                self.observed_state == 15
+                and elapsed >= self.next_action_at
+                and self._command_finished(elapsed)
+            ):
+                commands = [
+                    self._pulse_button(player, "START")
+                    for player in range(2, self.players + 1)
+                ]
+                if self._send(
+                    commands,
+                    elapsed,
+                    "join local guest players",
+                    0.75,
+                ):
+                    self.phase = "waiting-for-guests"
+            return
+
+        if self.phase == "waiting-for-guests":
+            if (
+                self.observed_state == 15
+                and self.observed_joined == self.players
+                and self._command_finished(elapsed)
+            ):
+                command = self._pulse_button(1, "START")
+                if self._send(
+                    [command],
+                    elapsed,
+                    "start local match",
+                    0.75,
+                ):
+                    self.phase = "starting-match"
+            return
+
+        if self.phase == "starting-match":
+            if self._command_finished(elapsed):
+                self.completed = True
+                self.phase = "waiting-for-match-readiness"
+                return
+
+    def close(self) -> None:
+        if self.command_fd >= 0:
+            os.close(self.command_fd)
+            self.command_fd = -1
+
+
+def run_cycle(
+    args: argparse.Namespace, suite_root: Path, number: int
+) -> dict[str, Any]:
     global ACTIVE_PROCESS
     cycle_root = suite_root / f"cycle-{number:03d}"
     cycle_root.mkdir(parents=True)
     log_path = cycle_root / "raw.log"
-    environment = build_environment(args, cycle_root)
-    command = [str(args.executable), "--game_data_root", str(args.game_data), "--gpu", "metal"]
+    virtual_gamepad_read_fd: int | None = None
+    virtual_gamepad_write_fd: int | None = None
+    input_driver: LocalMultiplayerInputDriver | None = None
+    if args.mode == "local-multiplayer":
+        virtual_gamepad_read_fd, virtual_gamepad_write_fd = os.pipe()
+    environment = build_environment(
+        args, cycle_root, virtual_gamepad_fd=virtual_gamepad_read_fd
+    )
+    command = [
+        str(args.executable),
+        "--game_data_root",
+        str(args.game_data),
+        "--gpu",
+        "metal",
+    ]
     started = time.monotonic()
     started_epoch = time.time()
     ready = False
@@ -307,6 +646,9 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
     launch_error: str | None = None
     with log_path.open("wb") as log:
         try:
+            process_options: dict[str, Any] = {}
+            if virtual_gamepad_read_fd is not None:
+                process_options["pass_fds"] = (virtual_gamepad_read_fd,)
             process = subprocess.Popen(
                 command,
                 cwd=args.game_data,
@@ -314,11 +656,28 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                **process_options,
             )
             ACTIVE_PROCESS = process
+            if virtual_gamepad_read_fd is not None:
+                os.close(virtual_gamepad_read_fd)
+                virtual_gamepad_read_fd = None
+            if virtual_gamepad_write_fd is not None:
+                input_driver = LocalMultiplayerInputDriver(
+                    args.players, virtual_gamepad_write_fd
+                )
+                virtual_gamepad_write_fd = None
         except OSError as error:
             launch_error = str(error)
             process = None
+            for descriptor in (
+                virtual_gamepad_read_fd,
+                virtual_gamepad_write_fd,
+            ):
+                if descriptor is not None:
+                    os.close(descriptor)
+            virtual_gamepad_read_fd = None
+            virtual_gamepad_write_fd = None
 
         if process is not None:
             deadline = started + args.ready_timeout
@@ -328,6 +687,10 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
                 if process.poll() is not None:
                     exited_before_ready = process.returncode
                     break
+                if input_driver:
+                    input_driver.advance(log_path, elapsed)
+                    if input_driver.error:
+                        break
                 ready, readiness_details = readiness(
                     args.mode,
                     log_path,
@@ -335,12 +698,16 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
                     args.menu_settle_seconds,
                     args.warmup_windows,
                     args.observe_windows,
+                    args.players,
+                    input_driver.last_sequence if input_driver else 0,
                 )
                 if ready:
                     ready_elapsed = elapsed
                     break
                 time.sleep(args.poll_seconds)
 
+            if input_driver:
+                input_driver.close()
             capture: str | None = None
             capture_error: str | None = None
             capture_validation: dict[str, Any] | None = None
@@ -358,10 +725,18 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
                     )
                     capture = str(capture_path)
                     if args.reference:
-                        regression = compare_capture(args.reference, capture_path, cycle_root, args)
-                except (rendering.ImageError, OSError, subprocess.TimeoutExpired) as error:
+                        regression = compare_capture(
+                            args.reference, capture_path, cycle_root, args
+                        )
+                except (
+                    rendering.ImageError,
+                    OSError,
+                    subprocess.TimeoutExpired,
+                ) as error:
                     capture_error = str(error)
-            shutdown = terminate_process(process, args.quit_method, args.shutdown_timeout)
+            shutdown = terminate_process(
+                process, args.quit_method, args.shutdown_timeout
+            )
             ACTIVE_PROCESS = None
         else:
             capture = None
@@ -369,6 +744,20 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
             capture_validation = None
             regression = None
             shutdown = {"exit_code": None}
+    input_script = {
+        "sent": input_driver.sent if input_driver else [],
+        "error": input_driver.error if input_driver else None,
+        "phase": input_driver.phase if input_driver else None,
+        "completed": input_driver.completed if input_driver else None,
+        "last_sequence": input_driver.last_sequence if input_driver else 0,
+        "last_ack": input_driver.last_ack if input_driver else 0,
+        "acknowledged_sequences": (
+            sorted(input_driver.acknowledged_sequences) if input_driver else []
+        ),
+        "observed_state": input_driver.observed_state if input_driver else None,
+        "observed_menu": input_driver.observed_menu if input_driver else None,
+        "observed_joined": input_driver.observed_joined if input_driver else 0,
+    }
 
     elapsed = time.monotonic() - started
     fatal_logs = detect_fatal_logs(cycle_root)
@@ -377,7 +766,9 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
     final_profile_passed: bool | None = None
     final_profile_failures: list[str] = []
     final_windows, final_violations, final_counts = profile.parse_log(log_path)
-    final_profile_failures = final_violations + profile.wait_reg_mem_violations(final_windows)
+    final_profile_failures = final_violations + profile.wait_reg_mem_violations(
+        final_windows
+    )
     if args.mode == "dam":
         final_selected = profile.select_windows(
             final_windows, args.warmup_windows, args.observe_windows
@@ -401,7 +792,9 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
     failures: list[str] = []
     if launch_error:
         failures.append(f"launch failed: {launch_error}")
-    if not ready:
+    if input_script["error"]:
+        failures.append(f"virtual-gamepad input failed: {input_script['error']}")
+    if not ready and not input_script["error"]:
         if exited_before_ready is not None:
             failures.append(
                 f"application exited with code {exited_before_ready} before {args.mode} readiness"
@@ -457,6 +850,7 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
             "raw_log": str(log_path),
         },
         "readiness": readiness_details,
+        "input_script": input_script,
         "capture": capture,
         "capture_validation": capture_validation,
         "render_comparison": regression,
@@ -474,7 +868,9 @@ def run_cycle(args: argparse.Namespace, suite_root: Path, number: int) -> dict[s
     return result
 
 
-def write_suite_summary(suite_root: Path, cycles: list[dict[str, Any]], args: argparse.Namespace) -> bool:
+def write_suite_summary(
+    suite_root: Path, cycles: list[dict[str, Any]], args: argparse.Namespace
+) -> bool:
     passed = sum(cycle["status"] == "pass" for cycle in cycles)
     readiness_times = [
         float(cycle["ready_seconds"])
@@ -483,11 +879,7 @@ def write_suite_summary(suite_root: Path, cycles: list[dict[str, Any]], args: ar
     ]
     mean_fps = []
     for cycle in cycles:
-        fps = (
-            cycle.get("readiness", {})
-            .get("aggregate", {})
-            .get("real_window_fps")
-        )
+        fps = cycle.get("readiness", {}).get("aggregate", {}).get("real_window_fps")
         if fps:
             mean_fps.append(float(fps["mean"]))
     summary = {
@@ -505,7 +897,9 @@ def write_suite_summary(suite_root: Path, cycles: list[dict[str, Any]], args: ar
             "min": min(readiness_times) if readiness_times else None,
             "max": max(readiness_times) if readiness_times else None,
         },
-        "mean_window_fps_across_cycles": statistics.fmean(mean_fps) if mean_fps else None,
+        "mean_window_fps_across_cycles": statistics.fmean(mean_fps)
+        if mean_fps
+        else None,
         "isolated_state": True,
         "game_data": str(args.game_data),
         "reference": str(args.reference) if args.reference else None,
@@ -521,7 +915,9 @@ def write_suite_summary(suite_root: Path, cycles: list[dict[str, Any]], args: ar
         f"native clean shutdowns: {summary['native_clean_shutdowns']}/{len(cycles)}",
     ]
     if mean_fps:
-        lines.append(f"mean 64-frame-window FPS across cycles: {statistics.fmean(mean_fps):.3f}")
+        lines.append(
+            f"mean 64-frame-window FPS across cycles: {statistics.fmean(mean_fps):.3f}"
+        )
     for cycle in cycles:
         if cycle["failures"]:
             lines.append(f"cycle {cycle['cycle']}: " + "; ".join(cycle["failures"]))
@@ -531,19 +927,34 @@ def write_suite_summary(suite_root: Path, cycles: list[dict[str, Any]], args: ar
 
 def main() -> int:
     global ACTIVE_PROCESS
-    default_app_contents = (
+    release_app_contents = (
         ROOT
         / "vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist"
         / "GoldenEye Metal.app/Contents"
     )
-    default_executable = default_app_contents / "MacOS/GoldenEye"
-    default_runtime = default_app_contents / "Frameworks"
-    default_game_data = Path.home() / "Library/Application Support/GoldenEye Metal/Game Data"
+    multiplayer_test_app_contents = (
+        ROOT
+        / "vendor/GoldenEye-Recomp/out/build/macos-arm64-multiplayer-test/dist"
+        / "GoldenEye Metal.app/Contents"
+    )
+    default_game_data = (
+        Path.home() / "Library/Application Support/GoldenEye Metal/Game Data"
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cycles", type=positive_integer, default=3)
-    parser.add_argument("--mode", choices=("menu", "dam"), default="dam")
-    parser.add_argument("--executable", type=Path, default=default_executable)
-    parser.add_argument("--runtime-dir", type=Path, default=default_runtime)
+    parser.add_argument(
+        "--mode",
+        choices=("menu", "dam", "local-multiplayer"),
+        default="dam",
+    )
+    parser.add_argument(
+        "--players",
+        type=int,
+        default=2,
+        help="local multiplayer test player count (2-4)",
+    )
+    parser.add_argument("--executable", type=Path)
+    parser.add_argument("--runtime-dir", type=Path)
     parser.add_argument("--game-data", type=Path, default=default_game_data)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--ready-timeout", type=finite_float, default=150.0)
@@ -582,6 +993,19 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    selected_app_contents = (
+        multiplayer_test_app_contents
+        if args.mode == "local-multiplayer"
+        else release_app_contents
+    )
+    if args.executable is None:
+        args.executable = selected_app_contents / "MacOS/GoldenEye"
+    if args.runtime_dir is None:
+        args.runtime_dir = (
+            selected_app_contents / "Frameworks"
+            if args.executable == selected_app_contents / "MacOS/GoldenEye"
+            else args.executable.parent.parent / "Frameworks"
+        )
     args.executable = args.executable.expanduser().resolve()
     args.runtime_dir = args.runtime_dir.expanduser().resolve()
     args.game_data = args.game_data.expanduser().resolve()
@@ -598,21 +1022,35 @@ def main() -> int:
     dylib = args.runtime_dir / "librexruntime.dylib"
     if not dylib.is_file():
         parser.error(f"runtime library does not exist: {dylib}")
+    if args.mode == "local-multiplayer":
+        if not binary_contains(
+            dylib, b"REX_TEST_VIRTUAL_GAMEPADS"
+        ) or not binary_contains(args.executable, b"[ge-test] menu state="):
+            parser.error(
+                "local multiplayer mode requires the developer harness build; "
+                "configure preset macos-arm64-multiplayer-test and build target "
+                "goldeneye_macos_app"
+            )
     if not (args.game_data / "default.xex").is_file():
         parser.error(f"game-data directory has no default.xex: {args.game_data}")
     if args.reference and not args.reference.is_file():
         parser.error(f"reference does not exist: {args.reference}")
     if args.warmup_windows < 0:
         parser.error("--warmup-windows must not be negative")
+    if args.players < 2 or args.players > 4:
+        parser.error("--players must be between 2 and 4")
     if not 0 <= args.render_pixel_threshold <= 255:
         parser.error("--render-pixel-threshold must be between 0 and 255")
     if not 0 <= args.render_max_changed_ratio <= 1:
         parser.error("--render-max-changed-ratio must be between 0 and 1")
-    if min(
-        args.render_max_mae,
-        args.render_max_coarse_mae,
-        args.render_min_luma_stddev,
-    ) < 0:
+    if (
+        min(
+            args.render_max_mae,
+            args.render_max_coarse_mae,
+            args.render_min_luma_stddev,
+        )
+        < 0
+    ):
         parser.error("render comparison thresholds must not be negative")
     if (
         args.ready_timeout <= 0
@@ -621,7 +1059,9 @@ def main() -> int:
         or args.menu_settle_seconds < 0
         or args.capture_delay < 0
     ):
-        parser.error("timeouts/polling must be positive and delays must not be negative")
+        parser.error(
+            "timeouts/polling must be positive and delays must not be negative"
+        )
     if not args.allow_stale_build:
         freshness = profile.build_freshness_report(ROOT, dylib, args.executable)
         if not freshness["fresh"]:
@@ -637,7 +1077,9 @@ def main() -> int:
     else:
         stability_root = ROOT / "out/stability"
         stability_root.mkdir(parents=True, exist_ok=True)
-        suite_root = Path(tempfile.mkdtemp(prefix=f"{timestamp()}.", dir=stability_root))
+        suite_root = Path(
+            tempfile.mkdtemp(prefix=f"{timestamp()}.", dir=stability_root)
+        )
 
     if not args.skip_metadata:
         profile.write_metadata(
@@ -663,7 +1105,9 @@ def main() -> int:
     except BaseException:
         if ACTIVE_PROCESS is not None and ACTIVE_PROCESS.poll() is None:
             try:
-                terminate_process(ACTIVE_PROCESS, "signal", min(5.0, args.shutdown_timeout))
+                terminate_process(
+                    ACTIVE_PROCESS, "signal", min(5.0, args.shutdown_timeout)
+                )
             except BaseException:
                 ACTIVE_PROCESS.kill()
         ACTIVE_PROCESS = None

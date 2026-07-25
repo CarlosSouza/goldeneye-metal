@@ -49,6 +49,7 @@ struct ControllerSnapshot {
   bool input_active = false;
   bool rumble_supported = false;
   uint32_t user_index = 0;
+  uint64_t device_id = 0;
   std::string name;
   X_INPUT_GAMEPAD raw_gamepad = {};
   X_INPUT_GAMEPAD gamepad = {};

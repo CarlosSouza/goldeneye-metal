@@ -20,8 +20,11 @@
 #include <rex/ui/windowed_app_context.h>
 
 #include <atomic>
+#include <cstdlib>
+#include <memory>
 #include <string>
 
+#include "ge_controller_shortcut.h"
 #include "ge_menu.h"
 #include "ge_host_pause.h"
 #include "ge_launcher.h"
@@ -106,6 +109,14 @@ class GeApp : public rex::ReXApp {
       repaired_macos_config |= rex::cvar::SetFlagByName("max_fps", "60");
     }
 
+    // GoldenEye's direct macOS mouse-camera path and keyboard co-control both
+    // belong to player 1. Repair a stale SDK slot override so they cannot split
+    // across two local players.
+    if (rex::cvar::GetFlagByName("mnk_user_index") != "0") {
+      REXLOG_WARN("Resetting unsupported mnk_user_index setting to player 1 on macOS");
+      repaired_macos_config |= rex::cvar::SetFlagByName("mnk_user_index", "0");
+    }
+
     // Config loading validates this range, but environment cvars are applied
     // through their typed setters and may contain an out-of-range value. Keep
     // the Metal sampler behavior and the Video menu's displayed choice aligned.
@@ -151,6 +162,35 @@ class GeApp : public rex::ReXApp {
   // Create the Post-FX spatial layer once the ImGui drawer exists, but only if
   // vignette or scanlines actually need it.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    auto shortcut_state = controller_shortcut_ui_state_;
+    shortcut_state->pending.store(false, std::memory_order_release);
+    shortcut_state->alive.store(true, std::memory_order_release);
+    auto* shortcut_context = &app_context();
+    ge::controller_shortcut::SetToggleHandler([this, shortcut_state,
+                                               shortcut_context](uint32_t controller_slot) {
+      if (!shortcut_state->alive.load(std::memory_order_acquire)) {
+        return;
+      }
+      bool expected = false;
+      if (!shortcut_state->pending.compare_exchange_strong(expected, true,
+                                                           std::memory_order_acq_rel)) {
+        return;
+      }
+      if (!shortcut_context->CallInUIThread([this, shortcut_state, controller_slot] {
+            if (shortcut_state->alive.load(std::memory_order_acquire)) {
+              // Raw pad state remains available while Host Settings has
+              // suppressed guest input. Still require window focus so a
+              // controller used elsewhere cannot affect this instance.
+              if (window() && window()->HasFocus()) {
+                REXLOG_INFO("GEUI player {} controller shortcut reached UI", controller_slot + 1);
+                TogglePauseMenu("L3+R3 hold");
+              }
+            }
+            shortcut_state->pending.store(false, std::memory_order_release);
+          })) {
+        shortcut_state->pending.store(false, std::memory_order_release);
+      }
+    });
 #if defined(__APPLE__)
     // The SDK's raw F4 settings overlay exposes every cross-platform cvar,
     // including backends and effects that don't exist in this Metal build.
@@ -164,15 +204,33 @@ class GeApp : public rex::ReXApp {
       // The drawer may remain alive for a passive Post-FX overlay. Polling
       // the controller there would add needless work to every gameplay
       // frame, so activate this host-only feed only for the settings menu.
-      if (!menu_ || !out || !runtime() || !runtime()->input_system()) {
+      if (!menu_ || !out || !window() || !window()->HasFocus() || !runtime() ||
+          !runtime()->input_system()) {
         return false;
       }
       auto* input = static_cast<rex::input::InputSystem*>(runtime()->input_system());
-      rex::input::ControllerSnapshot snapshot;
-      if (!input->GetControllerSnapshot(0, &snapshot)) {
+      bool controller_found = false;
+      uint16_t buttons = 0;
+      int16_t left_stick_x = 0;
+      int16_t left_stick_y = 0;
+      auto merge_axis = [](int16_t* destination, int16_t candidate) {
+        if (std::abs(static_cast<int>(candidate)) > std::abs(static_cast<int>(*destination))) {
+          *destination = candidate;
+        }
+      };
+      for (uint32_t slot = 0; slot < 4; ++slot) {
+        rex::input::ControllerSnapshot snapshot;
+        if (!input->GetControllerSnapshot(slot, &snapshot) || !snapshot.connected) {
+          continue;
+        }
+        controller_found = true;
+        buttons |= static_cast<uint16_t>(snapshot.raw_gamepad.buttons);
+        merge_axis(&left_stick_x, static_cast<int16_t>(snapshot.raw_gamepad.thumb_lx));
+        merge_axis(&left_stick_y, static_cast<int16_t>(snapshot.raw_gamepad.thumb_ly));
+      }
+      if (!controller_found) {
         return false;
       }
-      const uint16_t buttons = static_cast<uint16_t>(snapshot.raw_gamepad.buttons);
       out->face_down = (buttons & rex::input::X_INPUT_GAMEPAD_A) != 0;
       out->face_right = (buttons & rex::input::X_INPUT_GAMEPAD_B) != 0;
       out->face_left = (buttons & rex::input::X_INPUT_GAMEPAD_X) != 0;
@@ -187,10 +245,8 @@ class GeApp : public rex::ReXApp {
       out->right_stick_button = (buttons & rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB) != 0;
       out->start = (buttons & rex::input::X_INPUT_GAMEPAD_START) != 0;
       out->back = (buttons & rex::input::X_INPUT_GAMEPAD_BACK) != 0;
-      out->left_stick_x =
-          rex::input::controller::AxisToUnit(static_cast<int16_t>(snapshot.raw_gamepad.thumb_lx));
-      out->left_stick_y =
-          rex::input::controller::AxisToUnit(static_cast<int16_t>(snapshot.raw_gamepad.thumb_ly));
+      out->left_stick_x = rex::input::controller::AxisToUnit(left_stick_x);
+      out->left_stick_y = rex::input::controller::AxisToUnit(left_stick_y);
       return true;
     });
 #endif
@@ -221,6 +277,8 @@ class GeApp : public rex::ReXApp {
 
   // Tear down the menu, overlay and keybind before the drawer is destroyed.
   void OnShutdown() override {
+    controller_shortcut_ui_state_->alive.store(false, std::memory_order_release);
+    ge::controller_shortcut::ClearToggleHandler();
     input_suppressed_.store(true, std::memory_order_release);
     NotifyInputActiveChanged();
     // A direct shutdown/restart can destroy the dialog without its normal
@@ -251,7 +309,7 @@ class GeApp : public rex::ReXApp {
     // Escape cannot immediately reopen/close it.
     if (event.virtual_key() == rex::ui::VirtualKey::kEscape) {
       if (!event.prev_state()) {
-        TogglePauseMenu();
+        TogglePauseMenu("Escape");
       }
       event.set_handled(true);
       return;
@@ -264,13 +322,13 @@ class GeApp : public rex::ReXApp {
 
   // ESC handler: open or close the menu. Active offline local gameplay uses
   // the retail title's own pause state while the host UI remains responsive.
-  void TogglePauseMenu() {
+  void TogglePauseMenu(const char* source) {
     if (menu_) {
-      REXLOG_INFO("GEUI Escape requested pause-menu close");
+      REXLOG_INFO("GEUI {} requested pause-menu close", source);
       menu_->RequestClose();  // on_closed clears menu_
       return;
     }
-    REXLOG_INFO("GEUI Escape requested pause-menu open");
+    REXLOG_INFO("GEUI {} requested pause-menu open", source);
     auto* drawer = imgui_drawer();
     if (!drawer) {
       // This should be unreachable once a graphics backend provides its UI
@@ -372,6 +430,13 @@ class GeApp : public rex::ReXApp {
   }
 #endif
 
+  struct ControllerShortcutUIState {
+    std::atomic<bool> alive{true};
+    std::atomic<bool> pending{false};
+  };
+
+  std::shared_ptr<ControllerShortcutUIState> controller_shortcut_ui_state_ =
+      std::make_shared<ControllerShortcutUIState>();
   std::atomic<bool> input_suppressed_{false};
   GeMenuDialog* menu_ = nullptr;               // non-owning; self-deletes via the drawer
   std::unique_ptr<ge::PostFxOverlay> postfx_;  // spatial-effect layer, attached only when needed

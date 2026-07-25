@@ -60,6 +60,7 @@ class Win32Window : public Window {
   void CompleteMainMenuItemsUpdateImpl() override;
   void ApplyNewMouseCapture() override;
   void ApplyNewMouseRelease() override;
+  bool IsMouseCaptureActiveImpl() const override;
   void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
   void FocusImpl() override;
 

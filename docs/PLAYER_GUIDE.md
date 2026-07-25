@@ -39,12 +39,17 @@ inversion. Opening it during an offline mission pauses the game and releases the
 
 Supported macOS controllers include DualShock 4, DualSense, Xbox One, and Xbox Series X|S pads.
 Connect over USB or Bluetooth before or during play. Up to four controller slots are available,
-and keyboard/mouse can remain active.
+and keyboard/mouse can remain active as player 1.
 
-In **Host Settings → Controls**, choose Modern, Classic, or Southpaw, remap buttons, adjust
-sensitivity and deadzones, configure rumble, or test the connected controller. A selects, B goes
-back, the D-pad or left stick navigates, and LB/RB changes settings tabs. Right Bumper switches the
-game between original and remastered graphics.
+In **Host Settings → Controls**, the P1–P4 panel shows every connected pad. Select one to test its
+input and rumble or move it to another player port; choosing an occupied port swaps the two pads.
+Modern, Classic, Southpaw, remapping, sensitivity and deadzone settings apply to all local pads.
+Hold L3 + R3 for about 0.75 seconds to open or close Host Settings. A selects, B goes back, the
+D-pad or left stick navigates, and LB/RB changes settings tabs. Right Bumper switches between
+original and remastered graphics.
+
+For local split-screen, choose **Multiplayer → Local** in the dossier. P2–P4 press Start to join,
+then P1 presses Start to begin.
 
 ## Graphics and performance
 

@@ -41,7 +41,10 @@ class InputSystem : public system::IInputSystem {
   void SetMouseMotionMode(MouseMotionMode mode);
   bool ConsumeApplicationMouseMotion(uint32_t user_index, MouseMotionDelta* out_delta);
   bool GetControllerSnapshot(uint32_t user_index, ControllerSnapshot* out_snapshot);
-  X_RESULT PlayControllerTestRumble(uint32_t user_index);
+  bool GetHostInputSnapshot(HostInputSnapshot* out_snapshot) const;
+  X_RESULT PlayControllerTestRumble(uint32_t user_index, uint64_t expected_device_id = 0);
+  X_RESULT SwapControllerSlots(uint32_t first_user_index, uint32_t second_user_index,
+                               uint64_t expected_device_id = 0);
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);

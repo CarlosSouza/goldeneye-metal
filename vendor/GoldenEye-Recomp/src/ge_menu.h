@@ -14,6 +14,7 @@
 #include <imgui.h>
 
 #include <array>
+#include <cstddef>
 #include <functional>
 
 // Briefing-folder pause / settings menu.
@@ -59,7 +60,7 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   void DrawFolder(ImGuiIO& io);
   void DrawTabs(ImGuiIO& io);
   void DrawContent(ImGuiIO& io);
-  void UpdateControllerSnapshot();
+  void UpdateControllerSnapshots();
   void DrawControllerTest();
 
   Callbacks callbacks_;
@@ -83,8 +84,10 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   // Physical-controller state is sampled independently of guest input, so the
   // controller can navigate and test itself while this modal host menu keeps
   // the game input suppressed.
-  rex::input::ControllerSnapshot controller_snapshot_;
-  bool controller_snapshot_valid_ = false;
+  static constexpr std::size_t kControllerSlotCount = 4;
+  std::array<rex::input::ControllerSnapshot, kControllerSlotCount> controller_snapshots_{};
+  std::array<bool, kControllerSlotCount> controller_snapshot_valid_{};
+  int selected_controller_slot_ = 0;
   bool testing_tools_unlocked_ = false;
   static constexpr unsigned kTestingToggleCount = 14;
   // One pending desired state per entry in the data-driven Cheats list.

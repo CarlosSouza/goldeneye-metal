@@ -299,8 +299,14 @@ class Window {
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   bool IsMouseCaptureRequested() const { return mouse_capture_request_count_ != 0; }
+  // Platform-confirmed native capture state. Query this on the UI thread; it
+  // may remain false when a requested OS transition fails.
+  bool IsMouseCaptureActive() const { return IsMouseCaptureActiveImpl(); }
   void CaptureMouse();
   void ReleaseMouse();
+  // Retry the platform transition without changing the common request count.
+  // This is used when the OS rejected a prior capture or release attempt.
+  void RefreshMouseCapture();
 
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
@@ -515,6 +521,7 @@ class Window {
   // captured, in case something has released it in the OS.
   virtual void ApplyNewMouseCapture() {}
   virtual void ApplyNewMouseRelease() {}
+  virtual bool IsMouseCaptureActiveImpl() const { return false; }
   virtual void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
     (void)old_cursor_visibility;
   }

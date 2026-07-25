@@ -7,18 +7,29 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+#include <unistd.h>
+#endif
 
 using rex::X_RESULT;
 using rex::X_STATUS;
 using rex::input::X_INPUT_GAMEPAD_A;
+using rex::input::X_INPUT_GAMEPAD_B;
 using rex::input::X_INPUT_GAMEPAD_DPAD_UP;
 using rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER;
+using rex::input::X_INPUT_GAMEPAD_START;
+using rex::input::X_INPUT_GAMEPAD_X;
 using rex::input::X_INPUT_GAMEPAD_Y;
 using rex::input::X_INPUT_STATE;
 using rex::input::X_INPUT_VIBRATION;
@@ -206,8 +217,7 @@ class SDLDriverFixture {
     return result;
   }
 
-  bool Snapshot(uint32_t user_index,
-                rex::input::ControllerSnapshot& snapshot) {
+  bool Snapshot(uint32_t user_index, rex::input::ControllerSnapshot& snapshot) {
     for (int attempt = 0; attempt < 8; ++attempt) {
       SDL_PumpEvents();
       context.ExecutePendingFunctionsFromUIThread();
@@ -223,7 +233,121 @@ class SDLDriverFixture {
   rex::input::sdl::SDLInputDriver driver;
 };
 
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+
+class ScopedHarnessEnvironment {
+ public:
+  explicit ScopedHarnessEnvironment(int command_fd) {
+    Save("REX_INPUT_TEST_HARNESS");
+    Save("REX_TEST_VIRTUAL_GAMEPADS");
+    Save("REX_TEST_VIRTUAL_GAMEPAD_FD");
+    const std::string descriptor = std::to_string(command_fd);
+    setenv("REX_INPUT_TEST_HARNESS", "1", 1);
+    setenv("REX_TEST_VIRTUAL_GAMEPADS", "2", 1);
+    setenv("REX_TEST_VIRTUAL_GAMEPAD_FD", descriptor.c_str(), 1);
+  }
+
+  ~ScopedHarnessEnvironment() {
+    for (const auto& [name, value] : saved_) {
+      if (value) {
+        setenv(name.c_str(), value->c_str(), 1);
+      } else {
+        unsetenv(name.c_str());
+      }
+    }
+  }
+
+ private:
+  void Save(const char* name) {
+    const char* value = std::getenv(name);
+    saved_.emplace_back(name, value ? std::optional<std::string>(value) : std::nullopt);
+  }
+
+  std::vector<std::pair<std::string, std::optional<std::string>>> saved_;
+};
+
+#endif
+
 }  // namespace
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+
+TEST_CASE("SDL developer harness drives two pads through the normal input path",
+          "[input][sdl][multiplayer][harness]") {
+  int command_pipe[2] = {-1, -1};
+  REQUIRE(pipe(command_pipe) == 0);
+  struct ClosePipe {
+    int* descriptors;
+    ~ClosePipe() {
+      for (size_t index = 0; index < 2; ++index) {
+        if (descriptors[index] >= 0) {
+          close(descriptors[index]);
+        }
+      }
+    }
+  } close_pipe{command_pipe};
+  ScopedHarnessEnvironment environment(command_pipe[0]);
+
+  {
+    SDLDriverFixture fixture;
+    // The harness owns the inherited read side after successful activation.
+    command_pipe[0] = -1;
+
+    const std::string commands =
+        "SET_BUTTON 1 1 SOUTH 1\n"
+        "SET_BUTTON 2 2 EAST 1\n"
+        "SET_AXIS 3 2 LX 12345\n";
+    REQUIRE(write(command_pipe[1], commands.data(), commands.size()) ==
+            static_cast<ssize_t>(commands.size()));
+
+    X_INPUT_STATE state = {};
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_A) != 0);
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_B) != 0);
+    CHECK(static_cast<int16_t>(state.gamepad.thumb_lx) == 12345);
+
+    const std::string reset_and_pulse =
+        "RESET 4 ALL\n"
+        "PULSE_BUTTON 5 2 START 20\n";
+    REQUIRE(write(command_pipe[1], reset_and_pulse.data(), reset_and_pulse.size()) ==
+            static_cast<ssize_t>(reset_and_pulse.size()));
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_START) != 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_START) == 0);
+
+    // A malformed pulse must not alter input or consume its sequence number.
+    const std::string rejected_axis = "PULSE_AXIS 6 2 LX 20000 0\n";
+    REQUIRE(write(command_pipe[1], rejected_axis.data(), rejected_axis.size()) ==
+            static_cast<ssize_t>(rejected_axis.size()));
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK(static_cast<int16_t>(state.gamepad.thumb_lx) == 0);
+
+    const std::string retry_axis = "SET_AXIS 6 2 LX 22222\n";
+    REQUIRE(write(command_pipe[1], retry_axis.data(), retry_axis.size()) ==
+            static_cast<ssize_t>(retry_axis.size()));
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK(static_cast<int16_t>(state.gamepad.thumb_lx) == 22222);
+  }
+}
+
+#endif
 
 TEST_CASE("SDL virtual gamepad maps modern controller controls and activity", "[input][sdl]") {
   SDLDriverFixture fixture;
@@ -289,15 +413,250 @@ TEST_CASE("SDL gamepad discovery includes a controller connected before driver s
   CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_A) != 0);
 }
 
-TEST_CASE("SDL gamepad hotplug promotes waiting devices into guest slots", "[input][sdl]") {
+TEST_CASE("SDL keeps four controller ports isolated across disconnect and reconnect",
+          "[input][sdl][multiplayer]") {
+  const bool old_rumble_enabled = REXCVAR_GET(controller_rumble_enabled);
+  const double old_rumble_intensity = REXCVAR_GET(controller_rumble_intensity);
+  struct RestoreRumbleCvars {
+    bool enabled;
+    double intensity;
+    ~RestoreRumbleCvars() {
+      REXCVAR_SET(controller_rumble_enabled, enabled);
+      REXCVAR_SET(controller_rumble_intensity, intensity);
+    }
+  } restore{old_rumble_enabled, old_rumble_intensity};
+  REXCVAR_SET(controller_rumble_enabled, true);
+  REXCVAR_SET(controller_rumble_intensity, 1.0);
+
   SDLDriverFixture fixture;
-  std::array<RumbleRecord, 5> rumble_records = {};
+  std::array<RumbleRecord, 4> rumble_records = {};
   std::vector<std::unique_ptr<VirtualGamepad>> gamepads;
   gamepads.reserve(rumble_records.size());
   for (auto& record : rumble_records) {
     gamepads.push_back(std::make_unique<VirtualGamepad>(&record));
   }
 
+  constexpr std::array<SDL_GamepadButton, 4> physical_buttons = {
+      SDL_GAMEPAD_BUTTON_SOUTH,
+      SDL_GAMEPAD_BUTTON_EAST,
+      SDL_GAMEPAD_BUTTON_WEST,
+      SDL_GAMEPAD_BUTTON_NORTH,
+  };
+  constexpr std::array<uint16_t, 4> guest_buttons = {
+      X_INPUT_GAMEPAD_A,
+      X_INPUT_GAMEPAD_B,
+      X_INPUT_GAMEPAD_X,
+      X_INPUT_GAMEPAD_Y,
+  };
+  for (size_t i = 0; i < gamepads.size(); ++i) {
+    gamepads[i]->SetButton(physical_buttons[i], true);
+    gamepads[i]->Commit();
+  }
+
+  X_INPUT_STATE state = {};
+  std::array<uint32_t, 4> initial_packets = {};
+  std::array<uint64_t, 4> device_ids = {};
+  for (uint32_t user = 0; user < 4; ++user) {
+    REQUIRE(fixture.Poll(user, state) == X_ERROR_SUCCESS);
+    initial_packets[user] = static_cast<uint32_t>(state.packet_number);
+    rex::input::ControllerSnapshot snapshot;
+    REQUIRE(fixture.Snapshot(user, snapshot));
+    device_ids[user] = snapshot.device_id;
+    CHECK(device_ids[user] != 0);
+    for (uint32_t earlier = 0; earlier < user; ++earlier) {
+      CHECK(device_ids[user] != device_ids[earlier]);
+    }
+    for (uint32_t button = 0; button < 4; ++button) {
+      CHECK(((static_cast<uint16_t>(state.gamepad.buttons) & guest_buttons[button]) != 0) ==
+            (button == user));
+    }
+  }
+
+  rex::input::X_INPUT_KEYSTROKE keystroke = {};
+  REQUIRE(fixture.driver.GetKeystroke(0, 0, &keystroke) == X_ERROR_SUCCESS);
+  CHECK(keystroke.virtual_key == static_cast<uint16_t>(rex::ui::VirtualKey::kXInputPadA));
+  CHECK((keystroke.flags & rex::input::X_INPUT_KEYSTROKE_KEYDOWN) != 0);
+
+  // Rumble must follow the same guest port without touching any other pad.
+  for (uint32_t user = 0; user < 4; ++user) {
+    std::array<uint32_t, 4> calls_before = {};
+    for (size_t i = 0; i < rumble_records.size(); ++i) {
+      calls_before[i] = rumble_records[i].calls;
+    }
+    X_INPUT_VIBRATION vibration = {};
+    vibration.left_motor_speed = static_cast<uint16_t>(0x1100 + user);
+    vibration.right_motor_speed = static_cast<uint16_t>(0x2200 + user);
+    REQUIRE(fixture.driver.SetState(user, &vibration) == X_ERROR_SUCCESS);
+    for (uint32_t controller = 0; controller < 4; ++controller) {
+      CHECK(rumble_records[controller].calls ==
+            calls_before[controller] + (controller == user ? 1u : 0u));
+    }
+    CHECK(rumble_records[user].left == vibration.left_motor_speed);
+    CHECK(rumble_records[user].right == vibration.right_motor_speed);
+  }
+
+  // An intentional assignment swaps the complete physical devices, while all
+  // other ports remain unchanged.
+  std::array<uint32_t, 4> calls_before_swap = {};
+  for (size_t i = 0; i < rumble_records.size(); ++i) {
+    calls_before_swap[i] = rumble_records[i].calls;
+  }
+  REQUIRE(fixture.driver.SwapControllerSlots(0, 2, device_ids[0]) == X_ERROR_SUCCESS);
+  for (size_t controller = 0; controller < rumble_records.size(); ++controller) {
+    const bool swapped_controller = controller == 0 || controller == 2;
+    CHECK(rumble_records[controller].calls ==
+          calls_before_swap[controller] + (swapped_controller ? 1u : 0u));
+    if (swapped_controller) {
+      CHECK(rumble_records[controller].left == 0);
+      CHECK(rumble_records[controller].right == 0);
+    }
+  }
+  REQUIRE(fixture.driver.GetKeystroke(0, 0, &keystroke) == X_ERROR_SUCCESS);
+  CHECK(keystroke.virtual_key == static_cast<uint16_t>(rex::ui::VirtualKey::kXInputPadA));
+  CHECK((keystroke.flags & rex::input::X_INPUT_KEYSTROKE_KEYUP) != 0);
+  REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint32_t>(state.packet_number) > initial_packets[0]);
+  const uint32_t first_swapped_packet = static_cast<uint32_t>(state.packet_number);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_X) != 0);
+  REQUIRE(fixture.Poll(2, state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint32_t>(state.packet_number) > initial_packets[2]);
+  const uint32_t third_swapped_packet = static_cast<uint32_t>(state.packet_number);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_A) != 0);
+  REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_B) != 0);
+  REQUIRE(fixture.Poll(3, state) == X_ERROR_SUCCESS);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_Y) != 0);
+
+  // A stale host snapshot cannot reassign the controller that replaced it.
+  CHECK(fixture.driver.SwapControllerSlots(0, 1, device_ids[0]) == X_ERROR_DEVICE_NOT_CONNECTED);
+  REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_X) != 0);
+
+  std::array<uint32_t, 4> swapped_rumble_calls = {};
+  for (size_t i = 0; i < rumble_records.size(); ++i) {
+    swapped_rumble_calls[i] = rumble_records[i].calls;
+  }
+  X_INPUT_VIBRATION swapped_vibration = {};
+  swapped_vibration.left_motor_speed = 0x3456;
+  REQUIRE(fixture.driver.SetState(0, &swapped_vibration) == X_ERROR_SUCCESS);
+  CHECK(rumble_records[2].calls == swapped_rumble_calls[2] + 1);
+  CHECK(rumble_records[2].left == swapped_vibration.left_motor_speed);
+  CHECK(rumble_records[0].calls == swapped_rumble_calls[0]);
+
+  REQUIRE(fixture.driver.SwapControllerSlots(0, 2, device_ids[2]) == X_ERROR_SUCCESS);
+  REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint32_t>(state.packet_number) > first_swapped_packet);
+  REQUIRE(fixture.Poll(2, state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint32_t>(state.packet_number) > third_swapped_packet);
+  CHECK(fixture.driver.SwapControllerSlots(0, 4) == X_ERROR_BAD_ARGUMENTS);
+
+  // Removing player 2 must leave players 1, 3 and 4 on their original ports.
+  gamepads[1]->Detach();
+  REQUIRE(fixture.PollDisconnected(1, state) == X_ERROR_DEVICE_NOT_CONNECTED);
+  for (uint32_t user : {0u, 2u, 3u}) {
+    REQUIRE(fixture.Poll(user, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & guest_buttons[user]) != 0);
+  }
+
+  // A deliberate move into an empty port preserves the physical controller,
+  // input and rumble association. An empty source is never allowed to pull a
+  // different destination controller backward.
+  CHECK(fixture.driver.SwapControllerSlots(1, 0) == X_ERROR_DEVICE_NOT_CONNECTED);
+  REQUIRE(fixture.driver.SwapControllerSlots(0, 1, device_ids[0]) == X_ERROR_SUCCESS);
+  REQUIRE(fixture.PollDisconnected(0, state) == X_ERROR_DEVICE_NOT_CONNECTED);
+  REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_A) != 0);
+  const uint32_t moved_rumble_calls = rumble_records[0].calls;
+  X_INPUT_VIBRATION moved_vibration = {};
+  moved_vibration.right_motor_speed = 0x4567;
+  REQUIRE(fixture.driver.SetState(1, &moved_vibration) == X_ERROR_SUCCESS);
+  CHECK(rumble_records[0].calls == moved_rumble_calls + 1);
+  CHECK(rumble_records[0].right == moved_vibration.right_motor_speed);
+  REQUIRE(fixture.driver.SwapControllerSlots(1, 0, device_ids[0]) == X_ERROR_SUCCESS);
+  REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_A) != 0);
+  REQUIRE(fixture.PollDisconnected(1, state) == X_ERROR_DEVICE_NOT_CONNECTED);
+
+  RumbleRecord replacement_rumble;
+  VirtualGamepad replacement(&replacement_rumble);
+  replacement.SetButton(SDL_GAMEPAD_BUTTON_START, true);
+  replacement.Commit();
+  REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint32_t>(state.packet_number) > initial_packets[1]);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_START) != 0);
+
+  // Filling player 2 still must not renumber established players.
+  for (uint32_t user : {0u, 2u, 3u}) {
+    REQUIRE(fixture.Poll(user, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & guest_buttons[user]) != 0);
+  }
+}
+
+TEST_CASE("SDL waiting controller fills only a vacated multiplayer port",
+          "[input][sdl][multiplayer]") {
+  SDLDriverFixture fixture;
+  std::vector<std::unique_ptr<VirtualGamepad>> gamepads;
+  gamepads.reserve(5);
+  for (size_t i = 0; i < 5; ++i) {
+    gamepads.push_back(std::make_unique<VirtualGamepad>());
+  }
+
+  gamepads[0]->SetButton(SDL_GAMEPAD_BUTTON_SOUTH, true);
+  gamepads[1]->SetButton(SDL_GAMEPAD_BUTTON_EAST, true);
+  gamepads[2]->SetButton(SDL_GAMEPAD_BUTTON_WEST, true);
+  gamepads[3]->SetButton(SDL_GAMEPAD_BUTTON_NORTH, true);
+  gamepads[4]->SetButton(SDL_GAMEPAD_BUTTON_START, true);
+  for (auto& gamepad : gamepads) {
+    gamepad->Commit();
+  }
+
+  constexpr std::array<uint16_t, 4> original_buttons = {
+      X_INPUT_GAMEPAD_A,
+      X_INPUT_GAMEPAD_B,
+      X_INPUT_GAMEPAD_X,
+      X_INPUT_GAMEPAD_Y,
+  };
+  X_INPUT_STATE state = {};
+  uint64_t old_player_two_device = 0;
+  uint32_t old_player_two_packet = 0;
+  for (uint32_t user = 0; user < 4; ++user) {
+    REQUIRE(fixture.Poll(user, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & original_buttons[user]) != 0);
+    if (user == 1) {
+      old_player_two_packet = static_cast<uint32_t>(state.packet_number);
+      rex::input::ControllerSnapshot snapshot;
+      REQUIRE(fixture.Snapshot(user, snapshot));
+      old_player_two_device = snapshot.device_id;
+    }
+  }
+
+  // The fifth controller is connected but initially has no guest port. When
+  // player 2 disconnects it claims only that vacancy; players 1, 3 and 4 keep
+  // their established identities.
+  gamepads[1]->Detach();
+  REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint32_t>(state.packet_number) > old_player_two_packet);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_START) != 0);
+  rex::input::ControllerSnapshot replacement_snapshot;
+  REQUIRE(fixture.Snapshot(1, replacement_snapshot));
+  CHECK(replacement_snapshot.device_id != old_player_two_device);
+  CHECK(fixture.driver.SwapControllerSlots(1, 0, old_player_two_device) ==
+        X_ERROR_DEVICE_NOT_CONNECTED);
+  REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+  CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_START) != 0);
+  for (uint32_t user : {0u, 2u, 3u}) {
+    REQUIRE(fixture.Poll(user, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & original_buttons[user]) != 0);
+  }
+}
+
+TEST_CASE("SDL gamepad lifecycle clears and rediscovers controller ports", "[input][sdl]") {
+  SDLDriverFixture fixture;
+  std::vector<std::unique_ptr<VirtualGamepad>> gamepads;
+  gamepads.reserve(4);
+  for (size_t i = 0; i < 4; ++i) {
+    gamepads.push_back(std::make_unique<VirtualGamepad>());
+  }
   gamepads.back()->SetButton(SDL_GAMEPAD_BUTTON_NORTH, true);
   gamepads.back()->Commit();
 
@@ -305,12 +664,6 @@ TEST_CASE("SDL gamepad hotplug promotes waiting devices into guest slots", "[inp
   for (uint32_t user = 0; user < 4; ++user) {
     REQUIRE(fixture.Poll(user, state) == X_ERROR_SUCCESS);
   }
-
-  // The fifth controller is connected but initially has no guest slot. Once
-  // player 1 disconnects, the remaining slots compact and it fills slot 4.
-  gamepads.front()->Detach();
-  REQUIRE(fixture.Poll(3, state) == X_ERROR_SUCCESS);
-  CHECK((state.gamepad.buttons & X_INPUT_GAMEPAD_Y) != 0);
 
   for (auto& gamepad : gamepads) {
     gamepad->Detach();
@@ -385,8 +738,12 @@ TEST_CASE("SDL controller snapshot remains live while guest input is suppressed"
   REXCVAR_SET(controller_invert_y, true);
 
   SDLDriverFixture fixture;
-  bool active = false;
-  fixture.driver.set_is_active_callback([&active] { return active; });
+  std::atomic<uint32_t> active_callback_calls{0};
+  fixture.driver.set_is_active_callback([&active_callback_calls] {
+    active_callback_calls.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  });
+  fixture.driver.OnInputActiveChanged(false);
   VirtualGamepad gamepad;
   gamepad.SetButton(SDL_GAMEPAD_BUTTON_SOUTH, true);
   gamepad.SetAxis(SDL_GAMEPAD_AXIS_LEFTX, 3000);
@@ -404,11 +761,47 @@ TEST_CASE("SDL controller snapshot remains live while guest input is suppressed"
   CHECK(snapshot.gamepad.thumb_lx == 0);
   CHECK(snapshot.gamepad.thumb_rx == 24000);
   CHECK(snapshot.gamepad.thumb_ry > 0);
+  CHECK(active_callback_calls.load(std::memory_order_relaxed) == 0);
 
   X_INPUT_STATE guest_state = {};
   REQUIRE(fixture.Poll(0, guest_state) == X_ERROR_SUCCESS);
+  CHECK(active_callback_calls.load(std::memory_order_relaxed) != 0);
   CHECK(guest_state.gamepad.buttons == 0);
   CHECK(guest_state.gamepad.thumb_rx == 0);
+}
+
+TEST_CASE("SDL snapshot samples focus when attaching to an unfocused window",
+          "[input][sdl][controller]") {
+  REQUIRE(SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, "0xCAFE/0x0001"));
+
+  TestAppContext context;
+  TestWindow window(context);
+  CHECK_FALSE(window.HasFocus());
+
+  rex::input::sdl::SDLInputDriver driver(nullptr, 0);
+  REQUIRE(driver.Setup() == X_STATUS_SUCCESS);
+  driver.OnWindowAvailable(&window);
+  struct Cleanup {
+    rex::input::sdl::SDLInputDriver& driver;
+    ~Cleanup() {
+      driver.OnWindowUnavailable();
+      SDL_ResetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);
+    }
+  } cleanup{driver};
+
+  VirtualGamepad gamepad;
+  gamepad.Commit();
+
+  rex::input::ControllerSnapshot snapshot;
+  bool found = false;
+  for (int attempt = 0; attempt < 8 && !found; ++attempt) {
+    SDL_PumpEvents();
+    context.ExecutePendingFunctionsFromUIThread();
+    found = driver.GetControllerSnapshot(0, &snapshot);
+  }
+  REQUIRE(found);
+  CHECK(snapshot.connected);
+  CHECK_FALSE(snapshot.input_active);
 }
 
 TEST_CASE("SDL host rumble test respects enable and intensity settings",
@@ -433,12 +826,25 @@ TEST_CASE("SDL host rumble test respects enable and intensity settings",
   REQUIRE(fixture.Snapshot(0, snapshot));
   REQUIRE(snapshot.rumble_supported);
 
-  REQUIRE(fixture.driver.PlayControllerTestRumble(0) == X_ERROR_SUCCESS);
+  REQUIRE(fixture.driver.PlayControllerTestRumble(0, snapshot.device_id) == X_ERROR_SUCCESS);
   CHECK(rumble.left == 0x4800);
   CHECK(rumble.right == 0x4800);
 
+  gamepad.Detach();
+  RumbleRecord replacement_rumble;
+  VirtualGamepad replacement(&replacement_rumble);
+  CHECK(fixture.driver.PlayControllerTestRumble(0, snapshot.device_id) ==
+        X_ERROR_DEVICE_NOT_CONNECTED);
+  rex::input::ControllerSnapshot replacement_snapshot;
+  REQUIRE(fixture.Snapshot(0, replacement_snapshot));
+  REQUIRE(replacement_snapshot.device_id != snapshot.device_id);
+  REQUIRE(fixture.driver.PlayControllerTestRumble(0, replacement_snapshot.device_id) ==
+          X_ERROR_SUCCESS);
+  CHECK(replacement_rumble.left == 0x4800);
+  CHECK(replacement_rumble.right == 0x4800);
+
   REXCVAR_SET(controller_rumble_enabled, false);
-  REQUIRE(fixture.driver.PlayControllerTestRumble(0) ==
+  REQUIRE(fixture.driver.PlayControllerTestRumble(0, replacement_snapshot.device_id) ==
           X_ERROR_FUNCTION_FAILED);
 }
 
@@ -480,8 +886,8 @@ TEST_CASE("Controller rumble intensity scales both motors", "[input][sdl][contro
   CHECK(rex::input::controller::ScaleRumble(0xFFFF, 0.0) == 0);
   CHECK(rex::input::controller::ScaleRumble(0xFFFF, 0.5) == 0x8000);
   CHECK(rex::input::controller::ScaleRumble(0xFFFF, 1.0) == 0xFFFF);
-  CHECK(rex::input::controller::ScaleRumble(
-            0xFFFF, std::numeric_limits<double>::quiet_NaN()) == 0xFFFF);
+  CHECK(rex::input::controller::ScaleRumble(0xFFFF, std::numeric_limits<double>::quiet_NaN()) ==
+        0xFFFF);
 }
 
 TEST_CASE("Controller layout presets route axes and southpaw stick clicks",
@@ -522,35 +928,27 @@ TEST_CASE("Controller layout presets route axes and southpaw stick clicks",
 TEST_CASE("Controller button map parsing is strict and canonical",
           "[input][sdl][controller][mapping]") {
   rex::input::controller::ButtonBindings bindings;
-  REQUIRE(rex::input::controller::ParseButtonBindings(
-      " a=b, rt=lb, x=none ", &bindings));
-  CHECK(rex::input::controller::SerializeButtonBindings(bindings) ==
-        "a=b,x=none,rt=lb");
+  REQUIRE(rex::input::controller::ParseButtonBindings(" a=b, rt=lb, x=none ", &bindings));
+  CHECK(rex::input::controller::SerializeButtonBindings(bindings) == "a=b,x=none,rt=lb");
 
   rex::input::controller::ButtonBindings round_trip;
   REQUIRE(rex::input::controller::ParseButtonBindings(
       rex::input::controller::SerializeButtonBindings(bindings), &round_trip));
   CHECK(round_trip.sources == bindings.sources);
 
-  CHECK_FALSE(rex::input::controller::ParseButtonBindings(
-      "a=b,a=x", &round_trip));
-  CHECK_FALSE(rex::input::controller::ParseButtonBindings(
-      "guide=a", &round_trip));
-  CHECK_FALSE(rex::input::controller::ParseButtonBindings(
-      "a=guide", &round_trip));
-  CHECK_FALSE(rex::input::controller::ParseButtonBindings(
-      "a=b,", &round_trip));
+  CHECK_FALSE(rex::input::controller::ParseButtonBindings("a=b,a=x", &round_trip));
+  CHECK_FALSE(rex::input::controller::ParseButtonBindings("guide=a", &round_trip));
+  CHECK_FALSE(rex::input::controller::ParseButtonBindings("a=guide", &round_trip));
+  CHECK_FALSE(rex::input::controller::ParseButtonBindings("a=b,", &round_trip));
 }
 
 TEST_CASE("Controller remapping supports buttons triggers and unbound inputs",
           "[input][sdl][controller][mapping]") {
   rex::input::controller::ButtonBindings bindings;
-  REQUIRE(rex::input::controller::ParseButtonBindings(
-      "a=b,b=a,x=lt,y=none,lt=rb", &bindings));
+  REQUIRE(rex::input::controller::ParseButtonBindings("a=b,b=a,x=lt,y=none,lt=rb", &bindings));
 
   rex::input::X_INPUT_GAMEPAD source = {};
-  source.buttons = rex::input::X_INPUT_GAMEPAD_B |
-                   rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER |
+  source.buttons = rex::input::X_INPUT_GAMEPAD_B | rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER |
                    rex::input::X_INPUT_GAMEPAD_GUIDE;
   source.left_trigger = 31;
   const auto mapped = rex::input::controller::ApplyMapping(
@@ -573,17 +971,14 @@ TEST_CASE("Controller UI assignment swaps conflicting physical sources",
   using rex::input::controller::ResolveSource;
 
   ButtonBindings bindings;
-  REQUIRE(AssignSourceWithSwap(Layout::kModern, &bindings, Control::kA,
-                               Control::kB));
+  REQUIRE(AssignSourceWithSwap(Layout::kModern, &bindings, Control::kA, Control::kB));
   CHECK(ResolveSource(Layout::kModern, bindings, Control::kA) == Control::kB);
   CHECK(ResolveSource(Layout::kModern, bindings, Control::kB) == Control::kA);
-  CHECK(rex::input::controller::SerializeButtonBindings(bindings) ==
-        "a=b,b=a");
+  CHECK(rex::input::controller::SerializeButtonBindings(bindings) == "a=b,b=a");
 
   rex::input::X_INPUT_GAMEPAD source = {};
   source.buttons = rex::input::X_INPUT_GAMEPAD_B;
-  const auto mapped = rex::input::controller::ApplyMapping(
-      source, Layout::kModern, bindings);
+  const auto mapped = rex::input::controller::ApplyMapping(source, Layout::kModern, bindings);
   CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_A) != 0);
   CHECK((mapped.buttons & rex::input::X_INPUT_GAMEPAD_B) == 0);
 }
@@ -653,6 +1048,5 @@ TEST_CASE("SDL hot-reloads mapped state consistently for state snapshot and keys
 
   rex::input::X_INPUT_KEYSTROKE keystroke = {};
   REQUIRE(fixture.driver.GetKeystroke(0, 0, &keystroke) == X_ERROR_SUCCESS);
-  CHECK(keystroke.virtual_key == static_cast<uint16_t>(
-                                      rex::ui::VirtualKey::kXInputPadA));
+  CHECK(keystroke.virtual_key == static_cast<uint16_t>(rex::ui::VirtualKey::kXInputPadA));
 }

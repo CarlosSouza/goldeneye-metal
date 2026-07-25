@@ -79,6 +79,74 @@ namespace detail {
 
 inline constexpr size_t kToolCount = static_cast<size_t>(Tool::kCount);
 inline constexpr size_t kCheatCount = 14;
+inline constexpr uint32_t kLocalMultiplayerStablePolls = 120;
+inline constexpr uint32_t kTitleMenuStateAddress = 0x8272B35Cu;
+inline constexpr uint32_t kLocalMultiplayerJoinedCountAddress = 0x82F6107Cu;
+inline constexpr uint32_t kTitleReadyMenuState = 5;
+inline constexpr uint32_t kDossierMenuState = 7;
+inline constexpr uint32_t kCreateLocalGameMenuState = 15;
+inline constexpr uint32_t kMultiplayerModesMenuState = 27;
+
+constexpr const char* TitleMenuStateName(uint32_t state) noexcept {
+  switch (state) {
+    case kTitleReadyMenuState:
+      return "title-ready";
+    case kDossierMenuState:
+      return "dossier";
+    case kCreateLocalGameMenuState:
+      return "create-local-game";
+    case kMultiplayerModesMenuState:
+      return "multiplayer-modes";
+    default:
+      return "other";
+  }
+}
+
+class LocalMultiplayerReadinessTracker {
+ public:
+  // Returns true once when an offline 2-4 player match has remained on the
+  // same level with the same player count for the required number of polls.
+  bool Observe(int32_t level_id, int32_t player_count, bool network_session) noexcept {
+    const bool eligible =
+        level_id > 0 && level_id < 90 && player_count >= 2 && player_count <= 4 && !network_session;
+    if (!eligible) {
+      Reset();
+      return false;
+    }
+
+    if (level_id != level_id_ || player_count != player_count_) {
+      level_id_ = level_id;
+      player_count_ = player_count;
+      stable_polls_ = 0;
+      reported_ = false;
+    }
+    if (reported_) {
+      return false;
+    }
+    if (++stable_polls_ < kLocalMultiplayerStablePolls) {
+      return false;
+    }
+    reported_ = true;
+    return true;
+  }
+
+  int32_t level_id() const noexcept { return level_id_; }
+  int32_t player_count() const noexcept { return player_count_; }
+  uint32_t stable_polls() const noexcept { return stable_polls_; }
+
+ private:
+  void Reset() noexcept {
+    level_id_ = -1;
+    player_count_ = 0;
+    stable_polls_ = 0;
+    reported_ = false;
+  }
+
+  int32_t level_id_ = -1;
+  int32_t player_count_ = 0;
+  uint32_t stable_polls_ = 0;
+  bool reported_ = false;
+};
 
 constexpr size_t ToolIndex(Tool tool) noexcept {
   return static_cast<size_t>(tool);

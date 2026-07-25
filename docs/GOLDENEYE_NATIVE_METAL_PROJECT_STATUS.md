@@ -23,6 +23,8 @@ Working now:
 - Native launcher with game-data import and verification
 - Save management, crash recovery, Safe Mode and diagnostic export
 - Controller presets, remapping, rumble and live input testing
+- Stable P1-P4 controller ports with live testing and manual reassignment
+- Verified 2–4 player local split-screen joins and Metal viewport layouts
 - Proper pause while host settings are open
 - Testing page with all 14 verified runtime cheats
 - Signed and notarized macOS 14+ packaging
@@ -53,7 +55,7 @@ Lower-power Macs still need focused testing.
   sequence; unknown variants fall back safely instead of being guessed.
 - Visual and stability coverage beyond Dam is still limited.
 - Physical controller testing is incomplete across every supported model.
-- Reliable 2–4 player split-screen validation is still ongoing.
+- Longer split-screen matches still need broad physical-controller testing.
 
 ## Next priorities
 

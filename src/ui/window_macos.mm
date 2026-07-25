@@ -402,6 +402,8 @@ class MacOSWindow final : public Window {
 
   void ApplyNewMouseRelease() override { ApplyPlatformMouseState(); }
 
+  bool IsMouseCaptureActiveImpl() const override { return mouse_disassociated_; }
+
   void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override {
     (void)old_cursor_visibility;
     ApplyPlatformMouseState();

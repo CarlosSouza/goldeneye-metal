@@ -139,6 +139,14 @@ address = 0x823B25E4
 name = "ge_inject_keyboard"
 registers = ["r11"]
 after_instruction = true
+# Sample after GoldenEye has dispatched all four staged pad records. This
+# distinguishes input that reached the title's consumers from a merely populated
+# staging buffer.
+[[midasm_hook]]
+address = 0x823B26FC
+name = "ge_observe_dispatched_player_input"
+registers = []
+after_instruction = false
 # Dam crash recovery: sub_823DFB70 asks a resource object for its packed-data
 # buffer through two vtable+16 calls. A destroyed/base-state resource can point
 # that slot at the title's pure-virtual handler. Intercept only that exact
@@ -171,6 +179,30 @@ name = "ge_guard_packed_data_value"
 registers = ["r3", "r30", "r31", "r1"]
 after_instruction = false
 jump_address_on_true = 0x823DFBDC
+# The reported Facility freeze strands sub_823E4B60's critical section after
+# one of its two virtual callbacks returns with PPC nonvolatile state damaged.
+# These two return addresses are straight-line-only, so every restore is paired
+# with an executed dispatch (unlike other family members with shared joins).
+[[midasm_hook]]
+address = 0x823E4BA8
+name = "ge_audio_callback_enter_823E4BA8"
+registers = ["r1", "r27", "r28", "r29", "r30", "r31", "f31", "r3", "r11"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x823E4BAC
+name = "ge_audio_callback_leave"
+registers = ["r1", "r27", "r28", "r29", "r30", "r31", "f31"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x823E4BDC
+name = "ge_audio_callback_enter_823E4BDC"
+registers = ["r1", "r27", "r28", "r29", "r30", "r31", "f31", "r3", "r11"]
+after_instruction = false
+[[midasm_hook]]
+address = 0x823E4BE0
+name = "ge_audio_callback_leave"
+registers = ["r1", "r27", "r28", "r29", "r30", "r31", "f31"]
+after_instruction = false
 # Dam cleanup-worker crash recovery: sub_823CFC00 keeps its owner, lock
 # addresses, and intrusive-list cursors in ABI-nonvolatile registers. Either
 # virtual cleanup callback can return with that state clobbered. Preserve all

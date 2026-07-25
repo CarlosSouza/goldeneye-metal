@@ -15,6 +15,7 @@
 #include <string>
 
 #include <rex/platform.h>
+#include <rex/system/critical_section_ledger.h>
 #include <rex/thread/fiber.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/util/native_list.h>
@@ -376,6 +377,10 @@ class XThread : public XObject {
 
   rex::thread::Thread* thread() { return thread_.get(); }
   runtime::ThreadState* thread_state() { return thread_state_.get(); }
+  CriticalSectionOwnershipLedger& critical_section_ledger() { return critical_section_ledger_; }
+  const CriticalSectionOwnershipLedger& critical_section_ledger() const {
+    return critical_section_ledger_;
+  }
 
   virtual bool Save(stream::ByteStream* stream) override;
   static object_ref<XThread> Restore(KernelState* kernel_state, stream::ByteStream* stream);
@@ -415,6 +420,7 @@ class XThread : public XObject {
 
   std::string thread_name_;
   std::unique_ptr<runtime::ThreadState> thread_state_;
+  CriticalSectionOwnershipLedger critical_section_ledger_;
 
   int32_t priority_ = 0;
 

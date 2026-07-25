@@ -95,7 +95,7 @@ Working today:
 
 - the classification, gun-barrel, RARE, menu, briefing, and first Dam gameplay sequences;
 - native Metal presentation on Apple Silicon;
-- native keyboard/mouse input, modern gamepads, layout presets, and button remapping;
+- native keyboard/mouse input, stable P1–P4 gamepad ports, local split-screen, presets, and remapping;
 - a local game-data importer, crash-aware Safe Mode, save management, true local-mission pause,
   and diagnostic export;
 - live performance presets, MetalFX/Sharp output scaling, filtering, FXAA and colour controls;

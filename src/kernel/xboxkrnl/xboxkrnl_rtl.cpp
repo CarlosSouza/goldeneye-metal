@@ -50,6 +50,12 @@ bool ShouldLogCriticalSectionDebug() {
          g_critical_section_debug_logs.fetch_add(1, std::memory_order_relaxed) <
              kCriticalSectionDebugLogLimit;
 }
+
+uint32_t CurrentGuestReturnAddress(rex::system::XThread* thread) {
+  auto* thread_state = thread ? thread->thread_state() : nullptr;
+  auto* context = thread_state ? thread_state->context() : nullptr;
+  return context ? static_cast<uint32_t>(context->lr) : 0;
+}
 }  // namespace
 using namespace rex::system;
 
@@ -426,6 +432,13 @@ bool QueryRtlCriticalSectionDebugInfo(uint32_t guest_address,
   return true;
 }
 
+bool QueryRtlCriticalSectionOwnershipDebugInfo(const rex::system::XThread* owner_thread,
+                                               uint32_t guest_address,
+                                               RtlCriticalSectionOwnershipDebugInfo* out_info) {
+  return owner_thread && out_info &&
+         owner_thread->critical_section_ledger().Query(guest_address, out_info);
+}
+
 void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr) {
   cs->header.type = 1;      // EventSynchronizationObject (auto reset)
   cs->header.absolute = 0;  // spin count div 256
@@ -467,6 +480,7 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   auto* current_xthread = XThread::GetCurrentThread();
   uint32_t cur_thread = current_xthread->guest_object();
+  const uint32_t enter_lr = CurrentGuestReturnAddress(current_xthread);
   uint32_t spin_count = cs->header.absolute * 256;
 
   // Some embedded/static guest critical sections can appear as an orphaned
@@ -497,6 +511,8 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
     // We already own the lock.
     rex::thread::atomic_inc(&cs->lock_count);
     cs->recursion_count++;
+    current_xthread->critical_section_ledger().RecordEnter(
+        cs.guest_address(), enter_lr, static_cast<int32_t>(cs->recursion_count));
     return;
   }
 
@@ -506,6 +522,7 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
       // Acquired.
       cs->owning_thread = cur_thread;
       cs->recursion_count = 1;
+      current_xthread->critical_section_ledger().RecordEnter(cs.guest_address(), enter_lr, 1);
       return;
     }
   }
@@ -546,20 +563,26 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   }
   cs->owning_thread = cur_thread;
   cs->recursion_count = 1;
+  current_xthread->critical_section_ledger().RecordEnter(cs.guest_address(), enter_lr, 1);
 }
 
 u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  uint32_t thread = XThread::GetCurrentThread()->guest_object();
+  auto* current_xthread = XThread::GetCurrentThread();
+  uint32_t thread = current_xthread->guest_object();
+  const uint32_t enter_lr = CurrentGuestReturnAddress(current_xthread);
 
   if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
     // Able to steal the lock right away.
     cs->owning_thread = thread;
     cs->recursion_count = 1;
+    current_xthread->critical_section_ledger().RecordEnter(cs.guest_address(), enter_lr, 1);
     return 1;
   } else if (cs->owning_thread == thread) {
     // Already own the lock.
     rex::thread::atomic_inc(&cs->lock_count);
     ++cs->recursion_count;
+    current_xthread->critical_section_ledger().RecordEnter(
+        cs.guest_address(), enter_lr, static_cast<int32_t>(cs->recursion_count));
     return 1;
   }
 
@@ -570,7 +593,14 @@ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   auto* current_xthread = XThread::GetCurrentThread();
   uint32_t cur_thread = current_xthread->guest_object();
-  if (cs->owning_thread != cur_thread) {
+  const uint32_t leave_lr = CurrentGuestReturnAddress(current_xthread);
+  const uint32_t observed_owner = cs->owning_thread;
+  const int32_t observed_recursion = static_cast<int32_t>(cs->recursion_count);
+  const bool owner_mismatch = observed_owner != cur_thread;
+  if (owner_mismatch) {
+    current_xthread->critical_section_ledger().RecordLeaveMismatch(
+        cs.guest_address(), leave_lr, cur_thread, observed_owner, observed_recursion,
+        rex::system::CriticalSectionLeaveMismatchReason::kGuestOwnerMismatch);
     if (ShouldLogCriticalSectionDebug()) {
       REXKRNL_INFO(
           "RtlLeaveCriticalSection owner mismatch cs={:08X} cur_thread={:08X} "
@@ -591,6 +621,12 @@ void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   // Drop recursion count - if it isn't zero we still have the lock.
   if (cs->recursion_count <= 0) {
+    if (!owner_mismatch) {
+      current_xthread->critical_section_ledger().RecordLeaveMismatch(
+          cs.guest_address(), leave_lr, cur_thread, observed_owner,
+          static_cast<int32_t>(cs->recursion_count),
+          rex::system::CriticalSectionLeaveMismatchReason::kInvalidGuestRecursion);
+    }
     if (ShouldLogCriticalSectionDebug()) {
       REXKRNL_INFO(
           "RtlLeaveCriticalSection repaired empty recursion cs={:08X} thread={:08X} "
@@ -605,6 +641,11 @@ void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   }
   --cs->recursion_count;
   if (cs->recursion_count < 0) {
+    if (!owner_mismatch) {
+      current_xthread->critical_section_ledger().RecordLeaveMismatch(
+          cs.guest_address(), leave_lr, cur_thread, observed_owner, observed_recursion,
+          rex::system::CriticalSectionLeaveMismatchReason::kInvalidGuestRecursion);
+    }
     if (ShouldLogCriticalSectionDebug()) {
       REXKRNL_INFO(
           "RtlLeaveCriticalSection repaired negative recursion cs={:08X} thread={:08X} "
@@ -619,12 +660,22 @@ void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   }
   if (cs->recursion_count != 0) {
     rex::thread::atomic_dec(&cs->lock_count);
+    if (!owner_mismatch) {
+      current_xthread->critical_section_ledger().RecordLeave(
+          cs.guest_address(), leave_lr, cur_thread, observed_owner, observed_recursion,
+          static_cast<int32_t>(cs->recursion_count));
+    }
     return;
   }
 
   // Not owned - unlock!
   cs->owning_thread = 0;
-  if (rex::thread::atomic_dec(&cs->lock_count) != -1) {
+  const int32_t decremented_lock_count = rex::thread::atomic_dec(&cs->lock_count);
+  if (!owner_mismatch) {
+    current_xthread->critical_section_ledger().RecordLeave(cs.guest_address(), leave_lr, cur_thread,
+                                                           observed_owner, observed_recursion, 0);
+  }
+  if (decremented_lock_count != -1) {
     // There were waiters - wake one of them.
     if (ShouldLogCriticalSectionDebug()) {
       REXKRNL_INFO(

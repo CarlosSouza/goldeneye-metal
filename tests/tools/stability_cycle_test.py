@@ -25,7 +25,12 @@ SPEC.loader.exec_module(stability)
 class StabilityCycleTest(unittest.TestCase):
     def test_cli_rejects_non_finite_timeout(self):
         result = subprocess.run(
-            [sys.executable, str(ROOT / "tools/stability-cycle.py"), "--ready-timeout", "nan"],
+            [
+                sys.executable,
+                str(ROOT / "tools/stability-cycle.py"),
+                "--ready-timeout",
+                "nan",
+            ],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -69,6 +74,235 @@ class StabilityCycleTest(unittest.TestCase):
                 except ProcessLookupError:
                     pass
                 process.wait(timeout=3)
+
+    def test_local_multiplayer_uses_only_virtual_sdl_controller_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = type(
+                "Args",
+                (),
+                {
+                    "mode": "local-multiplayer",
+                    "players": 2,
+                    "runtime_dir": root / "runtime",
+                },
+            )()
+            old_environment = {
+                name: os.environ.get(name)
+                for name in (
+                    "GOLDENEYE_AUTO_START",
+                    "GOLDENEYE_AUTO_MISSION",
+                    "GOLDENEYE_TEST_MENU_TRACE",
+                    "REX_INPUT_TEST_HARNESS",
+                )
+            }
+            os.environ["GOLDENEYE_AUTO_START"] = "periodic"
+            os.environ["GOLDENEYE_AUTO_MISSION"] = "dam"
+            os.environ["REX_INPUT_TEST_HARNESS"] = "unexpected"
+            try:
+                environment = stability.build_environment(
+                    args,
+                    root / "cycle",
+                    virtual_gamepad_fd=17,
+                )
+            finally:
+                for name, value in old_environment.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+            self.assertEqual(environment["REX_INPUT_BACKEND"], "sdl")
+            self.assertEqual(environment["REX_INPUT_TEST_HARNESS"], "1")
+            self.assertEqual(environment["REX_TEST_VIRTUAL_GAMEPADS"], "2")
+            self.assertEqual(environment["REX_TEST_VIRTUAL_GAMEPAD_FD"], "17")
+            self.assertEqual(environment["GOLDENEYE_TEST_MENU_TRACE"], "1")
+            self.assertNotIn("GOLDENEYE_AUTO_START", environment)
+            self.assertNotIn("GOLDENEYE_AUTO_MISSION", environment)
+
+            log_path = root / "raw.log"
+            log_path.write_text("[vpad] READY pads=2\n", encoding="utf-8")
+
+            def append_log(*lines):
+                with log_path.open("a", encoding="utf-8") as stream:
+                    stream.write("\n".join(lines) + "\n")
+
+            read_fd, write_fd = os.pipe()
+            os.set_blocking(read_fd, False)
+            driver = stability.LocalMultiplayerInputDriver(2, write_fd)
+            driver.advance(log_path, 10.0)
+            with self.assertRaises(BlockingIOError):
+                os.read(read_fd, 4096)
+
+            append_log("[ge-test] menu state=5 name=title-ready joined=0")
+            driver.advance(log_path, 10.3)
+            self.assertEqual(
+                os.read(read_fd, 4096).decode("ascii"),
+                "PULSE_BUTTON 1 1 START 250\n",
+            )
+
+            append_log(
+                "[vpad] ACK seq=1",
+                "[ge-test] menu state=7 name=dossier joined=0",
+            )
+            driver.advance(log_path, 11.1)
+            driver.advance(log_path, 11.9)
+            self.assertEqual(
+                os.read(read_fd, 4096).decode("ascii"),
+                "PULSE_AXIS 2 1 LY 32767 80\n",
+            )
+
+            append_log("[vpad] ACK seq=2")
+            driver.advance(log_path, 12.6)
+            self.assertEqual(
+                os.read(read_fd, 4096).decode("ascii"),
+                "PULSE_BUTTON 3 1 SOUTH 250\n",
+            )
+
+            append_log(
+                "[vpad] ACK seq=3",
+                "[ge-test] menu state=27 name=multiplayer-modes joined=0",
+            )
+            driver.advance(log_path, 13.3)
+            driver.advance(log_path, 14.1)
+            self.assertEqual(
+                os.read(read_fd, 4096).decode("ascii"),
+                "PULSE_AXIS 4 1 LY -32768 80\n",
+            )
+
+            append_log("[vpad] ACK seq=4")
+            driver.advance(log_path, 14.8)
+            self.assertEqual(
+                os.read(read_fd, 4096).decode("ascii"),
+                "PULSE_BUTTON 5 1 SOUTH 250\n",
+            )
+
+            append_log(
+                "[vpad] ACK seq=5",
+                "[ge-test] menu state=15 name=create-local-game joined=1",
+            )
+            driver.advance(log_path, 15.1)
+            driver.advance(log_path, 15.9)
+            self.assertEqual(
+                os.read(read_fd, 4096).decode("ascii"),
+                "PULSE_BUTTON 6 2 START 250\n",
+            )
+
+            append_log(
+                "[vpad] ACK seq=6",
+                "[ge-test] menu state=15 name=create-local-game joined=2",
+            )
+            driver.advance(log_path, 16.7)
+            self.assertEqual(
+                os.read(read_fd, 4096).decode("ascii"),
+                "PULSE_BUTTON 7 1 START 250\n",
+            )
+            append_log("[vpad] ACK seq=7")
+            driver.advance(log_path, 17.5)
+            driver.close()
+            os.close(read_fd)
+            self.assertTrue(driver.completed)
+            self.assertEqual(driver.phase, "waiting-for-match-readiness")
+            self.assertEqual(len(driver.sent), 7)
+
+            profile_lines = [
+                "[vpad] READY pads=2",
+                *[f"[vpad] ACK seq={sequence}" for sequence in range(1, 8)],
+                (
+                    "[ge] local multiplayer ready level=7 players=2 "
+                    "network=0 stable_polls=120"
+                ),
+                (
+                    "[metal-profile] window swaps=1-64 "
+                    "elapsed_ns=1066666688 avg_frame_ns=16666667 fps=60.0"
+                ),
+                (
+                    "[metal-profile] command swaps=1-64 event=draw calls=640 "
+                    "avg_calls_per_swap=10 total_ns=64000000 "
+                    "avg_ns_per_swap=1000000 max_call_ns=2000000 "
+                    "max_swap_ns=3000000"
+                ),
+                (
+                    "[metal-profile] command swaps=1-64 event=copy calls=64 "
+                    "avg_calls_per_swap=1 total_ns=32000000 "
+                    "avg_ns_per_swap=500000 max_call_ns=1000000 "
+                    "max_swap_ns=2000000"
+                ),
+                (
+                    "[metal-profile] command swaps=1-64 event=swap calls=64 "
+                    "avg_calls_per_swap=1 total_ns=16000000 "
+                    "avg_ns_per_swap=250000 max_call_ns=500000 "
+                    "max_swap_ns=500000"
+                ),
+                (
+                    "[metal-profile] command swaps=1-64 event=wait_reg_mem "
+                    "calls=64 avg_calls_per_swap=1 total_ns=8000000 "
+                    "avg_ns_per_swap=125000 max_call_ns=250000 "
+                    "max_swap_ns=250000"
+                ),
+                (
+                    "[metal-profile] wait-reg-mem swaps=1-64 rank=1 "
+                    "source=memory unmatched=0 timeouts=0"
+                ),
+            ]
+            log_path.write_text("\n".join(profile_lines) + "\n", encoding="utf-8")
+            ready, details = stability.readiness(
+                "local-multiplayer", log_path, 40.0, 0.0, 0, 1, 2, 7
+            )
+            self.assertTrue(ready, details)
+            self.assertEqual(details["local_multiplayer"]["players"], 2)
+
+            log_path.write_text(
+                "\n".join(line for line in profile_lines if line != "[vpad] ACK seq=6")
+                + "\n",
+                encoding="utf-8",
+            )
+            ready, details = stability.readiness(
+                "local-multiplayer", log_path, 40.0, 0.0, 0, 1, 2, 7
+            )
+            self.assertFalse(ready)
+            self.assertEqual(details["missing_virtual_gamepad_acks"], [6])
+
+    def test_local_multiplayer_stops_on_rejected_virtual_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "raw.log"
+            log_path.write_text(
+                "\n".join(
+                    (
+                        "[vpad] READY pads=2",
+                        (
+                            "[vpad] REJECT reason=invalid pulse duration "
+                            "command=PULSE_AXIS 2 1 LY 32767 0"
+                        ),
+                        "[vpad] ACK seq=3",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            read_fd, write_fd = os.pipe()
+            driver = stability.LocalMultiplayerInputDriver(2, write_fd)
+            try:
+                driver.last_sequence = 3
+                driver.advance(log_path, 1.0)
+                self.assertEqual(
+                    driver.error,
+                    "virtual-gamepad command 2 was rejected",
+                )
+                self.assertFalse(driver.completed)
+                self.assertFalse(driver._command_finished(10.0))
+            finally:
+                driver.close()
+                os.close(read_fd)
+
+    def test_binary_capability_scan_handles_chunk_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "binary"
+            marker = b"REX_TEST_VIRTUAL_GAMEPADS"
+            path.write_bytes(b"x" * (1024 * 1024 - 3) + marker)
+            self.assertTrue(stability.binary_contains(path, marker))
+            self.assertFalse(
+                stability.binary_contains(path, b"GOLDENEYE_TEST_MENU_TRACE")
+            )
 
     def test_cycle_uses_private_state_and_collects_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -141,7 +375,11 @@ class StabilityCycleTest(unittest.TestCase):
             environment = os.environ.copy()
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
             result = subprocess.run(
-                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
             )
             detail = result.stdout + result.stderr
             if (suite / "summary.txt").is_file():
@@ -154,15 +392,23 @@ class StabilityCycleTest(unittest.TestCase):
             for number in (1, 2):
                 cycle_root = suite / f"cycle-{number:03d}"
                 state_root = cycle_root / "user-data"
-                observed_roots = (state_root / "state-root-seen.txt").read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                observed_roots = (
+                    (state_root / "state-root-seen.txt")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                )
                 self.assertEqual(observed_roots[0], str(state_root.resolve()))
-                self.assertEqual(observed_roots[1], str((cycle_root / "cache").resolve()))
-                self.assertEqual(observed_roots[2], str((cycle_root / "home").resolve()))
+                self.assertEqual(
+                    observed_roots[1], str((cycle_root / "cache").resolve())
+                )
+                self.assertEqual(
+                    observed_roots[2], str((cycle_root / "home").resolve())
+                )
                 self.assertTrue((cycle_root / "raw.log").is_file())
                 self.assertTrue((cycle_root / "cycle.json").is_file())
-            self.assertEqual(sorted(path.name for path in game_data.iterdir()), ["default.xex"])
+            self.assertEqual(
+                sorted(path.name for path in game_data.iterdir()), ["default.xex"]
+            )
 
     def test_failure_logged_during_shutdown_fails_final_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -235,13 +481,21 @@ class StabilityCycleTest(unittest.TestCase):
                 timeout=15,
             )
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            cycle = json.loads((suite / "cycle-001/cycle.json").read_text(encoding="utf-8"))
+            cycle = json.loads(
+                (suite / "cycle-001/cycle.json").read_text(encoding="utf-8")
+            )
             self.assertFalse(cycle["final_profile_passed"])
             self.assertTrue(
-                any("GPU tiled resolve failed" in match for match in cycle["fatal_log_matches"])
+                any(
+                    "GPU tiled resolve failed" in match
+                    for match in cycle["fatal_log_matches"]
+                )
             )
             self.assertTrue(
-                any("final Metal profile validation failed" in failure for failure in cycle["failures"])
+                any(
+                    "final Metal profile validation failed" in failure
+                    for failure in cycle["failures"]
+                )
             )
 
     def test_menu_failure_logged_after_readiness_fails_final_profile(self):
@@ -310,10 +564,15 @@ class StabilityCycleTest(unittest.TestCase):
                 timeout=15,
             )
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            cycle = json.loads((suite / "cycle-001/cycle.json").read_text(encoding="utf-8"))
+            cycle = json.loads(
+                (suite / "cycle-001/cycle.json").read_text(encoding="utf-8")
+            )
             self.assertFalse(cycle["final_profile_passed"])
             self.assertTrue(
-                any("fallbacks=1" in failure for failure in cycle["final_profile_failures"]),
+                any(
+                    "fallbacks=1" in failure
+                    for failure in cycle["final_profile_failures"]
+                ),
                 cycle["final_profile_failures"],
             )
 

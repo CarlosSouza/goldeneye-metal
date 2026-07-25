@@ -587,6 +587,10 @@ void Win32Window::ApplyNewMouseRelease() {
   }
 }
 
+bool Win32Window::IsMouseCaptureActiveImpl() const {
+  return hwnd_ && GetCapture() == hwnd_;
+}
+
 void Win32Window::ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
   CursorVisibility new_cursor_visibility = GetCursorVisibility();
   cursor_currently_auto_hidden_ = false;

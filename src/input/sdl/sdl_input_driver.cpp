@@ -22,28 +22,26 @@
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
+#include "sdl_virtual_gamepad_harness.h"
+
 REXCVAR_DEFINE_STRING(hid_mappings_file, "", "Input",
                       "Optional path to an additional SDL gamepad mappings file");
 REXCVAR_DEFINE_DOUBLE(controller_look_sensitivity, 1.0, "Input/Controller",
                       "Physical controller right-stick look sensitivity")
-    .range(rex::input::kControllerLookSensitivityMin,
-           rex::input::kControllerLookSensitivityMax);
+    .range(rex::input::kControllerLookSensitivityMin, rex::input::kControllerLookSensitivityMax);
 REXCVAR_DEFINE_DOUBLE(controller_move_deadzone, 0.0, "Input/Controller",
                       "Physical controller left-stick radial deadzone")
-    .range(rex::input::kControllerDeadzoneMin,
-           rex::input::kControllerDeadzoneMax);
+    .range(rex::input::kControllerDeadzoneMin, rex::input::kControllerDeadzoneMax);
 REXCVAR_DEFINE_DOUBLE(controller_aim_deadzone, 0.0, "Input/Controller",
                       "Physical controller right-stick radial deadzone")
-    .range(rex::input::kControllerDeadzoneMin,
-           rex::input::kControllerDeadzoneMax);
+    .range(rex::input::kControllerDeadzoneMin, rex::input::kControllerDeadzoneMax);
 REXCVAR_DEFINE_BOOL(controller_invert_y, false, "Input/Controller",
                     "Invert physical controller vertical look");
 REXCVAR_DEFINE_BOOL(controller_rumble_enabled, true, "Input/Controller",
                     "Enable physical controller rumble");
 REXCVAR_DEFINE_DOUBLE(controller_rumble_intensity, 1.0, "Input/Controller",
                       "Physical controller rumble intensity")
-    .range(rex::input::kControllerRumbleIntensityMin,
-           rex::input::kControllerRumbleIntensityMax);
+    .range(rex::input::kControllerRumbleIntensityMin, rex::input::kControllerRumbleIntensityMax);
 REXCVAR_DEFINE_STRING(controller_layout, "modern", "Input/Controller",
                       "Physical controller layout preset")
     .allowed({"modern", "classic", "southpaw"});
@@ -161,6 +159,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     return;
   }
   attached_window_ = window;
+  has_focus_.store(window->HasFocus(), std::memory_order_release);
   window->AddListener(this);
   window->app_context().CallInUIThreadSynchronous([this]() {
     // Register the watch before gamepad initialization so already-connected
@@ -181,8 +180,15 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     }
     sdl_event_watch_registered_ = true;
 
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    test_virtual_gamepads_supply_input_.store(false, std::memory_order_release);
+    test_virtual_gamepads_ = SDLVirtualGamepadHarness::CreateFromEnvironment();
+#endif
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
       REXLOG_ERROR("SDL: Failed to init gamepad subsystem: {}", SDL_GetError());
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+      test_virtual_gamepads_.reset();
+#endif
       accepting_events_.store(false, std::memory_order_release);
       SDL_RemoveEventWatch(EventWatch, this);
       sdl_event_watch_registered_ = false;
@@ -191,6 +197,13 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       return;
     }
     SDL_Gamepad_initialized_ = true;
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    if (test_virtual_gamepads_ && !test_virtual_gamepads_->Attach()) {
+      REXLOG_ERROR("[vpad] virtual controller harness could not start");
+      test_virtual_gamepads_.reset();
+    }
+#endif
 
     // Load custom controller mappings if available
     if (!REXCVAR_GET(hid_mappings_file).empty()) {
@@ -215,7 +228,28 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     // instance is idempotent below.
     {
       std::lock_guard guard(controllers_mutex_);
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+      if (test_virtual_gamepads_) {
+        for (SDL_JoystickID instance_id : test_virtual_gamepads_->instance_ids()) {
+          OpenControllerLocked(instance_id);
+        }
+      }
+#endif
       OpenUnassignedControllersLocked();
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+      if (test_virtual_gamepads_) {
+        const bool all_assigned = std::all_of(
+            test_virtual_gamepads_->instance_ids().begin(),
+            test_virtual_gamepads_->instance_ids().end(), [this](SDL_JoystickID instance_id) {
+              return GetControllerIndexFromInstanceID(instance_id).has_value();
+            });
+        if (all_assigned && test_virtual_gamepads_->ReportDriverReady()) {
+          test_virtual_gamepads_supply_input_.store(true, std::memory_order_release);
+        } else {
+          REXLOG_ERROR("[vpad] FAILED virtual controllers did not occupy every guest port");
+        }
+      }
+#endif
     }
     ready_.store(true, std::memory_order_release);
     REXLOG_INFO("SDL gamepad input initialized successfully");
@@ -233,6 +267,7 @@ void SDLInputDriver::OnWindowUnavailable() {
     return;
   }
   ready_.store(false, std::memory_order_release);
+  has_focus_.store(false, std::memory_order_release);
   attached_window_ = nullptr;
   window->RemoveListener(this);
   accepting_events_.store(false, std::memory_order_release);
@@ -256,6 +291,10 @@ void SDLInputDriver::OnWindowUnavailable() {
     }
     keystroke_states_ = {};
   }
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  test_virtual_gamepads_supply_input_.store(false, std::memory_order_release);
+  test_virtual_gamepads_.reset();
+#endif
   {
     std::lock_guard guard(event_queue_mutex_);
     pending_events_.clear();
@@ -272,12 +311,16 @@ void SDLInputDriver::OnWindowUnavailable() {
 }
 
 void SDLInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+  has_focus_.store(false, std::memory_order_release);
   StopRumble();
 }
 
-void SDLInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {}
+void SDLInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
+  has_focus_.store(true, std::memory_order_release);
+}
 
 void SDLInputDriver::OnInputActiveChanged(bool active) {
+  host_input_active_.store(active, std::memory_order_release);
   if (!active) {
     StopRumble();
   }
@@ -320,6 +363,13 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   }
 
   auto is_active = this->is_active();
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  // Automated controller integration must not depend on whichever desktop app
+  // happens to be frontmost. Release builds compile this override out.
+  if (test_virtual_gamepads_supply_input_.load(std::memory_order_acquire)) {
+    is_active = true;
+  }
+#endif
 
   if (is_active) {
     QueueControllerUpdate();
@@ -397,8 +447,7 @@ X_RESULT SDLInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
   return (!enabled || !active) ? X_ERROR_SUCCESS : result;
 }
 
-bool SDLInputDriver::GetControllerSnapshot(uint32_t user_index,
-                                           ControllerSnapshot* out_snapshot) {
+bool SDLInputDriver::GetControllerSnapshot(uint32_t user_index, ControllerSnapshot* out_snapshot) {
   if (!out_snapshot || user_index >= HID_SDL_USER_COUNT ||
       !ready_.load(std::memory_order_acquire)) {
     if (out_snapshot) {
@@ -418,9 +467,13 @@ bool SDLInputDriver::GetControllerSnapshot(uint32_t user_index,
   }
 
   out_snapshot->connected = true;
-  out_snapshot->input_active = is_active();
+  // Diagnostics may request this from the guest thread. Do not invoke the
+  // application active callback here: it may inspect UI-owned overlay state.
+  out_snapshot->input_active = host_input_active_.load(std::memory_order_acquire) &&
+                               has_focus_.load(std::memory_order_acquire);
   out_snapshot->rumble_supported = controller->rumble_supported;
   out_snapshot->user_index = user_index;
+  out_snapshot->device_id = static_cast<uint64_t>(SDL_GetGamepadID(controller->sdl));
   const char* name = SDL_GetGamepadName(controller->sdl);
   out_snapshot->name = name ? name : "Controller";
   out_snapshot->raw_gamepad = controller->state.gamepad;
@@ -428,29 +481,124 @@ bool SDLInputDriver::GetControllerSnapshot(uint32_t user_index,
   return true;
 }
 
-X_RESULT SDLInputDriver::PlayControllerTestRumble(uint32_t user_index) {
-  if (user_index >= HID_SDL_USER_COUNT ||
-      !ready_.load(std::memory_order_acquire)) {
+X_RESULT SDLInputDriver::PlayControllerTestRumble(uint32_t user_index,
+                                                  uint64_t expected_device_id) {
+  if (user_index >= HID_SDL_USER_COUNT || !ready_.load(std::memory_order_acquire)) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-  QueueControllerUpdate();
+  if (!PumpControllerTopologyFromUIThread()) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
   auto guard = DrainAndLock();
   auto* controller = GetControllerState(user_index);
-  if (!controller) {
+  if (!controller || !SDL_GamepadConnected(controller->sdl) ||
+      (expected_device_id &&
+       static_cast<uint64_t>(SDL_GetGamepadID(controller->sdl)) != expected_device_id)) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-  if (!REXCVAR_GET(controller_rumble_enabled) ||
-      !controller->rumble_supported) {
+  if (!REXCVAR_GET(controller_rumble_enabled) || !controller->rumble_supported) {
     return X_ERROR_FUNCTION_FAILED;
   }
   constexpr uint16_t kTestStrength = 0x9000;
   constexpr uint32_t kTestDurationMs = 220;
-  const uint16_t strength = rex::input::controller::ScaleRumble(
-      kTestStrength, REXCVAR_GET(controller_rumble_intensity));
+  const uint16_t strength =
+      rex::input::controller::ScaleRumble(kTestStrength, REXCVAR_GET(controller_rumble_intensity));
   if (!strength) {
     return X_ERROR_FUNCTION_FAILED;
   }
   return SetRumbleLocked(*controller, strength, strength, kTestDurationMs, true);
+}
+
+bool SDLInputDriver::PumpControllerTopologyFromUIThread() {
+  std::lock_guard lifecycle_guard(lifecycle_mutex_);
+  auto* window = attached_window_;
+  if (!window || !ready_.load(std::memory_order_acquire) || !window->app_context().IsInUIThread()) {
+    return false;
+  }
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  if (test_virtual_gamepads_) {
+    test_virtual_gamepads_supply_input_.store(test_virtual_gamepads_->BeforeSDLPump(),
+                                              std::memory_order_release);
+  }
+#endif
+  SDL_PumpEvents();
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  if (test_virtual_gamepads_) {
+    test_virtual_gamepads_->AfterSDLPump();
+  }
+#endif
+  return true;
+}
+
+X_RESULT SDLInputDriver::SwapControllerSlots(uint32_t first_user_index, uint32_t second_user_index,
+                                             uint64_t expected_device_id) {
+  if (first_user_index >= HID_SDL_USER_COUNT || second_user_index >= HID_SDL_USER_COUNT) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+  if (!ready_.load(std::memory_order_acquire)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  // Port reassignment is a Host Settings UI action. Refresh the topology now,
+  // on that same UI thread, rather than relying on the coalesced asynchronous
+  // pump used by normal guest polling. This ensures an unplug queued just
+  // before the click is applied before expected_device_id is checked.
+  if (!PumpControllerTopologyFromUIThread()) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+
+  auto guard = DrainAndLock();
+  auto& first = controllers_.at(first_user_index);
+  auto& second = controllers_.at(second_user_index);
+  // The first slot identifies the controller selected by the host UI. If it
+  // disconnected while the click was queued, do nothing rather than moving an
+  // unrelated destination controller into the stale source slot.
+  if (!first.sdl || !SDL_GamepadConnected(first.sdl)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (second.sdl && !SDL_GamepadConnected(second.sdl)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (expected_device_id &&
+      static_cast<uint64_t>(SDL_GetGamepadID(first.sdl)) != expected_device_id) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (first_user_index == second_user_index) {
+    return X_ERROR_SUCCESS;
+  }
+
+  const uint32_t first_packet = static_cast<uint32_t>(first.state.packet_number);
+  const uint32_t second_packet = static_cast<uint32_t>(second.state.packet_number);
+  SDL_RumbleGamepad(first.sdl, 0, 0, 0);
+  if (second.sdl) {
+    SDL_RumbleGamepad(second.sdl, 0, 0, 0);
+  }
+  std::swap(first, second);
+  // Packet numbers belong to guest ports, not physical devices. Preserve each
+  // port's monotonic sequence and force its next GetState call to publish the
+  // newly assigned input as a change.
+  first.state.packet_number = first_packet;
+  second.state.packet_number = second_packet;
+  first.configured_state_valid = false;
+  second.configured_state_valid = false;
+  for (uint32_t user_index : {first_user_index, second_user_index}) {
+    auto& keystroke = keystroke_states_.at(user_index);
+    // Preserve prior buttons so GetKeystroke can emit the necessary KEYUP
+    // transitions for the newly assigned device, but never carry a repeat
+    // timer across physical controllers.
+    keystroke.repeat_state = RepeatState::Idle;
+    keystroke.repeat_butt_idx = 0;
+    keystroke.repeat_time = 0;
+  }
+  if (first.sdl) {
+    SDL_SetGamepadPlayerIndex(first.sdl, static_cast<int>(first_user_index));
+  }
+  if (second.sdl) {
+    SDL_SetGamepadPlayerIndex(second.sdl, static_cast<int>(second_user_index));
+  }
+  REXLOG_INFO("SDL controller ports swapped: player {} <-> player {}", first_user_index + 1,
+              second_user_index + 1);
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
@@ -540,8 +688,7 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
       guest_gamepad = ApplyControllerTuning(controller->state.gamepad);
     }
     const uint64_t curr_butts =
-        is_active ? (static_cast<uint16_t>(guest_gamepad.buttons) |
-                     AnalogToKeyfield(guest_gamepad))
+        is_active ? (static_cast<uint16_t>(guest_gamepad.buttons) | AnalogToKeyfield(guest_gamepad))
                   : uint64_t(0);
     KeystrokeState& last = keystroke_states_.at(user_index);
 
@@ -730,7 +877,9 @@ bool SDLInputDriver::OpenControllerLocked(SDL_JoystickID instance_id) {
   }
   if (user_id >= 0) {
     auto& state = controllers_.at(user_id);
+    const uint32_t slot_packet = static_cast<uint32_t>(state.state.packet_number);
     state = {};
+    state.state.packet_number = slot_packet;
     state.sdl = controller;
     state.state_changed = true;
     RefreshControllerStateLocked(state);
@@ -757,34 +906,20 @@ void SDLInputDriver::OpenUnassignedControllersLocked() {
   SDL_free(gamepads);
 }
 
-void SDLInputDriver::CompactControllerSlotsLocked() {
-  size_t destination = 0;
-  for (size_t source = 0; source < controllers_.size(); ++source) {
-    if (!controllers_.at(source).sdl) {
-      continue;
-    }
-    if (source != destination) {
-      controllers_.at(destination) = controllers_.at(source);
-      controllers_.at(source) = {};
-      keystroke_states_.at(destination) = keystroke_states_.at(source);
-      keystroke_states_.at(source) = {};
-    }
-    SDL_SetGamepadPlayerIndex(controllers_.at(destination).sdl, static_cast<int>(destination));
-    ++destination;
-  }
-}
-
 void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
   // Find the disconnected gamecontroller and close it.
   auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
   if (idx) {
-    SDL_CloseGamepad(controllers_.at(*idx).sdl);
-    controllers_.at(*idx) = {};
+    auto& controller = controllers_.at(*idx);
+    const uint32_t slot_packet = static_cast<uint32_t>(controller.state.packet_number);
+    SDL_CloseGamepad(controller.sdl);
+    controller = {};
+    controller.state.packet_number = slot_packet;
     keystroke_states_.at(*idx) = {};
     REXLOG_INFO("SDL OnControllerDeviceRemoved: Removed at player index {}.", *idx);
-    CompactControllerSlotsLocked();
-    // A fifth connected controller may have been waiting for a free guest
-    // slot. Reconsider all currently connected, unopened devices now.
+    // Never compact surviving controllers: changing their guest user index
+    // mid-match makes physical players take control of different characters.
+    // A waiting or newly reconnected pad may claim only the vacated slot.
     OpenUnassignedControllersLocked();
   } else {
     REXLOG_DEBUG("SDL OnControllerDeviceRemoved: Ignored unused device.");
@@ -844,17 +979,14 @@ void SDLInputDriver::RefreshControllerStateLocked(ControllerState& controller) {
   controller.state_changed = true;
 }
 
-X_INPUT_GAMEPAD SDLInputDriver::ApplyControllerTuning(
-    const X_INPUT_GAMEPAD& gamepad) const {
-  rex::input::controller::Layout layout =
-      rex::input::controller::Layout::kModern;
-  rex::input::controller::ParseLayout(
-      rex::cvar::GetFlagByName(rex::input::kControllerLayoutCvar), &layout);
+X_INPUT_GAMEPAD SDLInputDriver::ApplyControllerTuning(const X_INPUT_GAMEPAD& gamepad) const {
+  rex::input::controller::Layout layout = rex::input::controller::Layout::kModern;
+  rex::input::controller::ParseLayout(rex::cvar::GetFlagByName(rex::input::kControllerLayoutCvar),
+                                      &layout);
 
   rex::input::controller::ButtonBindings bindings;
   rex::input::controller::ParseButtonBindings(
-      rex::cvar::GetFlagByName(rex::input::kControllerButtonMapCvar),
-      &bindings);
+      rex::cvar::GetFlagByName(rex::input::kControllerButtonMapCvar), &bindings);
 
   rex::input::ControllerTuning tuning;
   tuning.look_sensitivity = REXCVAR_GET(controller_look_sensitivity);
@@ -862,14 +994,11 @@ X_INPUT_GAMEPAD SDLInputDriver::ApplyControllerTuning(
   tuning.aim_deadzone = REXCVAR_GET(controller_aim_deadzone);
   tuning.invert_y = REXCVAR_GET(controller_invert_y);
   return rex::input::controller::ApplyTuning(
-      rex::input::controller::ApplyMapping(gamepad, layout, bindings),
-      tuning);
+      rex::input::controller::ApplyMapping(gamepad, layout, bindings), tuning);
 }
 
-X_RESULT SDLInputDriver::SetRumbleLocked(ControllerState& controller,
-                                         uint16_t left, uint16_t right,
-                                         uint32_t duration_ms,
-                                         bool host_test) {
+X_RESULT SDLInputDriver::SetRumbleLocked(ControllerState& controller, uint16_t left, uint16_t right,
+                                         uint32_t duration_ms, bool host_test) {
   if (!controller.rumble_supported && !left && !right) {
     return X_ERROR_SUCCESS;
   }
@@ -880,10 +1009,8 @@ X_RESULT SDLInputDriver::SetRumbleLocked(ControllerState& controller,
     controller.rumble_failure_logged = true;
     const char* name = SDL_GetGamepadName(controller.sdl);
     const char* error = SDL_GetError();
-    REXLOG_WARN("SDL: Controller '{}' rejected {} rumble: {}",
-                name ? name : "Controller",
-                host_test ? "test" : "game",
-                error && *error ? error : "no device detail");
+    REXLOG_WARN("SDL: Controller '{}' rejected {} rumble: {}", name ? name : "Controller",
+                host_test ? "test" : "game", error && *error ? error : "no device detail");
   }
   return X_ERROR_FUNCTION_FAILED;
 }
@@ -942,8 +1069,7 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 
   const SDL_PropertiesID properties = SDL_GetGamepadProperties(state.sdl);
   state.rumble_supported =
-      properties && SDL_GetBooleanProperty(
-                        properties, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+      properties && SDL_GetBooleanProperty(properties, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
   if (state.rumble_supported) {
     cap_flags |= X_INPUT_CAPS_FFB_SUPPORTED;
   }
@@ -1002,7 +1128,18 @@ void SDLInputDriver::QueueControllerUpdate() {
   if (!is_queued) {
     if (!window->app_context().CallInUIThread([this]() {
           if (ready_.load(std::memory_order_acquire)) {
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+            if (test_virtual_gamepads_) {
+              test_virtual_gamepads_supply_input_.store(test_virtual_gamepads_->BeforeSDLPump(),
+                                                        std::memory_order_release);
+            }
+#endif
             SDL_PumpEvents();
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+            if (test_virtual_gamepads_) {
+              test_virtual_gamepads_->AfterSDLPump();
+            }
+#endif
           }
           sdl_pumpevents_queued_.store(false, std::memory_order_release);
         })) {

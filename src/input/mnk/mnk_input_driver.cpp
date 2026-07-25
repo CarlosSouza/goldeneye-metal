@@ -31,8 +31,7 @@
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
 REXCVAR_DEFINE_BOOL(mnk_mouse_enabled, true, "Input", "Enable mouse controller input and capture");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
-REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse motion sensitivity")
-    .range(0.01, 10.0);
+REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse motion sensitivity").range(0.01, 10.0);
 
 REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
 REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
@@ -81,13 +80,15 @@ MnkInputDriver::~MnkInputDriver() {
 
 void MnkInputDriver::OnWindowUnavailable() {
   closing_.store(true, std::memory_order_release);
+  has_focus_.store(false, std::memory_order_release);
   capture_request_generation_.fetch_add(1, std::memory_order_acq_rel);
+  mouse_capture_requested_.store(false, std::memory_order_release);
+  mouse_capture_active_.store(false, std::memory_order_release);
   if (auto* window = attached_window_.exchange(nullptr, std::memory_order_acq_rel)) {
     // Window lifecycle callbacks and ReXApp teardown run on the UI thread, the
     // same thread that owns mouse_captured_ and common Window capture state.
     if (mouse_captured_) {
       mouse_captured_ = false;
-      mouse_capture_applied_.store(false, std::memory_order_release);
       window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
       window->ReleaseMouse();
     }
@@ -104,6 +105,7 @@ X_STATUS MnkInputDriver::Setup() {
 void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
   if (window) {
     closing_.store(false, std::memory_order_release);
+    has_focus_.store(window->HasFocus(), std::memory_order_release);
     attached_window_.store(window, std::memory_order_release);
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
@@ -159,11 +161,11 @@ bool MnkInputDriver::ConsumeApplicationMouseMotion(uint32_t user_index,
     return false;
   }
 
-  const bool active = enabled && mouse_enabled && callback_active &&
-                      host_input_active_.load(std::memory_order_acquire) &&
-                      has_focus_.load(std::memory_order_acquire) &&
-                      activity_generation ==
-                          input_activity_generation_.load(std::memory_order_acquire);
+  const bool active =
+      enabled && mouse_enabled && callback_active &&
+      host_input_active_.load(std::memory_order_acquire) &&
+      has_focus_.load(std::memory_order_acquire) &&
+      activity_generation == input_activity_generation_.load(std::memory_order_acquire);
   if (!active) {
     mouse_dx_ = 0;
     mouse_dy_ = 0;
@@ -321,8 +323,7 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   double sensitivity = REXCVAR_GET(mnk_sensitivity);
   constexpr double kBaseScale = 200.0;
-  const bool mouse_to_stick =
-      mouse_enabled && mouse_motion_mode_ == MouseMotionMode::kRightStick;
+  const bool mouse_to_stick = mouse_enabled && mouse_motion_mode_ == MouseMotionMode::kRightStick;
   int32_t rx = mouse_to_stick ? static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale) : 0;
   int32_t ry = mouse_to_stick ? static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale) : 0;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
@@ -431,7 +432,10 @@ void MnkInputDriver::UpdateMouseCapture(bool input_active, uint64_t observed_act
   // Common Window state needs a UI-thread transition only when the desired
   // capture state changes. Still increment the request generation above to
   // cancel any older queued transition.
-  if (should_capture == mouse_capture_applied_.load(std::memory_order_acquire)) {
+  const bool request_matches =
+      should_capture == mouse_capture_requested_.load(std::memory_order_acquire);
+  const bool capture_active = mouse_capture_active_.load(std::memory_order_acquire);
+  if (request_matches && capture_active == should_capture) {
 #if REX_PLATFORM_WIN32
     if (should_capture) {
       CenterCursor(window);
@@ -456,22 +460,34 @@ void MnkInputDriver::UpdateMouseCapture(bool input_active, uint64_t observed_act
         bool should_capture = IsEnabled() && IsMouseEnabled() &&
                               has_focus_.load(std::memory_order_acquire) && input_active &&
                               host_input_active_.load(std::memory_order_acquire);
-        if (should_capture && !mouse_captured_) {
-          {
-            std::lock_guard lock(state_mutex_);
-            // Reset deltas to avoid a spike on capture start.
-            mouse_dx_ = 0;
-            mouse_dy_ = 0;
+        if (should_capture) {
+          if (!mouse_captured_ || !window->IsMouseCaptureActive()) {
+            {
+              std::lock_guard lock(state_mutex_);
+              // Reset deltas to avoid a spike on capture start.
+              mouse_dx_ = 0;
+              mouse_dy_ = 0;
+            }
+            window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+            if (mouse_captured_) {
+              window->RefreshMouseCapture();
+            } else {
+              window->CaptureMouse();
+              mouse_captured_ = true;
+              mouse_capture_requested_.store(true, std::memory_order_release);
+            }
           }
-          window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
-          window->CaptureMouse();
-          mouse_captured_ = true;
-          mouse_capture_applied_.store(true, std::memory_order_release);
-        } else if (!should_capture && mouse_captured_) {
-          mouse_captured_ = false;
-          mouse_capture_applied_.store(false, std::memory_order_release);
-          window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
-          window->ReleaseMouse();
+          mouse_capture_active_.store(window->IsMouseCaptureActive(), std::memory_order_release);
+        } else {
+          if (mouse_captured_) {
+            mouse_captured_ = false;
+            window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+            window->ReleaseMouse();
+          } else if (window->IsMouseCaptureActive()) {
+            window->RefreshMouseCapture();
+          }
+          mouse_capture_requested_.store(false, std::memory_order_release);
+          mouse_capture_active_.store(window->IsMouseCaptureActive(), std::memory_order_release);
         }
 
 #if REX_PLATFORM_WIN32
@@ -481,6 +497,19 @@ void MnkInputDriver::UpdateMouseCapture(bool input_active, uint64_t observed_act
         }
 #endif
       });
+}
+
+bool MnkInputDriver::GetHostInputSnapshot(HostInputSnapshot* out_snapshot) const {
+  if (!out_snapshot) {
+    return true;
+  }
+  out_snapshot->focused = has_focus_.load(std::memory_order_acquire);
+  out_snapshot->input_active = out_snapshot->focused &&
+                               host_input_active_.load(std::memory_order_acquire) &&
+                               !closing_.load(std::memory_order_acquire) &&
+                               attached_window_.load(std::memory_order_acquire) != nullptr;
+  out_snapshot->mouse_capture_active = mouse_capture_active_.load(std::memory_order_acquire);
+  return true;
 }
 
 void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
@@ -559,23 +588,23 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   int32_t x = e.x();
   int32_t y = e.y();
   if (e.has_movement_delta()) {
-    mouse_dx_ = static_cast<int32_t>(std::clamp(
-        static_cast<int64_t>(mouse_dx_) + e.movement_x(),
-        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
-        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
-    mouse_dy_ = static_cast<int32_t>(std::clamp(
-        static_cast<int64_t>(mouse_dy_) + e.movement_y(),
-        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
-        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    mouse_dx_ =
+        static_cast<int32_t>(std::clamp(static_cast<int64_t>(mouse_dx_) + e.movement_x(),
+                                        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+                                        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    mouse_dy_ =
+        static_cast<int32_t>(std::clamp(static_cast<int64_t>(mouse_dy_) + e.movement_y(),
+                                        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+                                        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
   } else {
-    mouse_dx_ = static_cast<int32_t>(std::clamp(
-        static_cast<int64_t>(mouse_dx_) + x - prev_mouse_x_,
-        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
-        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
-    mouse_dy_ = static_cast<int32_t>(std::clamp(
-        static_cast<int64_t>(mouse_dy_) + y - prev_mouse_y_,
-        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
-        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    mouse_dx_ =
+        static_cast<int32_t>(std::clamp(static_cast<int64_t>(mouse_dx_) + x - prev_mouse_x_,
+                                        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+                                        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    mouse_dy_ =
+        static_cast<int32_t>(std::clamp(static_cast<int64_t>(mouse_dy_) + y - prev_mouse_y_,
+                                        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+                                        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
   }
   prev_mouse_x_ = x;
   prev_mouse_y_ = y;

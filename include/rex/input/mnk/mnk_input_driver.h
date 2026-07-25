@@ -41,8 +41,8 @@ class MnkInputDriver final : public InputDriver,
   void OnWindowUnavailable() override;
   void OnInputActiveChanged(bool active) override;
   void SetMouseMotionMode(MouseMotionMode mode) override;
-  bool ConsumeApplicationMouseMotion(uint32_t user_index,
-                                     MouseMotionDelta* out_delta) override;
+  bool ConsumeApplicationMouseMotion(uint32_t user_index, MouseMotionDelta* out_delta) override;
+  bool GetHostInputSnapshot(HostInputSnapshot* out_snapshot) const override;
 
   // WindowInputListener
   void OnKeyDown(rex::ui::KeyEvent& e) override;
@@ -83,7 +83,8 @@ class MnkInputDriver final : public InputDriver,
   // Read and written only on the window UI thread. All common Window capture
   // state is changed there too, so it stays serialized with ImGui capture.
   bool mouse_captured_ = false;
-  std::atomic<bool> mouse_capture_applied_{false};
+  std::atomic<bool> mouse_capture_requested_{false};
+  std::atomic<bool> mouse_capture_active_{false};
   std::atomic<bool> has_focus_{true};
 
   // Keystroke queue

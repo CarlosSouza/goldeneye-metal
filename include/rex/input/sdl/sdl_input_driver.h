@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -29,6 +30,8 @@
 
 namespace rex::input::sdl {
 
+class SDLVirtualGamepadHarness;
+
 class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener {
  public:
   explicit SDLInputDriver(rex::ui::Window* window, size_t window_z_order);
@@ -42,9 +45,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
-  bool GetControllerSnapshot(uint32_t user_index,
-                             ControllerSnapshot* out_snapshot) override;
-  X_RESULT PlayControllerTestRumble(uint32_t user_index) override;
+  bool GetControllerSnapshot(uint32_t user_index, ControllerSnapshot* out_snapshot) override;
+  X_RESULT PlayControllerTestRumble(uint32_t user_index, uint64_t expected_device_id = 0) override;
+  X_RESULT SwapControllerSlots(uint32_t first_user_index, uint32_t second_user_index,
+                               uint64_t expected_device_id = 0) override;
   void OnWindowAvailable(rex::ui::Window* window) override;
   void OnWindowUnavailable() override;
   void OnInputActiveChanged(bool active) override;
@@ -91,12 +95,11 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
   bool OpenControllerLocked(SDL_JoystickID instance_id);
   void OpenUnassignedControllersLocked();
-  void CompactControllerSlotsLocked();
   void RefreshControllerStateLocked(ControllerState& controller);
   X_INPUT_GAMEPAD ApplyControllerTuning(const X_INPUT_GAMEPAD& gamepad) const;
-  X_RESULT SetRumbleLocked(ControllerState& controller, uint16_t left,
-                           uint16_t right, uint32_t duration_ms,
-                           bool host_test);
+  X_RESULT SetRumbleLocked(ControllerState& controller, uint16_t left, uint16_t right,
+                           uint32_t duration_ms, bool host_test);
+  bool PumpControllerTopologyFromUIThread();
   void StopRumble();
   static bool SDLCALL EventWatch(void* userdata, SDL_Event* event);
 
@@ -113,6 +116,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool sdl_event_watch_registered_ = false;
   std::atomic<bool> ready_{false};
   std::atomic<bool> accepting_events_{false};
+  std::atomic<bool> host_input_active_{true};
+  std::atomic<bool> has_focus_{true};
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
@@ -121,6 +126,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;
   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  std::atomic<bool> test_virtual_gamepads_supply_input_{false};
+#endif
+  std::unique_ptr<SDLVirtualGamepadHarness> test_virtual_gamepads_;
 };
 
 }  // namespace rex::input::sdl

@@ -34,6 +34,9 @@ detail::RequestQueue g_requests;
 std::atomic<bool> g_refresh_requested{true};
 std::atomic<uint64_t> g_mutation_token{0};
 std::atomic<AvailabilityBlock> g_availability_block{AvailabilityBlock::kNoMission};
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+detail::LocalMultiplayerReadinessTracker g_local_multiplayer_readiness;
+#endif
 
 constexpr bool IsSupported(Tool tool) noexcept {
   return detail::IsToggle(tool) || detail::IsAction(tool);
@@ -353,6 +356,14 @@ void ProcessTestingToolRequests(PPCContext& context, uint8_t* base) noexcept {
   const int32_t level_id = CurrentLevel(context, base);
   const int32_t player_count = ActivePlayerCount(context, base);
   const bool network_session = base[kNetworkSessionFlagAddress] != 0;
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  if (g_local_multiplayer_readiness.Observe(level_id, player_count, network_session)) {
+    REXLOG_INFO("[ge] local multiplayer ready level={} players={} network=0 stable_polls={}",
+                g_local_multiplayer_readiness.level_id(),
+                g_local_multiplayer_readiness.player_count(),
+                g_local_multiplayer_readiness.stable_polls());
+  }
+#endif
   const bool debug_menu_visible = RetailDebugMenuVisible(context, base);
   const host_pause::Snapshot pause = host_pause::GetSnapshot();
   const AvailabilityBlock block = detail::MutationAvailability(

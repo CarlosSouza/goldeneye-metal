@@ -59,6 +59,12 @@ endif()
 set_target_properties(ge PROPERTIES OUTPUT_NAME "GoldenEye")
 
 rexglue_setup_target(ge)
+if(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    # The SDK option is directory-scoped when ReXGlue is included as a
+    # subproject, so opt this game target into the matching read-only markers.
+    target_compile_definitions(ge PRIVATE
+        REXGLUE_ENABLE_INPUT_TEST_HARNESS=1)
+endif()
 if(APPLE)
     find_library(GOLDENEYE_UNIFORM_TYPE_IDENTIFIERS_FRAMEWORK
         UniformTypeIdentifiers REQUIRED)
@@ -119,6 +125,20 @@ target_compile_definitions(goldeneye_testing_tools_test PRIVATE
 rexglue_apply_target_settings(goldeneye_testing_tools_test)
 if(NOT MSVC)
     target_compile_options(goldeneye_testing_tools_test PRIVATE
+        "-ffile-prefix-map=${REXSDK_DIR}=."
+        "-fmacro-prefix-map=${REXSDK_DIR}=."
+    )
+endif()
+
+# Deterministic regression for the bounded, observation-only player movement
+# telemetry used when rendering continues but a player appears unable to move.
+add_executable(goldeneye_player_stuck_telemetry_test EXCLUDE_FROM_ALL
+    tests/player_stuck_telemetry_test.cpp
+)
+target_include_directories(goldeneye_player_stuck_telemetry_test PRIVATE src)
+rexglue_apply_target_settings(goldeneye_player_stuck_telemetry_test)
+if(NOT MSVC)
+    target_compile_options(goldeneye_player_stuck_telemetry_test PRIVATE
         "-ffile-prefix-map=${REXSDK_DIR}=."
         "-fmacro-prefix-map=${REXSDK_DIR}=."
     )
@@ -283,6 +303,7 @@ if(APPLE)
 
     add_custom_target(goldeneye_macos_app_verify
         COMMAND "$<TARGET_FILE:goldeneye_crash_guard_test>"
+        COMMAND "$<TARGET_FILE:goldeneye_player_stuck_telemetry_test>"
         COMMAND "$<TARGET_FILE:goldeneye_host_pause_test>"
         COMMAND "$<TARGET_FILE:goldeneye_testing_tools_test>"
         COMMAND "$<TARGET_FILE:goldeneye_launch_recovery_test>"
@@ -299,6 +320,7 @@ if(APPLE)
             goldeneye_macos_app
             goldeneye_crash_guard_test
             goldeneye_crash_guard_codegen_verify
+            goldeneye_player_stuck_telemetry_test
             goldeneye_host_pause_test
             goldeneye_testing_tools_test
             goldeneye_launch_recovery_test

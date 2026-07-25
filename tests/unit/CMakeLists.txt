@@ -5,6 +5,7 @@ add_executable(unit_tests
     memory/physical_host_offset_test.cpp
     graphics/command_ring_state_test.cpp
     graphics/metal_profile_test.cpp
+    kernel/critical_section_ledger_test.cpp
     kernel/object_table_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp

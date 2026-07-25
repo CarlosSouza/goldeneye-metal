@@ -13,7 +13,12 @@
 
 #include <cstdint>
 
+#include <rex/system/critical_section_ledger.h>
 #include <rex/system/xtypes.h>
+
+namespace rex::system {
+class XThread;
+}
 
 namespace rex::kernel::xboxkrnl {
 
@@ -67,5 +72,13 @@ X_STATUS xeRtlInitializeCriticalSectionAndSpinCount(X_RTL_CRITICAL_SECTION* cs, 
 // object isn't in readable committed memory.
 bool QueryRtlCriticalSectionDebugInfo(uint32_t guest_address,
                                       RtlCriticalSectionDebugInfo* out_info);
+
+using RtlCriticalSectionOwnershipDebugInfo = rex::system::CriticalSectionOwnershipSnapshot;
+
+// Takes a read-only, bounded snapshot of provenance recorded by one XThread.
+// The guest critical-section fields queried above remain authoritative.
+bool QueryRtlCriticalSectionOwnershipDebugInfo(const rex::system::XThread* owner_thread,
+                                               uint32_t guest_address,
+                                               RtlCriticalSectionOwnershipDebugInfo* out_info);
 
 }  // namespace rex::kernel::xboxkrnl

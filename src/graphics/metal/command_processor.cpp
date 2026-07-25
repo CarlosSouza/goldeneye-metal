@@ -1916,11 +1916,14 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     std::fprintf(stderr,
                  "[metal] draw route summary#%u total=%u color_depth=%u "
                  "shader_color_candidates=%u register_color_candidates=%u "
-                 "register_color_unrouted=%u owned_rt_draws=%u owned_rt_targets=%u\n",
+                 "register_color_unrouted=%u owned_rt_draws=%u owned_rt_targets=%u "
+                 "host_pixel=%u host_fallback=%u host_rt_cpu=%u skipped_vertices=%u\n",
                  metal_swap_index, draw_calls_this_swap_, color_depth_draws_this_swap_,
                  color_target_candidate_draws_this_swap_, register_color_candidate_draws_this_swap_,
                  register_color_unrouted_draws_this_swap_, owned_rt_routed_draws_this_swap_,
-                 owned_rt_routed_targets_this_swap_);
+                 owned_rt_routed_targets_this_swap_, host_pixel_draws_this_swap_,
+                 host_fallback_pixel_draws_this_swap_, host_rt_cpu_draws_this_swap_,
+                 host_pixel_skipped_vertices_this_swap_);
     std::fflush(stderr);
   }
   draw_calls_this_swap_ = 0;
@@ -2449,6 +2452,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   pipeline_probe_skipped_this_swap_ = 0;
   host_pixel_draws_this_swap_ = 0;
   host_fallback_pixel_draws_this_swap_ = 0;
+  host_rt_cpu_draws_this_swap_ = 0;
   host_pixel_skipped_vertices_this_swap_ = 0;
   host_pixel_shader_draws_this_swap_.clear();
   if (primitive_processor_) {
@@ -4385,6 +4389,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         continue;
       }
       std::vector<uint8_t> rt_bgra;
+      ++host_rt_cpu_draws_this_swap_;
       if (RenderHostPixelShader(*pixel_shader, pending_host_vertices_, synthetic_host_vertex_start,
                                 synthetic_host_vertex_count, fallback_output_width_,
                                 fallback_output_height_, rt_bgra, active_host_rt->context)) {
@@ -5262,6 +5267,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
             continue;
           }
           std::vector<uint8_t> rt_bgra;
+          ++host_rt_cpu_draws_this_swap_;
           if (RenderHostPixelShader(*pixel_shader, pending_host_vertices_, host_pixel_vertex_start,
                                     appended_vertices, fallback_output_width_,
                                     fallback_output_height_, rt_bgra, active_host_rt->context,
@@ -10541,6 +10547,51 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
   if (!host_vertex_count) {
     return false;
   }
+
+  // CPU-interpreted host vertices retain their draw's Metal viewport. The guest
+  // scissor also has to be applied explicitly; otherwise a fallback draw from
+  // one split-screen view can write into the other players' quadrants.
+  const MetalHostVertex& first_host_vertex = host_vertices[host_vertex_start];
+  const double viewport_x = first_host_vertex.viewport_x;
+  const double viewport_y = first_host_vertex.viewport_y;
+  const double viewport_width = first_host_vertex.viewport_width;
+  const double viewport_height = first_host_vertex.viewport_height;
+  if (!std::isfinite(viewport_x) || !std::isfinite(viewport_y) || !std::isfinite(viewport_width) ||
+      !std::isfinite(viewport_height) || viewport_x < 0.0 || viewport_y < 0.0 ||
+      viewport_width <= 0.0 || viewport_height <= 0.0 || viewport_x > width ||
+      viewport_y > height || viewport_width > width - viewport_x ||
+      viewport_height > height - viewport_y) {
+    return false;
+  }
+  for (size_t i = 1; i < host_vertex_count; ++i) {
+    const MetalHostVertex& host_vertex = host_vertices[host_vertex_start + i];
+    if (host_vertex.viewport_x != first_host_vertex.viewport_x ||
+        host_vertex.viewport_y != first_host_vertex.viewport_y ||
+        host_vertex.viewport_width != first_host_vertex.viewport_width ||
+        host_vertex.viewport_height != first_host_vertex.viewport_height) {
+      return false;
+    }
+  }
+
+  draw_util::Scissor guest_scissor = {};
+  draw_util::GetScissor(*register_file_, guest_scissor);
+  const uint32_t scissor_x = std::min(guest_scissor.offset[0], width);
+  const uint32_t scissor_y = std::min(guest_scissor.offset[1], height);
+  const uint32_t scissor_width = std::min(guest_scissor.extent[0], width - scissor_x);
+  const uint32_t scissor_height = std::min(guest_scissor.extent[1], height - scissor_y);
+  if (!scissor_width || !scissor_height) {
+    return false;
+  }
+  ProbeRasterizationState host_rasterization_state = {};
+  host_rasterization_state.viewport_x = viewport_x;
+  host_rasterization_state.viewport_y = viewport_y;
+  host_rasterization_state.viewport_width = viewport_width;
+  host_rasterization_state.viewport_height = viewport_height;
+  host_rasterization_state.scissor_x = scissor_x;
+  host_rasterization_state.scissor_y = scissor_y;
+  host_rasterization_state.scissor_width = scissor_width;
+  host_rasterization_state.scissor_height = scissor_height;
+
   uint64_t vertex_modification = 0;
   uint64_t pixel_modification = 0;
   GetCurrentShaderModifications(nullptr, &pixel_shader, vertex_modification, pixel_modification);
@@ -10764,7 +10815,7 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
             fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(),
             probe_vertices.data(), probe_vertices.size() * sizeof(HostPixelProbeVertex), 3,
             bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t), UINT32_MAX,
-            fragment_bool_loop_constants_buffer_index) &&
+            fragment_bool_loop_constants_buffer_index, nullptr, &host_rasterization_state) &&
         ReadPipelineProbeContext(persistent_host_context, width, height, bgra_out, &render_error);
   } else {
     const uint8_t* initial_bgra = nullptr;
@@ -10786,7 +10837,7 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
         fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(),
         probe_vertices.data(), probe_vertices.size() * sizeof(HostPixelProbeVertex), 3,
         bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t), UINT32_MAX,
-        fragment_bool_loop_constants_buffer_index);
+        fragment_bool_loop_constants_buffer_index, nullptr, &host_rasterization_state);
   }
   if (!rendered) {
     disabled_host_pixel_shader_hashes_.insert(pixel_shader.ucode_data_hash());

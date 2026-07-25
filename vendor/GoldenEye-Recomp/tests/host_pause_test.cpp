@@ -1,5 +1,8 @@
 #include "ge_host_pause.h"
+#include "ge_controller_shortcut.h"
 
+#include <array>
+#include <climits>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -352,6 +355,132 @@ void TestResumeInputLatch() {
   CHECK_TRUE(!latch.ShouldSuppress(held));
 }
 
+void TestIndependentMultiplayerResumeLatches() {
+  std::array<ge::host_pause::ResumeInputLatch, 4> latches;
+  std::array<ge::host_pause::InputSample, 4> samples = {};
+  samples[1].thumb_lx = INT16_MAX;  // drifting/held player 2
+
+  for (size_t player = 0; player < latches.size(); ++player) {
+    latches[player].Arm(samples[player]);
+    CHECK_TRUE(latches[player].ShouldSuppress(samples[player]));
+  }
+
+  // Neutral players finish their two-poll transition independently. Player 2
+  // remains latched instead of freezing all four guest ports.
+  for (size_t player : {0u, 2u, 3u}) {
+    CHECK_TRUE(latches[player].ShouldSuppress(samples[player]));
+    CHECK_TRUE(!latches[player].active());
+  }
+  CHECK_TRUE(latches[1].ShouldSuppress(samples[1]));
+  CHECK_TRUE(latches[1].active());
+
+  samples[1] = {};
+  CHECK_TRUE(latches[1].ShouldSuppress(samples[1]));
+  CHECK_TRUE(latches[1].active());
+  CHECK_TRUE(latches[1].ShouldSuppress(samples[1]));
+  CHECK_TRUE(!latches[1].active());
+}
+
+void TestControllerHostSettingsShortcut() {
+  using ge::controller_shortcut::HoldTracker;
+  using ge::controller_shortcut::kButtonChord;
+  using ge::controller_shortcut::kHoldDurationMs;
+  using ge::controller_shortcut::kLeftStickButton;
+  using ge::controller_shortcut::kRightStickButton;
+
+  std::array<ge::controller_shortcut::ControllerSample,
+             ge::controller_shortcut::kControllerSlotCount>
+      controllers = {};
+  for (size_t slot = 0; slot < controllers.size(); ++slot) {
+    controllers[slot].device_id = slot + 1;
+  }
+  HoldTracker tracker;
+
+  // Normal L3/R3 presses, a short chord, and buttons split across controllers
+  // remain ordinary gameplay input.
+  controllers[0].buttons = kLeftStickButton;
+  CHECK_TRUE(!tracker.Observe(controllers, 0));
+  controllers[0].buttons = kRightStickButton;
+  CHECK_TRUE(!tracker.Observe(controllers, 100));
+  controllers[0].buttons = kButtonChord;
+  CHECK_TRUE(!tracker.Observe(controllers, 200));
+  CHECK_TRUE(!tracker.Observe(controllers, 200 + kHoldDurationMs - 1));
+  for (auto& controller : controllers) {
+    controller.buttons = 0;
+  }
+  CHECK_TRUE(!tracker.Observe(controllers, 200 + kHoldDurationMs));
+  controllers[0].buttons = kLeftStickButton;
+  controllers[1].buttons = kRightStickButton;
+  CHECK_TRUE(!tracker.Observe(controllers, 2000));
+  CHECK_TRUE(!tracker.Observe(controllers, 3000));
+
+  // One controller must hold both buttons continuously for the full duration.
+  for (auto& controller : controllers) {
+    controller.buttons = 0;
+  }
+  CHECK_TRUE(!tracker.Observe(controllers, 3100));
+  controllers[2].buttons = kButtonChord;
+  CHECK_TRUE(!tracker.Observe(controllers, 4000));
+  CHECK_TRUE(!tracker.Observe(controllers, 4000 + kHoldDurationMs - 1));
+  const auto opened = tracker.Observe(controllers, 4000 + kHoldDurationMs);
+  CHECK_TRUE(opened && *opened == 2);
+  CHECK_TRUE(!tracker.armed());
+
+  // A long hold fires once. Even moving the held chord directly to another
+  // controller cannot close the menu until every controller has released it.
+  CHECK_TRUE(!tracker.Observe(controllers, 6000));
+  controllers[2].buttons = 0;
+  controllers[3].buttons = kButtonChord;
+  CHECK_TRUE(!tracker.Observe(controllers, 7000));
+  CHECK_TRUE(!tracker.Observe(controllers, 7000 + kHoldDurationMs));
+  for (auto& controller : controllers) {
+    controller.buttons = 0;
+  }
+  CHECK_TRUE(!tracker.Observe(controllers, 8000));
+  CHECK_TRUE(tracker.armed());
+
+  controllers[3].buttons = kButtonChord;
+  CHECK_TRUE(!tracker.Observe(controllers, 9000));
+  const auto closed = tracker.Observe(controllers, 9000 + kHoldDurationMs);
+  CHECK_TRUE(closed && *closed == 3);
+
+  // A replacement pad in the same guest slot starts a new hold interval even
+  // if both physical devices happened to have the chord down.
+  HoldTracker replacement_tracker;
+  for (auto& controller : controllers) {
+    controller.buttons = 0;
+  }
+  controllers[0].buttons = kButtonChord;
+  CHECK_TRUE(!replacement_tracker.Observe(controllers, 10000));
+  controllers[0].device_id = 99;
+  CHECK_TRUE(!replacement_tracker.Observe(controllers, 10000 + kHoldDurationMs - 1));
+  CHECK_TRUE(!replacement_tracker.Observe(controllers, 10000 + (2 * kHoldDurationMs) - 2));
+  const auto replacement_completed =
+      replacement_tracker.Observe(controllers, 10000 + (2 * kHoldDurationMs) - 1);
+  CHECK_TRUE(replacement_completed && *replacement_completed == 0);
+
+  // A backward clock sample restarts the continuous-hold interval safely.
+  HoldTracker regressed_clock_tracker;
+  for (auto& controller : controllers) {
+    controller.buttons = 0;
+  }
+  controllers[1].buttons = kButtonChord;
+  CHECK_TRUE(!regressed_clock_tracker.Observe(controllers, 1000));
+  CHECK_TRUE(!regressed_clock_tracker.Observe(controllers, 900));
+  CHECK_TRUE(!regressed_clock_tracker.Observe(controllers, 900 + kHoldDurationMs - 1));
+  const auto after_regression = regressed_clock_tracker.Observe(controllers, 900 + kHoldDurationMs);
+  CHECK_TRUE(after_regression && *after_regression == 1);
+
+  ge::controller_shortcut::ToggleHandlerRegistry registry;
+  uint32_t requested_slot = UINT32_MAX;
+  registry.Set([&requested_slot](uint32_t slot) { requested_slot = slot; });
+  CHECK_TRUE(registry.Request(2));
+  CHECK_TRUE(requested_slot == 2);
+  registry.Clear();
+  CHECK_TRUE(!registry.Request(1));
+  CHECK_TRUE(requested_slot == 2);
+}
+
 void TestRetryLogGate() {
   ge::host_pause::detail::RetryLogGate gate;
   ge::host_pause::ProcessResult failed_acquire{
@@ -507,6 +636,8 @@ int main() {
   TestFailedWritesRetryAndReleaseRace();
   TestRetailPauseWriteShadow();
   TestResumeInputLatch();
+  TestIndependentMultiplayerResumeLatches();
+  TestControllerHostSettingsShortcut();
   TestRetryLogGate();
   TestGeneratedPauseWordContract();
   return failures == 0 ? 0 : 1;
