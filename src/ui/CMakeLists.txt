@@ -9,6 +9,7 @@ set(REXUI_CORE_SOURCES
     immediate_drawer.cpp
     keybinds.cpp
     menu_item.cpp
+    module_launch_coordinator.cpp
     presenter.cpp
     renderdoc_api.cpp
     window.cpp

@@ -50,7 +50,7 @@ const uint32_t XAPC::kDummyRundownRoutine;
 
 using namespace rex::literals;
 
-uint32_t next_xthread_id_ = 0;
+std::atomic<uint32_t> next_xthread_id_{0};
 
 XThread::XThread(KernelState* kernel_state)
     : XObject(kernel_state, kObjectType), guest_thread_(true) {}
@@ -59,7 +59,7 @@ XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_t
                  uint32_t start_address, uint32_t start_context, uint32_t creation_flags,
                  bool guest_thread, bool main_thread, uint32_t guest_process)
     : XObject(kernel_state, kObjectType),
-      thread_id_(++next_xthread_id_),
+      thread_id_(next_xthread_id_.fetch_add(1, std::memory_order_relaxed) + 1),
       guest_thread_(guest_thread),
       main_thread_(main_thread),
       apc_lock_old_irql_(0) {
@@ -83,7 +83,16 @@ XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_t
   }
 
   // The kernel does not take a reference. We must unregister in the dtor.
-  kernel_state_->RegisterThread(this);
+  registered_with_kernel_ = kernel_state_->RegisterThread(this);
+  if (!registered_with_kernel_ && guest_thread_) {
+    termination_started_.store(true, std::memory_order_release);
+    // Registration rejection transfers no ownership to the kernel. Drop the
+    // creation-owned table handle immediately so a caller that never reaches
+    // Create() cannot strand the rejected object.
+    if (!handles().empty()) {
+      (void)ReleaseHandle(handles().front());
+    }
+  }
 }
 
 XThread::~XThread() {
@@ -93,7 +102,10 @@ XThread::~XThread() {
   }
 
   // Unregister first to prevent lookups while deleting.
-  kernel_state_->UnregisterThread(this);
+  if (registered_with_kernel_) {
+    kernel_state_->UnregisterThread(this);
+    registered_with_kernel_ = false;
+  }
 
   thread_.reset();
 
@@ -106,6 +118,122 @@ XThread::~XThread() {
     // TODO(benvanik): platform kill
     REXSYS_ERROR("Thread disposed without exiting");
   }
+}
+
+bool XThread::TryBeginTermination() {
+  bool expected = false;
+  return termination_started_.compare_exchange_strong(expected, true);
+}
+
+void XThread::RetainSelfHandle() {
+  // Retain the object table entry before publishing ownership of the
+  // self-handle. If termination races creation, the post-publication check
+  // ensures that whichever side observes the other second releases it.
+  const std::vector<X_HANDLE> object_handles = handles();
+  if (object_handles.empty() || !RetainHandle(object_handles.front())) {
+    assert_always("XThread could not retain its self-handle");
+    return;
+  }
+  const X_HANDLE retained_handle = object_handles.front();
+  self_handle_.store(retained_handle, std::memory_order_release);
+
+  bool expected = false;
+  if (!self_handle_retained_.compare_exchange_strong(expected, true)) {
+    assert_always("XThread self-handle retained more than once");
+    (void)ReleaseHandle(retained_handle);
+    return;
+  }
+
+  // These two lifecycle atomics intentionally use sequential consistency. The
+  // retain/termination handshake must not allow both sides to observe the
+  // other's old value and strand the self-handle.
+  if (termination_started_.load()) {
+    ReleaseSelfHandleOnce();
+  }
+}
+
+void XThread::AdoptSelfHandle() {
+  // ObjectTable restoration already restores the saved handle reference
+  // count, including the thread's self-owned reference.
+  const std::vector<X_HANDLE> object_handles = handles();
+  if (object_handles.empty()) {
+    assert_always("XThread restored without a self-handle");
+    return;
+  }
+  self_handle_.store(object_handles.front(), std::memory_order_release);
+
+  bool expected = false;
+  if (!self_handle_retained_.compare_exchange_strong(expected, true)) {
+    assert_always("XThread restored self-handle adopted more than once");
+    return;
+  }
+
+  if (termination_started_.load()) {
+    ReleaseSelfHandleOnce();
+  }
+}
+
+void XThread::ReleaseSelfHandleOnce() {
+  if (self_handle_retained_.exchange(false)) {
+    const X_HANDLE retained_handle = self_handle_.exchange(0, std::memory_order_acq_rel);
+    if (retained_handle) {
+      (void)ReleaseHandle(retained_handle);
+    }
+  }
+}
+
+void XThread::PrepareForTitleDrain() {
+  drain_wait_expected_.store(true, std::memory_order_release);
+}
+
+bool XThread::WaitForExitUntil(std::chrono::steady_clock::time_point deadline) {
+  rex::thread::Thread* host_thread = nullptr;
+  {
+    std::unique_lock lock(host_thread_state_mutex_);
+    auto publication_finished = [this]() {
+      return host_thread_state_ == HostThreadState::kHostPublished ||
+             host_thread_state_ == HostThreadState::kNoHost ||
+             host_thread_state_ == HostThreadState::kJoined;
+    };
+    if (deadline == std::chrono::steady_clock::time_point::max()) {
+      thread_state_cv_.wait(lock, publication_finished);
+    } else if (!thread_state_cv_.wait_until(lock, deadline, publication_finished)) {
+      return false;
+    }
+    if (host_thread_state_ == HostThreadState::kNoHost ||
+        host_thread_state_ == HostThreadState::kJoined) {
+      ReleaseSelfHandleOnce();
+      return true;
+    }
+    host_thread = published_host_thread_.load(std::memory_order_acquire);
+  }
+
+  if (!host_thread ||
+      host_thread->WaitForExitUntil(deadline) != rex::thread::WaitResult::kSuccess) {
+    return false;
+  }
+
+  {
+    std::lock_guard lock(host_thread_state_mutex_);
+    host_thread_state_ = HostThreadState::kJoined;
+  }
+  thread_state_cv_.notify_all();
+  ReleaseSelfHandleOnce();
+  return true;
+}
+
+void XThread::WaitCallback() {
+  // The native wait handle may become signaled before a POSIX exit observer
+  // has released callback captures that own this XThread. Guest thread waits,
+  // including the main-module waiter, must not return during that window.
+  if (!WaitForExitUntil(std::chrono::steady_clock::time_point::max())) {
+    rex::FatalError("XThread wait completed without strong native exit completion");
+  }
+}
+
+std::string XThread::thread_name_snapshot() const {
+  std::lock_guard lock(thread_lock_);
+  return thread_name_;
 }
 
 thread_local XThread* current_xthread_tls_ = nullptr;
@@ -317,15 +445,68 @@ void XThread::FreeStack() {
 }
 
 X_STATUS XThread::Create() {
+  bool linked_to_guest_process = false;
+  auto fail_creation = [this, &linked_to_guest_process](X_STATUS status) {
+    // Create owns the original guest handle until it returns success.
+    auto self = retain_object(this);
+    TryBeginTermination();
+    running_.store(false, std::memory_order_release);
+    ReleaseSelfHandleOnce();
+
+    if (linked_to_guest_process) {
+      X_KTHREAD* thread = guest_object<X_KTHREAD>();
+      const uint32_t process_guest = thread->process;
+      if (process_guest) {
+        auto* ctx = thread_state_->context();
+        auto kprocess = memory()->TranslateVirtual<X_KPROCESS*>(process_guest);
+        auto old_irql =
+            kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kprocess->thread_list_spinlock);
+        util::XeRemoveEntryList(&thread->process_threads, memory());
+        kprocess->thread_count = kprocess->thread_count - 1;
+        kernel::xboxkrnl::xeKeKfReleaseSpinLock(ctx, &kprocess->thread_list_spinlock, old_irql);
+      }
+      linked_to_guest_process = false;
+    }
+
+    if (!handles().empty()) {
+      (void)ReleaseHandle();
+    }
+    {
+      std::lock_guard lock(host_thread_state_mutex_);
+      if (host_thread_state_ == HostThreadState::kNotStarted ||
+          host_thread_state_ == HostThreadState::kCreating) {
+        host_thread_state_ = HostThreadState::kNoHost;
+      }
+    }
+    thread_state_cv_.notify_all();
+    return status;
+  };
+
+  bool creation_rejected = false;
+  {
+    std::lock_guard lock(host_thread_state_mutex_);
+    if (!registered_with_kernel_ || termination_started_.load(std::memory_order_acquire) ||
+        host_thread_state_ != HostThreadState::kNotStarted) {
+      host_thread_state_ = HostThreadState::kNoHost;
+      creation_rejected = true;
+    } else {
+      host_thread_state_ = HostThreadState::kCreating;
+    }
+  }
+  if (creation_rejected) {
+    thread_state_cv_.notify_all();
+    return fail_creation(X_STATUS_THREAD_IS_TERMINATING);
+  }
+
   // Thread kernel object.
   if (!CreateNative<X_KTHREAD>()) {
     REXSYS_WARN("Unable to allocate thread object");
-    return X_STATUS_NO_MEMORY;
+    return fail_creation(X_STATUS_NO_MEMORY);
   }
 
   // Allocate a stack.
   if (!AllocateStack(creation_params_.stack_size)) {
-    return X_STATUS_NO_MEMORY;
+    return fail_creation(X_STATUS_NO_MEMORY);
   }
 
   // Allocate thread scratch.
@@ -358,7 +539,7 @@ X_STATUS XThread::Create() {
   tls_dynamic_address_ = tls_static_address_ + tls_extended_size;
   if (!tls_static_address_) {
     REXSYS_WARN("Unable to allocate thread local storage block");
-    return X_STATUS_NO_MEMORY;
+    return fail_creation(X_STATUS_NO_MEMORY);
   }
 
   // Zero all of TLS.
@@ -387,7 +568,7 @@ X_STATUS XThread::Create() {
   pcr_address_ = memory()->SystemHeapAlloc(0x2D8);
   if (!pcr_address_) {
     REXSYS_WARN("Unable to allocate thread state block");
-    return X_STATUS_NO_MEMORY;
+    return fail_creation(X_STATUS_NO_MEMORY);
   }
 
   // Create thread state - needed for interrupt callbacks and kernel exports
@@ -401,6 +582,7 @@ X_STATUS XThread::Create() {
 
   // Initialize the KTHREAD object.
   InitializeGuestObject();
+  linked_to_guest_process = true;
 
   X_KPCR* pcr = memory()->TranslateVirtual<X_KPCR*>(pcr_address_);
 
@@ -417,12 +599,12 @@ X_STATUS XThread::Create() {
   pcr->prcb_data.dpc_active = 0;
 
   // Always retain when starting - the thread owns itself until exited.
-  RetainHandle();
+  RetainSelfHandle();
 
   rex::thread::Thread::CreationParameters params;
   params.stack_size = 16_MiB;  // Allocate a big host stack.
   params.create_suspended = true;
-  thread_ = rex::thread::Thread::Create(params, [this]() {
+  auto host_thread = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
     runtime::ThreadState::Bind(thread_state_.get());
 
@@ -435,24 +617,59 @@ X_STATUS XThread::Create() {
     PROFILE_THREAD_ENTER(thread_name_.c_str());
     PROFILE_THREAD_CREATED();
 
+    if (termination_started_.load(std::memory_order_acquire)) {
+      running_.store(false, std::memory_order_release);
+      PROFILE_THREAD_EXITED();
+      PROFILE_THREAD_EXIT();
+      return;
+    }
+
     // Execute user code.
     current_xthread_tls_ = this;
-    running_ = true;
+    running_.store(true, std::memory_order_release);
     Execute();
-    running_ = false;
+    TryBeginTermination();
+    running_.store(false, std::memory_order_release);
     current_xthread_tls_ = nullptr;
 
     PROFILE_THREAD_EXITED();
     PROFILE_THREAD_EXIT();
 
-    // Release the self-reference to the thread.
-    ReleaseHandle();
   });
+  {
+    std::lock_guard lock(thread_lock_);
+    thread_ = std::move(host_thread);
+    published_host_thread_.store(thread_.get(), std::memory_order_release);
+  }
+  {
+    std::lock_guard lock(host_thread_state_mutex_);
+    host_thread_state_ = published_host_thread_.load(std::memory_order_acquire)
+                             ? HostThreadState::kHostPublished
+                             : HostThreadState::kNoHost;
+  }
+  thread_state_cv_.notify_all();
 
   if (!thread_) {
     // TODO(benvanik): translate error?
     REXSYS_ERROR("CreateThread failed");
-    return X_STATUS_NO_MEMORY;
+    return fail_creation(X_STATUS_NO_MEMORY);
+  }
+
+  // Forced termination skips the guest callback tail, and normal return may
+  // still be running host TLS destructors. Release the self-handle from the
+  // native joined-completion path in both cases.
+  auto exit_owner =
+      std::make_shared<object_ref<XThread>>(retain_object(this));
+  thread_->SetExitCallback([this, exit_owner]() {
+    (void)exit_owner;
+    ReleaseSelfHandleOnce();
+  });
+
+  if (termination_started_.load(std::memory_order_acquire)) {
+    const int exit_code = guest_object<X_KTHREAD>()->exit_status;
+    thread_->Terminate(exit_code);
+    (void)WaitForExitUntil(std::chrono::steady_clock::time_point::max());
+    return fail_creation(X_STATUS_THREAD_IS_TERMINATING);
   }
 
   // Set the thread name based on host ID (for easier debugging).
@@ -470,9 +687,20 @@ X_STATUS XThread::Create() {
 
   // TODO(tomc): do we need thread notifications (related to processor thread management)?
 
+  if (termination_started_.load(std::memory_order_acquire)) {
+    const int exit_code = guest_object<X_KTHREAD>()->exit_status;
+    thread_->Terminate(exit_code);
+    (void)WaitForExitUntil(std::chrono::steady_clock::time_point::max());
+    return fail_creation(X_STATUS_THREAD_IS_TERMINATING);
+  }
+
   if ((creation_params_.creation_flags & X_CREATE_SUSPENDED) == 0) {
     // Start the thread now that we're all setup.
-    thread_->Resume();
+    if (!thread_->Resume()) {
+      thread_->Terminate(0);
+      (void)WaitForExitUntil(std::chrono::steady_clock::time_point::max());
+      return fail_creation(X_STATUS_UNSUCCESSFUL);
+    }
   }
 
   return X_STATUS_SUCCESS;
@@ -481,8 +709,10 @@ X_STATUS XThread::Create() {
 X_STATUS XThread::Exit(int exit_code) {
   // This may only be called on the thread itself.
   assert_true(XThread::GetCurrentThread() == this);
+  TryBeginTermination();
+
   // Keep the object alive until Thread::Exit() transitions the host thread
-  // into pthread_exit(). Otherwise ReleaseHandle() below may delete `this`
+  // into pthread_exit(). Otherwise releasing the self-handle below may delete `this`
   // while this method is still running.
   auto self = retain_object(this);
 
@@ -517,8 +747,7 @@ X_STATUS XThread::Exit(int exit_code) {
   current_xthread_tls_ = nullptr;
   PROFILE_THREAD_EXIT();
 
-  running_ = false;
-  ReleaseHandle();
+  running_.store(false, std::memory_order_release);
 
   // NOTE: this does not return!
   rex::thread::Thread::Exit(exit_code);
@@ -527,24 +756,44 @@ X_STATUS XThread::Exit(int exit_code) {
 
 X_STATUS XThread::Terminate(int exit_code) {
   // TODO(benvanik): inform the profiler that this thread is exiting.
+  auto self = retain_object(this);
+
+  const bool is_current_thread = XThread::IsInThread(this);
+  if (!TryBeginTermination() && !is_current_thread) {
+    return X_STATUS_SUCCESS;
+  }
 
   // Set exit code.
-  X_KTHREAD* thread = guest_object<X_KTHREAD>();
-  thread->header.signal_state = 1;
-  thread->exit_status = exit_code;
+  if (guest_object()) {
+    X_KTHREAD* thread = guest_object<X_KTHREAD>();
+    thread->header.signal_state = 1;
+    thread->exit_status = exit_code;
+  }
 
   // TODO(tomc): do we need thread notifications (related to processor thread management)?
 
-  running_ = false;
-  if (XThread::IsInThread(this)) {
-    // Same lifetime rule as Exit(): don't allow ReleaseHandle() to destroy
+  running_.store(false, std::memory_order_release);
+  if (is_current_thread) {
+    // Same lifetime rule as Exit(): don't allow releasing the self-handle to destroy
     // the thread object before Thread::Exit() reaches pthread_exit().
-    auto self = retain_object(this);
-    ReleaseHandle();
     rex::thread::Thread::Exit(exit_code);
   } else {
-    thread_->Terminate(exit_code);
-    ReleaseHandle();
+    rex::thread::Thread* host_thread = nullptr;
+    bool no_host_will_be_published = false;
+    {
+      std::lock_guard lock(host_thread_state_mutex_);
+      if (host_thread_state_ == HostThreadState::kNotStarted) {
+        host_thread_state_ = HostThreadState::kNoHost;
+        no_host_will_be_published = true;
+      }
+      host_thread = published_host_thread_.load(std::memory_order_acquire);
+    }
+    if (no_host_will_be_published) {
+      thread_state_cv_.notify_all();
+    }
+    if (host_thread) {
+      host_thread->Terminate(exit_code);
+    }
   }
 
   return X_STATUS_SUCCESS;
@@ -1280,8 +1529,10 @@ bool XThread::Save(stream::ByteStream* stream) {
 
   REXSYS_DEBUG("XThread {:08X} serializing...", handle());
 
+  const bool is_running = running_.load(std::memory_order_acquire);
+  const bool owns_self_handle = self_handle_retained_.load();
   uint32_t pc = 0;
-  if (running_) {
+  if (is_running || owns_self_handle) {
     // TODO(tomc): do we need rexglue-compatible thread serialization?
     //             ideally any previous use for this (multi-dvds) are reworked in recomp to be
     //             single xex
@@ -1299,7 +1550,7 @@ bool XThread::Save(stream::ByteStream* stream) {
   ThreadSavedState state;
   state.thread_id = thread_id_;
   state.is_main_thread = main_thread_;
-  state.is_running = running_;
+  state.is_running = is_running;
   state.apc_head = 0;  // APCs now live in guest-memory typed lists
   state.tls_static_address = tls_static_address_;
   state.tls_dynamic_address = tls_dynamic_address_;
@@ -1310,7 +1561,7 @@ bool XThread::Save(stream::ByteStream* stream) {
   state.stack_alloc_base = stack_alloc_base_;
   state.stack_alloc_size = stack_alloc_size_;
 
-  if (running_) {
+  if (is_running) {
     auto context = thread_state_->context();
     SaveContext(context, state);
     state.context.pc = pc;
@@ -1325,14 +1576,21 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
   // constructor so it doesn't register a handle with the object table.
   auto thread = new XThread(nullptr);
   thread->kernel_state_ = kernel_state;
+  auto discard_restored_thread = [&]() -> object_ref<XThread> {
+    if (!thread->handles().empty()) {
+      (void)thread->Delete();
+    }
+    thread->Release();
+    return nullptr;
+  };
 
   if (!thread->RestoreObject(stream)) {
-    return nullptr;
+    return discard_restored_thread();
   }
 
   if (stream->Read<uint32_t>() != kThreadSaveSignature) {
     REXSYS_ERROR("Could not restore XThread - invalid magic!");
-    return nullptr;
+    return discard_restored_thread();
   }
 
   REXSYS_DEBUG("XThread {:08X}", thread->handle());
@@ -1343,7 +1601,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
   stream->Read(&state, sizeof(ThreadSavedState));
   thread->thread_id_ = state.thread_id;
   thread->main_thread_ = state.is_main_thread;
-  thread->running_ = state.is_running;
+  thread->running_.store(state.is_running, std::memory_order_release);
   // state.apc_head is ignored - APCs live in guest-memory typed lists
   thread->tls_static_address_ = state.tls_static_address;
   thread->tls_dynamic_address_ = state.tls_dynamic_address;
@@ -1355,23 +1613,45 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
   thread->stack_alloc_size_ = state.stack_alloc_size;
 
   // Register now that we know our thread ID.
-  kernel_state->RegisterThread(thread);
+  thread->registered_with_kernel_ = kernel_state->RegisterThread(thread);
+  if (!thread->registered_with_kernel_) {
+    thread->termination_started_.store(true, std::memory_order_release);
+    return discard_restored_thread();
+  }
 
   // Create thread state
   thread->thread_state_ = std::make_unique<runtime::ThreadState>(
       thread->thread_id_, thread->stack_base_, thread->pcr_address_, kernel_state->memory());
 
   if (state.is_running) {
+    // The saved ObjectTable count already includes the running thread's
+    // self-owned handle. Adopt it before the creation/publication handshake so
+    // a concurrent drain can release it even if no host thread is recreated.
+    thread->AdoptSelfHandle();
+
+    bool host_creation_aborted = false;
+    {
+      std::lock_guard lock(thread->host_thread_state_mutex_);
+      if (thread->termination_started_.load(std::memory_order_acquire) ||
+          thread->host_thread_state_ != HostThreadState::kNotStarted) {
+        thread->host_thread_state_ = HostThreadState::kNoHost;
+        host_creation_aborted = true;
+      } else {
+        thread->host_thread_state_ = HostThreadState::kCreating;
+      }
+    }
+    if (host_creation_aborted) {
+      thread->thread_state_cv_.notify_all();
+      return object_ref<XThread>(thread);
+    }
+
     auto context = thread->thread_state_->context();
     LoadContext(context, state);
-
-    // Always retain when starting - the thread owns itself until exited.
-    thread->RetainHandle();
 
     rex::thread::Thread::CreationParameters params;
     params.create_suspended = true;  // Not done restoring yet.
     params.stack_size = 16_MiB;
-    thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
+    auto host_thread = rex::thread::Thread::Create(params, [thread, state]() {
       // Set thread ID override. This is used by logging.
       rex::thread::set_current_thread_id(thread->handle());
       runtime::ThreadState::Bind(thread->thread_state_.get());
@@ -1380,6 +1660,12 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
       thread->thread_->set_name(thread->name());
 
       PROFILE_THREAD_ENTER(thread->name().c_str());
+
+      if (thread->termination_started_.load(std::memory_order_acquire)) {
+        thread->running_.store(false, std::memory_order_release);
+        PROFILE_THREAD_EXIT();
+        return;
+      }
 
       current_xthread_tls_ = thread;
 
@@ -1392,21 +1678,46 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
       thread->pending_mutant_acquires_.clear();
 
       // Execute user code.
-      thread->running_ = true;
+      thread->running_.store(true, std::memory_order_release);
 
       // TODO(tomc): do we need this? threads would need different restoration approach
       //             see XThread::Save
       REXSYS_ERROR("Thread restore not implemented");
       (void)state;
 
+      thread->TryBeginTermination();
+      thread->running_.store(false, std::memory_order_release);
       current_xthread_tls_ = nullptr;
 
       PROFILE_THREAD_EXIT();
 
-      // Release the self-reference to the thread.
-      thread->ReleaseHandle();
     });
-    assert_not_null(thread->thread_);
+    {
+      std::lock_guard lock(thread->thread_lock_);
+      thread->thread_ = std::move(host_thread);
+      thread->published_host_thread_.store(thread->thread_.get(), std::memory_order_release);
+    }
+    {
+      std::lock_guard lock(thread->host_thread_state_mutex_);
+      thread->host_thread_state_ =
+          thread->published_host_thread_.load(std::memory_order_acquire)
+              ? HostThreadState::kHostPublished
+              : HostThreadState::kNoHost;
+    }
+    thread->thread_state_cv_.notify_all();
+    if (!thread->thread_) {
+      REXSYS_ERROR("Could not recreate restored XThread host thread");
+      thread->TryBeginTermination();
+      thread->running_.store(false, std::memory_order_release);
+      thread->ReleaseSelfHandleOnce();
+      return discard_restored_thread();
+    }
+    auto exit_owner =
+        std::make_shared<object_ref<XThread>>(retain_object(thread));
+    thread->thread_->SetExitCallback([thread, exit_owner]() {
+      (void)exit_owner;
+      thread->ReleaseSelfHandleOnce();
+    });
 
     // NOTE(tomc): if this is kept and processor notification dispatch is implemented,
     //             this needs to send a signal to the processor that a thread was started

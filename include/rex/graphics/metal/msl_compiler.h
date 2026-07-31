@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include <rex/graphics/metal/edram_snapshot.h>
+
 namespace rex::graphics::metal {
 
 struct ProbeTextureSlot {
@@ -362,6 +364,30 @@ bool ResolvePipelineProbeDepthStencilContextToXenosTiled(
     uint32_t resolve_width, uint32_t resolve_height, bool depth_float24, bool depth_float24_round,
     uint32_t depth_sample_select, const ProbeTiledResolveTarget& destination,
     bool wait_for_completion, std::string* error_out);
+
+// Canonical 10 MiB EDRAM transfer used by deterministic trace capture and
+// playback. Color transfer preserves every guest MSAA sample and every defined
+// Xenos color storage format. Depth transfer preserves the selected D24S8 or
+// D24FS8 word, including stencil, for every sample. These functions are
+// synchronous fences: on failure no caller may advertise a complete snapshot.
+bool ExportPipelineProbeColorToCanonicalEdram(
+    void* context, uint32_t width, uint32_t height,
+    const CanonicalEdramSurfaceLayout& layout, xenos::ColorRenderTargetFormat format,
+    void* canonical_edram, size_t canonical_edram_size, std::string* error_out);
+bool RestorePipelineProbeColorFromCanonicalEdram(
+    void* context, uint32_t width, uint32_t height,
+    const CanonicalEdramSurfaceLayout& layout, xenos::ColorRenderTargetFormat format,
+    const void* canonical_edram, size_t canonical_edram_size, std::string* error_out);
+bool ExportPipelineProbeDepthStencilToCanonicalEdram(
+    void* context, uint32_t width, uint32_t height,
+    const CanonicalEdramSurfaceLayout& layout, xenos::DepthRenderTargetFormat format,
+    bool float24_round, void* canonical_edram, size_t canonical_edram_size,
+    std::string* error_out);
+bool RestorePipelineProbeDepthStencilFromCanonicalEdram(
+    void* context, uint32_t width, uint32_t height,
+    const CanonicalEdramSurfaceLayout& layout, xenos::DepthRenderTargetFormat format,
+    const void* canonical_edram, size_t canonical_edram_size, std::string* error_out);
+
 bool RenderPipelineProbe(
     void* metal_device, void* pipeline_state, const void* system_constants,
     size_t system_constants_size, const void* float_constants, size_t float_constants_size,

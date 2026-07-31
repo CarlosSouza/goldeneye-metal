@@ -216,6 +216,21 @@ TEST_CASE("retain_object helper retains and wraps", "[kernel][object_ref]") {
   CHECK(TestObject::destructor_count == 1);
 }
 
+TEST_CASE("XObject handle helpers reject objects without handles",
+          "[kernel][object_ref][object_table]") {
+  InitTestLogging();
+  DestructorCountReset reset;
+
+  auto* obj = new TestObject();
+  CHECK_FALSE(obj->RetainHandle());
+  CHECK_FALSE(obj->ReleaseHandle());
+  CHECK_FALSE(obj->RetainHandle(XObject::kHandleBase + 4));
+  CHECK_FALSE(obj->ReleaseHandle(XObject::kHandleBase + 4));
+
+  obj->Release();
+  CHECK(TestObject::destructor_count == 1);
+}
+
 // =============================================================================
 // ObjectTable Handle Allocation Tests
 // =============================================================================
@@ -359,6 +374,8 @@ TEST_CASE("ObjectTable ReleaseHandle removes at zero refs", "[kernel][object_tab
   // Handle should be gone
   auto found = table.LookupObject<XObject>(handle);
   CHECK(found.get() == nullptr);
+  CHECK(table.RetainHandle(handle) == X_STATUS_INVALID_HANDLE);
+  CHECK(table.ReleaseHandle(handle) == X_STATUS_INVALID_HANDLE);
 
   table.Reset();
 }
@@ -393,6 +410,43 @@ TEST_CASE("ObjectTable DuplicateHandle creates new handle for same object",
 
   // Object should have both handles
   CHECK(obj->handles().size() == 2);
+
+  table.Reset();
+}
+
+TEST_CASE("closing a duplicated source preserves retained internal ownership",
+          "[kernel][object_table]") {
+  InitTestLogging();
+
+  ObjectTable table;
+  auto* object = new TestObject();
+  X_HANDLE source_handle = 0;
+  REQUIRE(table.AddHandle(object, &source_handle) == X_STATUS_SUCCESS);
+
+  // Model the thread self-reference / prepared-launch lease retaining the
+  // source entry before the guest duplicates and closes its own reference.
+  REQUIRE(table.RetainHandle(source_handle, object) == X_STATUS_SUCCESS);
+  X_HANDLE duplicate_handle = 0;
+  REQUIRE(table.DuplicateHandle(source_handle, &duplicate_handle, true) == X_STATUS_SUCCESS);
+
+  auto source_lookup = table.LookupObject<XObject>(source_handle);
+  CHECK(source_lookup.get() == object);
+
+  auto* unrelated = new TestObject();
+  X_HANDLE unrelated_handle = 0;
+  REQUIRE(table.AddHandle(unrelated, &unrelated_handle) == X_STATUS_SUCCESS);
+  CHECK(unrelated_handle != source_handle);
+
+  // Once the retained owner drains, the slot may be reused. An exact-object
+  // release using the stale value must not decrement the replacement entry.
+  REQUIRE(table.ReleaseHandle(source_handle, object) == X_STATUS_SUCCESS);
+  auto* replacement = new TestObject();
+  X_HANDLE replacement_handle = 0;
+  REQUIRE(table.AddHandle(replacement, &replacement_handle) == X_STATUS_SUCCESS);
+  REQUIRE(replacement_handle == source_handle);
+  CHECK(table.ReleaseHandle(source_handle, object) == X_STATUS_INVALID_HANDLE);
+  auto replacement_lookup = table.LookupObject<XObject>(replacement_handle);
+  CHECK(replacement_lookup.get() == replacement);
 
   table.Reset();
 }

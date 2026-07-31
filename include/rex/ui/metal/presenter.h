@@ -111,6 +111,7 @@ class MetalPresenter final : public Presenter {
 
   struct GuestOutputMailboxTexture {
     void* texture = nullptr;
+    std::shared_ptr<const std::vector<uint8_t>> cpu_bgra;
     uint32_t width = 0;
     uint32_t height = 0;
     bool direct_valid = false;
@@ -155,7 +156,7 @@ class MetalPresenter final : public Presenter {
   uint32_t guest_texture_width_ = 0;
   uint32_t guest_texture_height_ = 0;
   std::mutex guest_frame_mutex_;
-  std::vector<uint8_t> guest_frame_bgra_;
+  std::shared_ptr<const std::vector<uint8_t>> guest_frame_bgra_;
   uint32_t guest_frame_width_ = 0;
   uint32_t guest_frame_height_ = 0;
   uint64_t guest_frame_generation_ = 0;

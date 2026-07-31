@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -103,6 +104,7 @@ class CommandProcessor {
   void increment_counter() { counter_.fetch_add(1, std::memory_order_acq_rel); }
   uint32_t swap_counter() const { return swap_counter_.load(std::memory_order_acquire); }
   void increment_swap_counter() { swap_counter_.fetch_add(1, std::memory_order_acq_rel); }
+  CommandRingState::Snapshot primary_ring_snapshot() const { return ring_state_.GetSnapshot(); }
   uint32_t read_ptr_index() const { return ring_state_.GetSnapshot().read_pointer; }
   uint32_t write_ptr_index() const { return ring_state_.GetSnapshot().write_pointer; }
   bool primary_ring_drained() const {
@@ -117,7 +119,9 @@ class CommandProcessor {
   virtual bool Initialize();
   virtual void Shutdown();
 
-  void CallInThread(std::function<void()> fn);
+  // Returns false if shutdown has already stopped the worker and the function
+  // could not be accepted.
+  bool CallInThread(std::function<void()> fn);
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
@@ -139,9 +143,11 @@ class CommandProcessor {
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                        bool blocking);
 
-  virtual void RequestFrameTrace(const std::filesystem::path& root_path);
-  virtual void BeginTracing(const std::filesystem::path& root_path);
-  virtual void EndTracing();
+  // The return value reports whether the worker accepted the control request,
+  // not whether a capture file has already been opened or finalized.
+  virtual bool RequestFrameTrace(const std::filesystem::path& root_path);
+  virtual bool BeginTracing(const std::filesystem::path& root_path);
+  virtual bool EndTracing();
 
   virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
 
@@ -150,7 +156,9 @@ class CommandProcessor {
   void RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ramp_256_entry_table,
                         const reg::DC_LUT_PWL_DATA* new_gamma_ramp_pwl_rgb,
                         uint32_t new_gamma_ramp_rw_component);
-  virtual void RestoreEdramSnapshot(const void* snapshot) = 0;
+  // Returns only after the backend has accepted the complete canonical image.
+  // Trace playback treats false as fatal and will not produce capture output.
+  virtual bool RestoreEdramSnapshot(const void* snapshot) = 0;
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
@@ -159,14 +167,20 @@ class CommandProcessor {
   uint32_t ReadRingBufferRegister(uint32_t index) const;
   void WriteRingBufferRegister(uint32_t index, uint32_t value);
 
-  void ExecutePacket(uint32_t ptr, uint32_t count);
+  // Executes the complete direct packet span with the existing backend
+  // fail-soft policy, but reports whether every packet handler succeeded.
+  // Live callers may ignore the result. Deterministic trace replay must not.
+  bool ExecutePacket(uint32_t ptr, uint32_t count);
+  // In addition to normal packet-handler failures, rejects packets that live
+  // Metal gameplay intentionally skips (such as unimplemented Type 3 opcodes).
+  bool ExecutePacketForTrace(uint32_t ptr, uint32_t count);
 
   // May be called by recompiled guest code immediately after a CPU memory
   // store. Backends use this as a precise, post-store wake hint for an active
   // WAIT_REG_MEM; the packet still re-reads and evaluates its own predicate.
   virtual void NotifyWaitRegMemMemoryWrite(uint32_t address, uint32_t length);
 
-  bool is_paused() const { return paused_; }
+  bool is_paused() const { return paused_.load(std::memory_order_acquire); }
   void Pause();
   void Resume();
 
@@ -174,6 +188,11 @@ class CommandProcessor {
   bool Restore(::rex::stream::ByteStream* stream);
 
  protected:
+  enum class PacketExecutionMode {
+    kLiveFailSoft,
+    kTraceFailClosed,
+  };
+
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
     xenos::Endian endianness = xenos::Endian::kNone;
@@ -243,18 +262,21 @@ class CommandProcessor {
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index,
                                 uint32_t primary_buffer_ptr, uint32_t primary_buffer_size);
   virtual void OnPrimaryBufferEnd() {}
-  void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
-  bool ExecutePacket(memory::RingBuffer* reader);
+  bool ExecuteIndirectBuffer(uint32_t ptr, uint32_t length,
+                             PacketExecutionMode mode = PacketExecutionMode::kLiveFailSoft);
+  bool ExecutePacket(memory::RingBuffer* reader,
+                     PacketExecutionMode mode = PacketExecutionMode::kLiveFailSoft);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet);
-  bool ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet);
+  bool ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet,
+                          PacketExecutionMode mode);
   bool ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count);
+                                          uint32_t count, PacketExecutionMode mode);
   bool ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
@@ -268,9 +290,12 @@ class CommandProcessor {
   virtual bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count);
   bool ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet, const char* opcode_name,
-                              uint32_t viz_query_condition, uint32_t count_remaining);
-  bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+                              uint32_t viz_query_condition, uint32_t count_remaining,
+                              PacketExecutionMode mode);
+  bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count,
+                                    PacketExecutionMode mode);
+  bool ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet, uint32_t count,
+                                      PacketExecutionMode mode);
   bool ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* reader, uint32_t packet,
                                         uint32_t count);
@@ -297,6 +322,15 @@ class CommandProcessor {
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const { return swap_post_effect_actual_; }
 
+  // Opens the trace and runs the complete backend initialization hook as one
+  // fail-closed operation. Failed initialization discards the partial file and
+  // disarms the request instead of retrying every command buffer.
+  bool OpenAndInitializeTrace(const std::filesystem::path& path, uint32_t title_id);
+  bool ExecutePacketSpan(uint32_t ptr, uint32_t count, PacketExecutionMode mode);
+  void RequestFrameTraceOnThread(const std::filesystem::path& root_path);
+  void BeginTracingOnThread(const std::filesystem::path& root_path);
+  void EndTracingOnThread();
+  void MarkTraceInitializationIncomplete() { trace_initialization_incomplete_ = true; }
   virtual void InitializeTrace();
 
   // Shared readback resolve mode with backend legacy-flag alias support.
@@ -318,12 +352,31 @@ class CommandProcessor {
   TraceState trace_state_ = TraceState::kDisabled;
   std::filesystem::path trace_stream_path_;
   std::filesystem::path trace_frame_path_;
+  bool trace_initialization_incomplete_ = false;
+  // The native GoldenEye bridge may execute direct packet spans outside the
+  // command worker. Trace controls take this gate exclusively, so opening or
+  // finalizing a capture can't overtake a span that started before the request.
+  // Packet spans share it, preserving the normal no-capture concurrency.
+  std::shared_mutex trace_lifecycle_mutex_;
+  // While capture is requested or active, packet spans must also be mutually
+  // exclusive because they all emit into the same ordered FILE stream.
+  std::mutex trace_execution_mutex_;
+  std::atomic<bool> trace_capture_active_{false};
 
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
   mutable std::mutex pending_fns_mutex_;
+  // Guarded by pending_fns_mutex_. Shutdown closes this gate before changing
+  // worker_running_, so every function reported as accepted is drained before
+  // the worker exits.
+  bool worker_accepting_functions_ = false;
   std::queue<std::function<void()>> pending_fns_;
+  std::atomic<bool> worker_paused_{false};
+  // Pause blocks until its worker callback has established the pause. Keep a
+  // concurrent Resume from overtaking that callback and leaving the worker
+  // paused after the public state has already changed back to running.
+  std::mutex pause_mutex_;
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
@@ -346,7 +399,7 @@ class CommandProcessor {
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
 
-  bool paused_ = false;
+  std::atomic<bool> paused_{false};
 
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.

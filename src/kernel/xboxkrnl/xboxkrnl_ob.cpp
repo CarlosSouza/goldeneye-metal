@@ -204,16 +204,18 @@ u32 NtDuplicateObject_entry(u32 handle, mapped_u32 new_handle_ptr, u32 options) 
   // This function actually just creates a new handle to the same object.
   // Most games use it to get real handles to the current thread or whatever.
 
+  const bool close_source = (options & 1 /* DUPLICATE_CLOSE_SOURCE */) != 0;
+  if (!new_handle_ptr && close_source) {
+    // A null output is the close-only form; don't allocate an unreachable
+    // duplicate handle.
+    return REX_KERNEL_OBJECTS()->ReleaseHandle(handle);
+  }
+
   X_HANDLE new_handle = X_INVALID_HANDLE_VALUE;
-  X_STATUS result = REX_KERNEL_OBJECTS()->DuplicateHandle(handle, &new_handle);
+  X_STATUS result = REX_KERNEL_OBJECTS()->DuplicateHandle(handle, &new_handle, close_source);
 
   if (new_handle_ptr) {
     *new_handle_ptr = new_handle;
-  }
-
-  if (options == 1 /* DUPLICATE_CLOSE_SOURCE */) {
-    // Always close the source object.
-    REX_KERNEL_OBJECTS()->RemoveHandle(handle);
   }
 
   return result;

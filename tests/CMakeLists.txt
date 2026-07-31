@@ -9,6 +9,7 @@ if(UNIX)
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         foreach(_tool_test IN ITEMS
+                metal_trace_dump_test
                 metal_profile_parser_test
                 render_regression_test
                 stability_cycle_test)

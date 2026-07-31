@@ -91,6 +91,12 @@ class MetalSharedMemory final : public SharedMemory {
   bool SynchronizeBeforeHostResourceMutation();
   bool WaitForPendingUploads();
 
+  // Writes the GPU-authored shared-memory ranges needed by trace
+  // initialization. Render-target / EDRAM state is captured separately. The
+  // shared Metal buffer is CPU-visible, so after persistent render work and
+  // pending uploads have been fenced no staging copy is required.
+  bool InitializeTraceDownload();
+
   // Commits bytes written through the guest CPU mapping to the separate Metal
   // shared-memory buffer, then publishes the range as GPU-produced data. This
   // is used by the current CPU readback/resolve path: RangeWrittenByGpu alone

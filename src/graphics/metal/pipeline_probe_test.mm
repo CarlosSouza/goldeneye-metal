@@ -27,6 +27,7 @@
 
 namespace {
 
+using rex::graphics::metal::CanonicalEdramSurfaceLayout;
 using rex::graphics::metal::ClearPipelineProbeContext;
 using rex::graphics::metal::CreateHostRenderTargetContext;
 using rex::graphics::metal::CreateMetalPipelineBinaryArchive;
@@ -36,6 +37,8 @@ using rex::graphics::metal::CreatePipelineProbeDepthSnapshotTexture;
 using rex::graphics::metal::CreatePipelineProbePackedDepthSnapshotTexture;
 using rex::graphics::metal::CreatePipelineProbeSnapshotTexture;
 using rex::graphics::metal::CreateRenderPipelineState;
+using rex::graphics::metal::ExportPipelineProbeColorToCanonicalEdram;
+using rex::graphics::metal::ExportPipelineProbeDepthStencilToCanonicalEdram;
 using rex::graphics::metal::GetPipelineProbeContextMultisampleResolveCount;
 using rex::graphics::metal::GetPipelineProbeContextPendingSubmissionCount;
 using rex::graphics::metal::GetPipelineProbeContextUploadStats;
@@ -54,11 +57,14 @@ using rex::graphics::metal::QueuePipelineProbeSnapshotCopy;
 using rex::graphics::metal::ReadPipelineProbeContext;
 using rex::graphics::metal::ReadPipelineProbeContextRect;
 using rex::graphics::metal::ReadPipelineProbeContextRectSampleSelected;
+using rex::graphics::metal::ReadCanonicalEdramSample;
 using rex::graphics::metal::ReleaseMetalPipelineBinaryArchive;
 using rex::graphics::metal::ReleaseMslLibrary;
 using rex::graphics::metal::ReleasePipelineProbeContext;
 using rex::graphics::metal::ReleasePipelineProbeSnapshotTexture;
 using rex::graphics::metal::ReleaseRenderPipelineState;
+using rex::graphics::metal::RestorePipelineProbeColorFromCanonicalEdram;
+using rex::graphics::metal::RestorePipelineProbeDepthStencilFromCanonicalEdram;
 using rex::graphics::metal::RenderPipelineCacheTelemetry;
 using rex::graphics::metal::RenderPipelineProbe;
 using rex::graphics::metal::RenderPipelineProbeToContext;
@@ -70,6 +76,7 @@ using rex::graphics::metal::SerializeMetalPipelineBinaryArchive;
 using rex::graphics::metal::SetPipelineProbeContextSampleCount;
 using rex::graphics::metal::SharePipelineProbeDepthStencilTarget;
 using rex::graphics::metal::WaitPipelineProbeContext;
+using rex::graphics::metal::WriteCanonicalEdramSample;
 
 constexpr uint32_t kWidth = 40;
 constexpr uint32_t kHeight = 40;
@@ -2880,6 +2887,139 @@ int RunPipelineProbeTest() {
                         null_waited == 0 && !null_wait_error.empty() &&
                         GetPipelineProbeContextPendingSubmissionCount(nullptr) == 0;
 
+    std::string canonical_error;
+    auto canonical_roundtrip = [&](rex::graphics::xenos::MsaaSamples msaa_samples) {
+      void* canonical_context = CreateHostRenderTargetContext(device, &canonical_error);
+      const uint32_t sample_count = uint32_t(1) << uint32_t(msaa_samples);
+      bool succeeded =
+          canonical_context &&
+          SetPipelineProbeContextSampleCount(canonical_context, sample_count,
+                                             &canonical_error);
+      CanonicalEdramSurfaceLayout color_layout;
+      color_layout.base_tiles = 301;
+      color_layout.pitch_tiles = 1;
+      color_layout.msaa_samples = msaa_samples;
+      std::vector<uint8_t> source(rex::graphics::xenos::kEdramSizeBytes, 0);
+      for (uint32_t sample = 0; sample < sample_count && succeeded; ++sample) {
+        for (uint32_t y = 0; y < kHeight && succeeded; ++y) {
+          for (uint32_t x = 0; x < kWidth; ++x) {
+            uint32_t packed = (uint32_t(17 + sample) << 0) |
+                              (uint32_t(51 + (x & 31)) << 8) |
+                              (uint32_t(103 + (y & 31)) << 16) |
+                              (uint32_t(241 - sample) << 24);
+            succeeded = WriteCanonicalEdramSample(source, color_layout, x, y,
+                                                   sample, {packed, 0});
+            if (!succeeded) {
+              break;
+            }
+          }
+        }
+      }
+      succeeded =
+          succeeded &&
+          RestorePipelineProbeColorFromCanonicalEdram(
+              canonical_context, kWidth, kHeight, color_layout,
+              rex::graphics::xenos::ColorRenderTargetFormat::k_8_8_8_8,
+              source.data(), source.size(), &canonical_error);
+      std::vector<uint8_t> exported(rex::graphics::xenos::kEdramSizeBytes, 0);
+      succeeded =
+          succeeded &&
+          ExportPipelineProbeColorToCanonicalEdram(
+              canonical_context, kWidth, kHeight, color_layout,
+              rex::graphics::xenos::ColorRenderTargetFormat::k_8_8_8_8,
+              exported.data(), exported.size(), &canonical_error);
+      for (uint32_t sample = 0; sample < sample_count && succeeded; ++sample) {
+        for (uint32_t y = 0; y < kHeight && succeeded; ++y) {
+          for (uint32_t x = 0; x < kWidth; ++x) {
+            std::array<uint32_t, 2> expected;
+            std::array<uint32_t, 2> actual;
+            succeeded =
+                ReadCanonicalEdramSample(source, color_layout, x, y, sample,
+                                         expected) &&
+                ReadCanonicalEdramSample(exported, color_layout, x, y, sample,
+                                         actual) &&
+                expected == actual;
+            if (!succeeded) {
+              break;
+            }
+          }
+        }
+      }
+
+      for (rex::graphics::xenos::DepthRenderTargetFormat depth_format :
+           {rex::graphics::xenos::DepthRenderTargetFormat::kD24S8,
+            rex::graphics::xenos::DepthRenderTargetFormat::kD24FS8}) {
+        CanonicalEdramSurfaceLayout depth_layout = color_layout;
+        depth_layout.base_tiles += 512;
+        depth_layout.is_depth = true;
+        std::fill(source.begin(), source.end(), 0);
+        for (uint32_t sample = 0; sample < sample_count && succeeded; ++sample) {
+          for (uint32_t y = 0; y < kHeight && succeeded; ++y) {
+            for (uint32_t x = 0; x < kWidth; ++x) {
+              uint32_t depth24 =
+                  depth_format ==
+                          rex::graphics::xenos::DepthRenderTargetFormat::kD24FS8
+                      ? rex::graphics::xenos::Float32To20e4(
+                            0.25f + float(sample) * 0.03125f +
+                                float((x + y) & 7) * 0.00390625f,
+                            true)
+                      : (UINT32_C(0x204060) + sample * 0x101 +
+                         x * 17 + y * 31) &
+                            0xFFFFFF;
+              uint32_t packed =
+                  (depth24 << 8) | uint8_t(0x31 + sample + x + y);
+              succeeded = WriteCanonicalEdramSample(
+                  source, depth_layout, x, y, sample, {packed, 0});
+              if (!succeeded) {
+                break;
+              }
+            }
+          }
+        }
+        succeeded =
+            succeeded &&
+            RestorePipelineProbeDepthStencilFromCanonicalEdram(
+                canonical_context, kWidth, kHeight, depth_layout, depth_format,
+                source.data(), source.size(), &canonical_error);
+        std::fill(exported.begin(), exported.end(), 0);
+        succeeded =
+            succeeded &&
+            ExportPipelineProbeDepthStencilToCanonicalEdram(
+                canonical_context, kWidth, kHeight, depth_layout, depth_format,
+                true, exported.data(), exported.size(), &canonical_error);
+        for (uint32_t sample = 0; sample < sample_count && succeeded; ++sample) {
+          for (uint32_t y = 0; y < kHeight && succeeded; ++y) {
+            for (uint32_t x = 0; x < kWidth; ++x) {
+              std::array<uint32_t, 2> expected;
+              std::array<uint32_t, 2> actual;
+              succeeded =
+                  ReadCanonicalEdramSample(source, depth_layout, x, y, sample,
+                                           expected) &&
+                  ReadCanonicalEdramSample(exported, depth_layout, x, y, sample,
+                                           actual) &&
+                  expected == actual;
+              if (!succeeded) {
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      CanonicalEdramSurfaceLayout unsupported_layout = color_layout;
+      bool unsupported_rejected =
+          !RestorePipelineProbeColorFromCanonicalEdram(
+              canonical_context, kWidth, kHeight, unsupported_layout,
+              rex::graphics::xenos::ColorRenderTargetFormat::k_16_16,
+              source.data(), source.size(), &canonical_error);
+      ReleasePipelineProbeContext(canonical_context);
+      return succeeded && unsupported_rejected;
+    };
+    bool canonical_roundtrip_ok =
+        canonical_roundtrip(rex::graphics::xenos::MsaaSamples::k1X) &&
+        canonical_roundtrip(rex::graphics::xenos::MsaaSamples::k2X) &&
+        canonical_roundtrip(rex::graphics::xenos::MsaaSamples::k4X);
+
     [fan_metal_index_buffer release];
     [fan_position_buffer release];
     ReleasePipelineProbeContext(context);
@@ -3103,6 +3243,13 @@ int RunPipelineProbeTest() {
           int(resize_new_rendered), resize_new_pending, int(resize_read), resize_pending_after_read,
           int(release_rendered), release_pending, release_context_error.c_str(), int(null_wait_ok),
           null_waited, null_wait_error.c_str());
+      return 1;
+    }
+    if (!canonical_roundtrip_ok) {
+      std::fprintf(stderr,
+                   "[metal_pipeline_probe_test] FAIL: canonical EDRAM "
+                   "BGRA8/D24S8/D24FS8 1x/2x/4x round-trip: %s\n",
+                   canonical_error.c_str());
       return 1;
     }
 

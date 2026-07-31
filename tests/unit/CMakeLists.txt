@@ -4,6 +4,7 @@ add_executable(unit_tests
     memory/heap_allocation_test.cpp
     memory/physical_host_offset_test.cpp
     graphics/command_ring_state_test.cpp
+    graphics/trace_reader_test.cpp
     graphics/metal_profile_test.cpp
     kernel/critical_section_ledger_test.cpp
     kernel/object_table_test.cpp
@@ -13,6 +14,7 @@ add_executable(unit_tests
     core/metal_performance_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
+    core/thread_native_exit_test.cpp
     core/byte_order_test.cpp
     core/chrono_test.cpp
     codegen/config_test.cpp
@@ -25,6 +27,7 @@ add_executable(unit_tests
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
     ui/mouse_event_test.cpp
+    ui/module_launch_coordinator_test.cpp
     input/input_system_test.cpp
     input/mnk_input_driver_test.cpp
     input/sdl_input_driver_test.cpp
@@ -39,13 +42,16 @@ endif()
 
 if(REXGLUE_USE_METAL)
     target_sources(unit_tests PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/graphics/metal/edram_snapshot.cpp
         graphics/metal_completion_packet_test.cpp
+        graphics/metal_edram_snapshot_test.cpp
         graphics/metal_depth_float24_test.mm
         graphics/metal_exact_resolved_surface_test.cpp
         graphics/metal_goldeneye_postprocess_alias_test.cpp
         graphics/metal_shared_memory_test.mm
         graphics/metal_sampler_util_test.cpp
         graphics/metal_texture_cache_depth_test.mm
+        ui/metal_presenter_capture_test.mm
     )
     target_link_libraries(unit_tests PRIVATE
         glslang::SPIRV

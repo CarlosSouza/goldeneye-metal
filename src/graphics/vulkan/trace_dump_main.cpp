@@ -29,6 +29,13 @@ class VulkanTraceDump final : public TraceDump {
 
   void BeginHostCapture() override {}
   void EndHostCapture() override {}
+  bool SupportsCanonicalEdramRequirements(
+      const TraceEdramRequirements& requirements,
+      std::string& limitation_out) const override {
+    (void)requirements;
+    limitation_out.clear();
+    return true;
+  }
 };
 
 }  // namespace rex::graphics::vulkan

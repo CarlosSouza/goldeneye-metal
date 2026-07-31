@@ -25,6 +25,7 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
+#include <rex/ui/module_launch_coordinator.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
@@ -175,6 +176,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Use for cleanup that depends on runtime resources.
   virtual void OnGuestThreadExit(system::XThread* thread) { (void)thread; }
 
+  /// Called immediately before an application-initiated forced title
+  /// termination. Stop background observers that inspect live guest state
+  /// here, before KernelState begins suspending and destroying guest threads.
+  virtual void OnPreTerminateTitle() {}
+
   // --- Init phase methods (called in order from OnInitialize) ---
 
   /// Resolve path defaults, load config TOML, initialize logging.
@@ -225,6 +231,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::function<void(PathConfig)> MakePreparePathsResumeCallback();
   std::function<void(PathConfig)> MakeResumeCallback();
   bool IsEffectiveInputActive() const;
+  void BeginModuleShutdown();
 
   // WindowedApp overrides
   bool OnInitialize() override;
@@ -246,6 +253,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::filesystem::path cache_root_;
   std::unique_ptr<Runtime> runtime_;
   std::unique_ptr<ui::Window> window_;
+  ui::ModuleLaunchCoordinator module_launch_coordinator_;
   std::thread module_thread_;
   std::atomic<bool> shutting_down_{false};
   std::atomic<bool> immediate_process_exit_{false};

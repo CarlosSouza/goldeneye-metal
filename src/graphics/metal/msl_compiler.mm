@@ -4603,6 +4603,589 @@ bool ReadPipelineProbeContext(void* opaque_context, uint32_t width, uint32_t hei
                                       error_out);
 }
 
+bool ExportPipelineProbeColorToCanonicalEdram(
+    void* opaque_context, uint32_t width, uint32_t height,
+    const CanonicalEdramSurfaceLayout& layout, xenos::ColorRenderTargetFormat format,
+    void* canonical_edram, size_t canonical_edram_size, std::string* error_out) {
+  auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+  if (!context || !canonical_edram || canonical_edram_size != xenos::kEdramSizeBytes || !width ||
+      !height || !layout.pitch_tiles || layout.is_depth ||
+      layout.is_64bpp != xenos::IsColorRenderTargetFormat64bpp(format) ||
+      !IsCanonicalEdramMsaaSupportedByMetal(layout.msaa_samples)) {
+    if (error_out) {
+      *error_out = "invalid canonical color export context, surface, or EDRAM destination";
+    }
+    return false;
+  }
+  // The current native target is BGRA8Unorm. Other guest formats need a
+  // format-capable target (or raw blend sidecar) before they can be exported
+  // without inventing precision that the private target never retained.
+  if (!IsCanonicalEdramColorFormatSupportedByMetal(format)) {
+    if (error_out) {
+      *error_out = "Metal BGRA8 private targets cannot canonically export this Xenos color format";
+    }
+    return false;
+  }
+  const uint32_t sample_count = GetCanonicalEdramSampleCount(layout.msaa_samples);
+  if (context->sample_count != sample_count) {
+    if (error_out) {
+      *error_out = "canonical color export sample count does not match the private target";
+    }
+    return false;
+  }
+  std::span<uint8_t> edram(static_cast<uint8_t*>(canonical_edram), canonical_edram_size);
+  for (uint32_t sample = 0; sample < sample_count; ++sample) {
+    std::vector<uint8_t> bgra;
+    std::string read_error;
+    if (!ReadPipelineProbeContextRectSampleSelected(opaque_context, width, height, 0, 0, width,
+                                                    height, sample, bgra, &read_error)) {
+      if (error_out) {
+        *error_out = "canonical color sample read failed";
+        if (!read_error.empty()) {
+          error_out->append(": ");
+          error_out->append(read_error);
+        }
+      }
+      return false;
+    }
+    if (bgra.size() != size_t(width) * height * 4) {
+      if (error_out) {
+        *error_out = "canonical color sample read returned an invalid byte count";
+      }
+      return false;
+    }
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const uint8_t* pixel = bgra.data() + (size_t(y) * width + x) * 4;
+        std::array<float, 4> rgba = {
+            float(pixel[2]) * (1.0f / 255.0f), float(pixel[1]) * (1.0f / 255.0f),
+            float(pixel[0]) * (1.0f / 255.0f), float(pixel[3]) * (1.0f / 255.0f)};
+        std::array<uint32_t, 2> words;
+        if (!PackCanonicalEdramColor(rgba, format, words) ||
+            !WriteCanonicalEdramSample(edram, layout, x, y, sample, words)) {
+          if (error_out) {
+            *error_out = "canonical color packing failed";
+          }
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+bool RestorePipelineProbeColorFromCanonicalEdram(
+    void* opaque_context, uint32_t width, uint32_t height,
+    const CanonicalEdramSurfaceLayout& layout, xenos::ColorRenderTargetFormat format,
+    const void* canonical_edram, size_t canonical_edram_size, std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    if (!context || !canonical_edram || canonical_edram_size != xenos::kEdramSizeBytes || !width ||
+        !height || !layout.pitch_tiles || layout.is_depth ||
+        layout.is_64bpp != xenos::IsColorRenderTargetFormat64bpp(format) ||
+        !IsCanonicalEdramMsaaSupportedByMetal(layout.msaa_samples)) {
+      if (error_out) {
+        *error_out = "invalid canonical color restore context, surface, or EDRAM source";
+      }
+      return false;
+    }
+    if (!IsCanonicalEdramColorFormatSupportedByMetal(format)) {
+      if (error_out) {
+        *error_out =
+            "Metal BGRA8 private targets cannot canonically restore this Xenos color format";
+      }
+      return false;
+    }
+    const uint32_t sample_count = GetCanonicalEdramSampleCount(layout.msaa_samples);
+    if (context->sample_count != sample_count ||
+        !WaitPendingPipelineProbeCommands(context, error_out, nullptr) ||
+        !EnsureProbeContextTexture(context, width, height, error_out)) {
+      return false;
+    }
+
+    static constexpr char kCanonicalColorRestoreMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 canonical_color_vertex(uint vertex_id [[vertex_id]]) {
+  float2 positions[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+  return float4(positions[vertex_id], 0.0, 1.0);
+}
+struct CanonicalColorResult {
+  float4 color [[color(0)]];
+  uint sample_mask [[sample_mask]];
+};
+fragment CanonicalColorResult canonical_color_fragment(
+    float4 position [[position]], texture2d<float, access::read> source [[texture(0)]],
+    constant uint& sample_mask [[buffer(0)]]) {
+  CanonicalColorResult result;
+  result.color = source.read(uint2(position.xy));
+  result.sample_mask = sample_mask;
+  return result;
+}
+)MSL";
+    NSError* error = nil;
+    id<MTLLibrary> library = [context->device
+        newLibraryWithSource:[NSString stringWithUTF8String:kCanonicalColorRestoreMsl]
+                     options:nil
+                       error:&error];
+    id<MTLFunction> vertex =
+        library ? [library newFunctionWithName:@"canonical_color_vertex"] : nil;
+    id<MTLFunction> fragment =
+        library ? [library newFunctionWithName:@"canonical_color_fragment"] : nil;
+    MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.vertexFunction = vertex;
+    descriptor.fragmentFunction = fragment;
+    descriptor.rasterSampleCount = sample_count;
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    id<MTLRenderPipelineState> pipeline =
+        vertex && fragment ? [context->device newRenderPipelineStateWithDescriptor:descriptor
+                                                                              error:&error]
+                           : nil;
+    [descriptor release];
+    [vertex release];
+    [fragment release];
+    [library release];
+    if (!pipeline) {
+      if (error_out) {
+        *error_out = error ? [[error localizedDescription] UTF8String]
+                           : "canonical color restore pipeline creation failed";
+      }
+      return false;
+    }
+
+    std::span<const uint8_t> edram(static_cast<const uint8_t*>(canonical_edram),
+                                   canonical_edram_size);
+    std::vector<id<MTLTexture>> sample_textures;
+    sample_textures.reserve(sample_count);
+    bool textures_ok = true;
+    for (uint32_t sample = 0; sample < sample_count; ++sample) {
+      std::vector<uint8_t> bgra(size_t(width) * height * 4);
+      for (uint32_t y = 0; y < height && textures_ok; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          std::array<uint32_t, 2> words;
+          std::array<float, 4> rgba;
+          if (!ReadCanonicalEdramSample(edram, layout, x, y, sample, words) ||
+              !UnpackCanonicalEdramColor(words, format, rgba)) {
+            textures_ok = false;
+            break;
+          }
+          auto to_byte = [](float value) {
+            if (std::isnan(value)) {
+              value = 0.0f;
+            }
+            return uint8_t(std::clamp(std::floor(value * 255.0f + 0.5f), 0.0f, 255.0f));
+          };
+          uint8_t* pixel = bgra.data() + (size_t(y) * width + x) * 4;
+          pixel[0] = to_byte(rgba[2]);
+          pixel[1] = to_byte(rgba[1]);
+          pixel[2] = to_byte(rgba[0]);
+          pixel[3] = to_byte(rgba[3]);
+        }
+      }
+      MTLTextureDescriptor* source_descriptor =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                             width:width
+                                                            height:height
+                                                         mipmapped:NO];
+      source_descriptor.storageMode = MTLStorageModeShared;
+      source_descriptor.usage = MTLTextureUsageShaderRead;
+      id<MTLTexture> source =
+          textures_ok ? [context->device newTextureWithDescriptor:source_descriptor] : nil;
+      if (source) {
+        [source replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                  mipmapLevel:0
+                    withBytes:bgra.data()
+                  bytesPerRow:size_t(width) * 4];
+        sample_textures.push_back(source);
+      } else {
+        textures_ok = false;
+      }
+    }
+    if (!textures_ok) {
+      for (id<MTLTexture> texture : sample_textures) {
+        [texture release];
+      }
+      [pipeline release];
+      if (error_out) {
+        *error_out = "canonical color restore source conversion or allocation failed";
+      }
+      return false;
+    }
+
+    id<MTLCommandBuffer> command_buffer = [context->command_queue commandBuffer];
+    bool encoded = command_buffer != nil;
+    for (uint32_t sample = 0; sample < sample_count && encoded; ++sample) {
+      if (!PrepareProbeDepthStencilSubmission(context, false, error_out)) {
+        encoded = false;
+        break;
+      }
+      MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+      ConfigureProbeColorPass(pass, context,
+                              sample ? MTLLoadActionLoad : MTLLoadActionClear,
+                              MTLClearColorMake(0.0, 0.0, 0.0, 0.0));
+      ConfigureProbeDepthStencilPass(
+          pass, context->depth_stencil_target->texture,
+          context->depth_stencil_target->initialized ? MTLLoadActionLoad : MTLLoadActionClear);
+      id<MTLRenderCommandEncoder> encoder =
+          [command_buffer renderCommandEncoderWithDescriptor:pass];
+      if (!encoder) {
+        encoded = false;
+        break;
+      }
+      uint32_t host_sample_mask = 0;
+      if (!GetProbeColorSampleMask(sample_count, sample, host_sample_mask)) {
+        [encoder endEncoding];
+        encoded = false;
+        break;
+      }
+      [encoder setRenderPipelineState:pipeline];
+      [encoder setFragmentTexture:sample_textures[sample] atIndex:0];
+      [encoder setFragmentBytes:&host_sample_mask length:sizeof(host_sample_mask)
+                        atIndex:0];
+      [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [encoder endEncoding];
+    }
+    if (encoded) {
+      [command_buffer commit];
+      [command_buffer waitUntilCompleted];
+      encoded = [command_buffer status] == MTLCommandBufferStatusCompleted;
+    }
+    for (id<MTLTexture> texture : sample_textures) {
+      [texture release];
+    }
+    [pipeline release];
+    if (!encoded) {
+      if (error_out && error_out->empty()) {
+        NSError* command_error = command_buffer ? [command_buffer error] : nil;
+        *error_out = command_error ? [[command_error localizedDescription] UTF8String]
+                                   : "canonical color restore command failed";
+      }
+      return false;
+    }
+    context->initialized = true;
+    context->color_resolve_dirty = sample_count > 1;
+    // The import render pass loads the existing shared depth target, or
+    // deterministically initializes a previously absent one to 1/0.
+    context->depth_stencil_target->initialized = true;
+    return true;
+  }
+}
+
+bool ExportPipelineProbeDepthStencilToCanonicalEdram(
+    void* opaque_context, uint32_t width, uint32_t height,
+    const CanonicalEdramSurfaceLayout& layout, xenos::DepthRenderTargetFormat format,
+    bool float24_round, void* canonical_edram, size_t canonical_edram_size,
+    std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    if (!context || !canonical_edram || canonical_edram_size != xenos::kEdramSizeBytes || !width ||
+        !height || !layout.pitch_tiles || !layout.is_depth || layout.is_64bpp ||
+        !IsCanonicalEdramDepthFormatSupportedByMetal(format) ||
+        !IsCanonicalEdramMsaaSupportedByMetal(layout.msaa_samples)) {
+      if (error_out) {
+        *error_out = "invalid canonical depth export context, surface, or EDRAM destination";
+      }
+      return false;
+    }
+    const uint32_t sample_count = GetCanonicalEdramSampleCount(layout.msaa_samples);
+    if (context->sample_count != sample_count) {
+      if (error_out) {
+        *error_out = "canonical depth export sample count does not match the private target";
+      }
+      return false;
+    }
+    const uint32_t tiled_extent = GetTiledRgba8UpperBound(width, height, width);
+    id<MTLBuffer> tiled_buffer =
+        tiled_extent ? [context->device newBufferWithLength:tiled_extent
+                                                   options:MTLResourceStorageModeShared]
+                     : nil;
+    if (!tiled_buffer) {
+      if (error_out) {
+        *error_out = "failed to allocate canonical depth export staging";
+      }
+      return false;
+    }
+    std::span<uint8_t> edram(static_cast<uint8_t*>(canonical_edram), canonical_edram_size);
+    bool succeeded = true;
+    for (uint32_t sample = 0; sample < sample_count && succeeded; ++sample) {
+      std::memset([tiled_buffer contents], 0, tiled_extent);
+      ProbeTiledResolveTarget destination;
+      destination.metal_buffer = tiled_buffer;
+      destination.pitch = width;
+      destination.height = height;
+      destination.endian = 0;
+      std::string resolve_error;
+      if (!ResolvePipelineProbeDepthStencilContextToXenosTiled(
+              opaque_context, width, height, 0, 0, width, height,
+              format == xenos::DepthRenderTargetFormat::kD24FS8, float24_round, sample,
+              destination, true, &resolve_error)) {
+        succeeded = false;
+        if (error_out) {
+          *error_out = "canonical depth sample read failed";
+          if (!resolve_error.empty()) {
+            error_out->append(": ");
+            error_out->append(resolve_error);
+          }
+        }
+        break;
+      }
+      const uint8_t* tiled = static_cast<const uint8_t*>([tiled_buffer contents]);
+      for (uint32_t y = 0; y < height && succeeded; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          uint32_t packed = 0;
+          std::memcpy(&packed, tiled + GetTiledRgba8Offset(x, y, width), sizeof(packed));
+          if (!WriteCanonicalEdramSample(edram, layout, x, y, sample, {packed, 0})) {
+            succeeded = false;
+            break;
+          }
+        }
+      }
+    }
+    [tiled_buffer release];
+    if (!succeeded && error_out && error_out->empty()) {
+      *error_out = "canonical depth packing failed";
+    }
+    return succeeded;
+  }
+}
+
+bool RestorePipelineProbeDepthStencilFromCanonicalEdram(
+    void* opaque_context, uint32_t width, uint32_t height,
+    const CanonicalEdramSurfaceLayout& layout, xenos::DepthRenderTargetFormat format,
+    const void* canonical_edram, size_t canonical_edram_size, std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    if (!context || !canonical_edram || canonical_edram_size != xenos::kEdramSizeBytes || !width ||
+        !height || !layout.pitch_tiles || !layout.is_depth || layout.is_64bpp ||
+        !IsCanonicalEdramDepthFormatSupportedByMetal(format) ||
+        !IsCanonicalEdramMsaaSupportedByMetal(layout.msaa_samples)) {
+      if (error_out) {
+        *error_out = "invalid canonical depth restore context, surface, or EDRAM source";
+      }
+      return false;
+    }
+    const uint32_t sample_count = GetCanonicalEdramSampleCount(layout.msaa_samples);
+    if (context->sample_count != sample_count ||
+        !WaitPendingPipelineProbeCommands(context, error_out, nullptr) ||
+        !EnsureProbeContextTexture(context, width, height, error_out) ||
+        !PrepareProbeDepthStencilSubmission(context, false, error_out)) {
+      return false;
+    }
+
+    const size_t pixel_count = size_t(width) * height;
+    std::vector<float> depth_values(pixel_count * sample_count);
+    std::vector<uint8_t> stencil_values(pixel_count * sample_count);
+    std::array<std::array<bool, 256>, 4> used_stencils = {};
+    std::span<const uint8_t> edram(static_cast<const uint8_t*>(canonical_edram),
+                                   canonical_edram_size);
+    for (uint32_t sample = 0; sample < sample_count; ++sample) {
+      for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          std::array<uint32_t, 2> words;
+          if (!ReadCanonicalEdramSample(edram, layout, x, y, sample, words)) {
+            if (error_out) {
+              *error_out = "canonical depth unpacking failed";
+            }
+            return false;
+          }
+          size_t index = size_t(sample) * pixel_count + size_t(y) * width + x;
+          uint32_t depth24 = words[0] >> 8;
+          depth_values[index] =
+              format == xenos::DepthRenderTargetFormat::kD24FS8
+                  ? xenos::Float20e4To32(depth24) * 0.5f
+                  : xenos::UNorm24To32(depth24);
+          stencil_values[index] = uint8_t(words[0]);
+          used_stencils[sample][stencil_values[index]] = true;
+        }
+      }
+    }
+
+    MTLTextureDescriptor* depth_source_descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    depth_source_descriptor.textureType = MTLTextureType2DArray;
+    depth_source_descriptor.arrayLength = sample_count;
+    depth_source_descriptor.storageMode = MTLStorageModeShared;
+    depth_source_descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> depth_source =
+        [context->device newTextureWithDescriptor:depth_source_descriptor];
+    depth_source_descriptor.pixelFormat = MTLPixelFormatR8Uint;
+    id<MTLTexture> stencil_source =
+        [context->device newTextureWithDescriptor:depth_source_descriptor];
+    if (!depth_source || !stencil_source) {
+      [depth_source release];
+      [stencil_source release];
+      if (error_out) {
+        *error_out = "failed to allocate canonical depth restore sources";
+      }
+      return false;
+    }
+    for (uint32_t sample = 0; sample < sample_count; ++sample) {
+      [depth_source replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                      mipmapLevel:0
+                            slice:sample
+                        withBytes:depth_values.data() + size_t(sample) * pixel_count
+                      bytesPerRow:size_t(width) * sizeof(float)
+                    bytesPerImage:pixel_count * sizeof(float)];
+      [stencil_source replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                        mipmapLevel:0
+                              slice:sample
+                          withBytes:stencil_values.data() + size_t(sample) * pixel_count
+                        bytesPerRow:width
+                      bytesPerImage:pixel_count];
+    }
+
+    static constexpr char kCanonicalDepthRestoreMsl[] = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+struct RestoreConstants { uint sample; uint stencil; uint sample_mask; };
+struct RestoreResult {
+  float depth [[depth(any)]];
+  uint sample_mask [[sample_mask]];
+};
+vertex float4 canonical_depth_vertex(uint vertex_id [[vertex_id]]) {
+  float2 positions[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+  return float4(positions[vertex_id], 0.0, 1.0);
+}
+fragment RestoreResult canonical_depth_fragment(
+    float4 position [[position]], texture2d_array<float, access::read> depths [[texture(0)]],
+    texture2d_array<uint, access::read> stencils [[texture(1)]],
+    constant RestoreConstants& constants [[buffer(0)]]) {
+  uint2 coordinate = uint2(position.xy);
+  if (stencils.read(coordinate, constants.sample).x != constants.stencil) {
+    discard_fragment();
+  }
+  RestoreResult result;
+  result.depth = depths.read(coordinate, constants.sample).x;
+  result.sample_mask = constants.sample_mask;
+  return result;
+}
+)MSL";
+    NSError* error = nil;
+    id<MTLLibrary> library = [context->device
+        newLibraryWithSource:[NSString stringWithUTF8String:kCanonicalDepthRestoreMsl]
+                     options:nil
+                       error:&error];
+    id<MTLFunction> vertex =
+        library ? [library newFunctionWithName:@"canonical_depth_vertex"] : nil;
+    id<MTLFunction> fragment =
+        library ? [library newFunctionWithName:@"canonical_depth_fragment"] : nil;
+    MTLRenderPipelineDescriptor* pipeline_descriptor =
+        [[MTLRenderPipelineDescriptor alloc] init];
+    pipeline_descriptor.vertexFunction = vertex;
+    pipeline_descriptor.fragmentFunction = fragment;
+    pipeline_descriptor.rasterSampleCount = sample_count;
+    pipeline_descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pipeline_descriptor.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+    pipeline_descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    pipeline_descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    id<MTLRenderPipelineState> pipeline =
+        vertex && fragment
+            ? [context->device newRenderPipelineStateWithDescriptor:pipeline_descriptor
+                                                              error:&error]
+            : nil;
+    [pipeline_descriptor release];
+    [vertex release];
+    [fragment release];
+    [library release];
+
+    MTLDepthStencilDescriptor* state_descriptor = [[MTLDepthStencilDescriptor alloc] init];
+    state_descriptor.depthCompareFunction = MTLCompareFunctionAlways;
+    state_descriptor.depthWriteEnabled = YES;
+    MTLStencilDescriptor* stencil_descriptor = [[MTLStencilDescriptor alloc] init];
+    stencil_descriptor.stencilCompareFunction = MTLCompareFunctionAlways;
+    stencil_descriptor.depthStencilPassOperation = MTLStencilOperationReplace;
+    stencil_descriptor.readMask = 0xFF;
+    stencil_descriptor.writeMask = 0xFF;
+    state_descriptor.frontFaceStencil = stencil_descriptor;
+    state_descriptor.backFaceStencil = stencil_descriptor;
+    id<MTLDepthStencilState> depth_stencil_state =
+        [context->device newDepthStencilStateWithDescriptor:state_descriptor];
+    [stencil_descriptor release];
+    [state_descriptor release];
+    if (!pipeline || !depth_stencil_state) {
+      [pipeline release];
+      [depth_stencil_state release];
+      [depth_source release];
+      [stencil_source release];
+      if (error_out) {
+        *error_out = error ? [[error localizedDescription] UTF8String]
+                           : "canonical depth restore pipeline creation failed";
+      }
+      return false;
+    }
+
+    id<MTLCommandBuffer> command_buffer = [context->command_queue commandBuffer];
+    bool encoded = command_buffer != nil;
+    bool first_pass = true;
+    for (uint32_t sample = 0; sample < sample_count && encoded; ++sample) {
+      uint32_t host_sample = 0;
+      if (!GetProbeDepthSample(sample_count, sample, host_sample)) {
+        encoded = false;
+        break;
+      }
+      for (uint32_t stencil = 0; stencil < 256; ++stencil) {
+        if (!used_stencils[sample][stencil]) {
+          continue;
+        }
+        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        ConfigureProbeColorPass(pass, context,
+                                context->initialized || !first_pass ? MTLLoadActionLoad
+                                                                    : MTLLoadActionClear,
+                                MTLClearColorMake(0.0, 0.0, 0.0, 0.0));
+        ConfigureProbeDepthStencilPass(
+            pass, context->depth_stencil_target->texture,
+            first_pass ? MTLLoadActionClear : MTLLoadActionLoad);
+        id<MTLRenderCommandEncoder> encoder =
+            [command_buffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+          encoded = false;
+          break;
+        }
+        struct {
+          uint32_t sample;
+          uint32_t stencil;
+          uint32_t sample_mask;
+        } constants = {sample, stencil, uint32_t(1) << host_sample};
+        [encoder setRenderPipelineState:pipeline];
+        [encoder setDepthStencilState:depth_stencil_state];
+        [encoder setStencilFrontReferenceValue:stencil backReferenceValue:stencil];
+        [encoder setFragmentTexture:depth_source atIndex:0];
+        [encoder setFragmentTexture:stencil_source atIndex:1];
+        [encoder setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+        first_pass = false;
+      }
+    }
+    if (encoded) {
+      [command_buffer commit];
+      [command_buffer waitUntilCompleted];
+      encoded = [command_buffer status] == MTLCommandBufferStatusCompleted;
+    }
+    [pipeline release];
+    [depth_stencil_state release];
+    [depth_source release];
+    [stencil_source release];
+    if (!encoded) {
+      if (error_out && error_out->empty()) {
+        NSError* command_error = command_buffer ? [command_buffer error] : nil;
+        *error_out = command_error ? [[command_error localizedDescription] UTF8String]
+                                   : "canonical depth restore command failed";
+      }
+      return false;
+    }
+    context->initialized = true;
+    context->color_resolve_dirty = sample_count > 1;
+    context->depth_stencil_target->initialized = true;
+    return true;
+  }
+}
+
 bool RenderPipelineProbe(
     void* metal_device, void* pipeline_state, const void* system_constants,
     size_t system_constants_size, const void* float_constants, size_t float_constants_size,

@@ -233,7 +233,6 @@ void GraphicsSystem::Shutdown() {
   }
 
   if (command_processor_) {
-    EndTracing();
     command_processor_->Shutdown();
     command_processor_.reset();
   }
@@ -414,11 +413,12 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
       command_processor_->InitializeShaderStorage(cache_root, title_id, true);
     } else {
       rex::thread::Fence fence;
-      command_processor_->CallInThread([this, cache_root, title_id, &fence]() {
-        command_processor_->InitializeShaderStorage(cache_root, title_id, true);
-        fence.Signal();
-      });
-      fence.Wait();
+      if (command_processor_->CallInThread([this, cache_root, title_id, &fence]() {
+            command_processor_->InitializeShaderStorage(cache_root, title_id, true);
+            fence.Signal();
+          })) {
+        fence.Wait();
+      }
     }
   } else {
     command_processor_->CallInThread([this, cache_root, title_id]() {

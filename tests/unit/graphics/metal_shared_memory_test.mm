@@ -14,9 +14,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -95,7 +98,93 @@ struct GpuPublicationProbe {
   }
 };
 
+struct TemporaryFile {
+  std::filesystem::path path;
+
+  ~TemporaryFile() {
+    std::error_code error;
+    std::filesystem::remove(path, error);
+  }
+};
+
 }  // namespace
+
+TEST_CASE("Metal trace initialization captures completed GPU-written shared memory",
+          "[graphics][metal][shared-memory][trace][integration]") {
+  @autoreleasepool {
+    rex::memory::Memory memory;
+    if (!memory.Initialize()) {
+      SKIP("Guest memory mapping is unavailable in this environment");
+    }
+    rex::graphics::TraceWriter trace_writer(memory.physical_membase());
+    rex::graphics::metal::MetalSharedMemory shared_memory(memory, trace_writer);
+
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) {
+      SKIP("No Metal device is available in this environment");
+    }
+    if (!shared_memory.Initialize((void*)device)) {
+      SKIP("Metal shared memory is unavailable in this environment");
+    }
+
+    constexpr uint32_t kTargetAddress = 0x001A0040;
+    constexpr uint32_t kTargetValue = 0xC0DEC0DE;
+    REQUIRE(shared_memory.EnqueueGpuOrderedGuestMemoryWrite(kTargetAddress, &kTargetValue,
+                                                            sizeof(kTargetValue)));
+
+    std::atomic<uint32_t> synchronization_call_count = 0;
+    shared_memory.SetHostResourceMutationCallback([&]() {
+      synchronization_call_count.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    });
+
+    TemporaryFile trace_file{
+        std::filesystem::temp_directory_path() /
+        ("rex-metal-shared-memory-trace-" +
+         std::to_string(reinterpret_cast<uintptr_t>(&shared_memory)) + ".xtr")};
+    REQUIRE(trace_writer.Open(trace_file.path, 0x584108A9));
+    REQUIRE(shared_memory.InitializeTraceDownload());
+    trace_writer.Close();
+    shared_memory.SetHostResourceMutationCallback({});
+
+    CHECK(synchronization_call_count.load(std::memory_order_relaxed) == 1);
+
+    std::ifstream trace_stream(trace_file.path, std::ios::binary | std::ios::ate);
+    REQUIRE(trace_stream.is_open());
+    std::streamsize trace_size = trace_stream.tellg();
+    REQUIRE(trace_size >=
+            std::streamsize(sizeof(rex::graphics::TraceHeader) +
+                            sizeof(rex::graphics::MemoryCommand)));
+    trace_stream.seekg(0, std::ios::beg);
+    std::vector<uint8_t> trace_bytes(static_cast<size_t>(trace_size));
+    REQUIRE(trace_stream.read(reinterpret_cast<char*>(trace_bytes.data()), trace_size));
+
+    rex::graphics::TraceHeader header = {};
+    std::memcpy(&header, trace_bytes.data(), sizeof(header));
+    CHECK(header.version == rex::graphics::kTraceFormatVersion);
+    CHECK(header.title_id == 0x584108A9);
+
+    rex::graphics::MemoryCommand command = {};
+    std::memcpy(&command, trace_bytes.data() + sizeof(header), sizeof(command));
+    uint32_t page_size = uint32_t(rex::memory::page_size());
+    uint32_t page_base = kTargetAddress & ~(page_size - 1);
+    CHECK(command.type == rex::graphics::TraceCommandType::kMemoryRead);
+    CHECK(command.base_ptr == page_base);
+    CHECK(command.encoding_format == rex::graphics::MemoryEncodingFormat::kNone);
+    CHECK(command.encoded_length == page_size);
+    CHECK(command.decoded_length == page_size);
+    REQUIRE(trace_bytes.size() == sizeof(header) + sizeof(command) + page_size);
+
+    uint32_t captured_value = 0;
+    std::memcpy(&captured_value,
+                trace_bytes.data() + sizeof(header) + sizeof(command) +
+                    (kTargetAddress - page_base),
+                sizeof(captured_value));
+    CHECK(captured_value == kTargetValue);
+
+    shared_memory.Shutdown();
+  }
+}
 
 TEST_CASE("Metal ordered completion staging is recycled only after GPU completion",
           "[graphics][metal][completion][integration]") {

@@ -10,6 +10,7 @@
  */
 
 #include <cstring>
+#include <thread>
 #include <string>
 
 #include <fmt/format.h>
@@ -42,6 +43,25 @@ constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
 // It references the current kernel state object that all kernel methods should
 // be using to stash their variables.
 KernelState* shared_kernel_state_ = nullptr;
+
+struct KernelState::TitleDrainSession {
+  enum class State {
+    kPending,
+    kOwnerExitPending,
+    kSucceeded,
+    kTimedOut,
+  };
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  State state = State::kPending;
+  std::thread::id owner_host_thread;
+  XThread* owner_guest_thread = nullptr;
+  object_ref<XThread> owner_guest_ref;
+  std::chrono::steady_clock::time_point deadline;
+  std::vector<object_ref<XThread>> targets;
+  std::string failure_detail;
+};
 
 KernelState* kernel_state() {
   return shared_kernel_state_;
@@ -152,6 +172,22 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 }
 
 KernelState::~KernelState() {
+  {
+    std::shared_ptr<TitleDrainSession> session;
+    {
+      std::lock_guard drain_lock(title_drain_mutex_);
+      session = title_drain_session_;
+    }
+    if (session) {
+      std::lock_guard session_lock(session->mutex);
+      if (session->state != TitleDrainSession::State::kSucceeded) {
+        rex::FatalError(fmt::format(
+            "~KernelState refused unsafe teardown with an incomplete title thread drain: {}",
+            session->failure_detail.empty() ? "drain still pending" : session->failure_detail));
+      }
+    }
+  }
+
   app_manager_.reset();
 
   // Stop the dispatch thread before touching the object table
@@ -837,59 +873,286 @@ std::optional<KernelState::RecompiledModuleInfo> KernelState::FindRecompiledModu
   return std::nullopt;
 }
 
-void KernelState::TerminateTitle() {
+bool KernelState::TerminateTitle(std::chrono::milliseconds timeout) {
   REXSYS_DEBUG("KernelState::TerminateTitle");
-  auto global_lock = global_critical_region_.Acquire();
+  XThread* current_guest = XThread::IsInThread() ? XThread::GetCurrentThread() : nullptr;
+  std::shared_ptr<TitleDrainSession> session;
+  bool is_owner = false;
 
-  // Suspend all running guest threads so they stop touching shared state.
-  std::vector<XThread*> suspended_threads;
-  for (auto it = threads_by_id_.begin(); it != threads_by_id_.end(); ++it) {
-    if (!XThread::IsInThread(it->second) && it->second->is_guest_thread() &&
-        it->second->is_running()) {
-      it->second->thread()->Suspend();
-      suspended_threads.push_back(it->second);
-    }
-  }
+  {
+    // Elect exactly one owner. This lock is never held across a native wait.
+    std::lock_guard drain_lock(title_drain_mutex_);
+    if (!title_drain_session_) {
+      session = std::make_shared<TitleDrainSession>();
+      session->owner_host_thread = std::this_thread::get_id();
+      session->owner_guest_thread = current_guest;
+      session->owner_guest_ref = retain_object(current_guest);
+      session->deadline = timeout == std::chrono::milliseconds::max()
+                              ? std::chrono::steady_clock::time_point::max()
+                              : std::chrono::steady_clock::now() +
+                                    std::max(timeout, std::chrono::milliseconds::zero());
 
-  // Terminate each suspended thread. Must drop the lock since Terminate waits.
-  global_lock.unlock();
-  for (auto* thread : suspended_threads) {
-    thread->Terminate(0);
-  }
-  global_lock.lock();
-
-  // Remove all guest threads from the map.
-  for (auto it = threads_by_id_.begin(); it != threads_by_id_.end();) {
-    if (!XThread::IsInThread(it->second) && it->second->is_guest_thread()) {
-      it = threads_by_id_.erase(it);
+      // Closing registration and taking the retained snapshot are one atomic
+      // operation with respect to RegisterThread.
+      {
+        auto global_lock = global_critical_region_.Acquire();
+        guest_thread_registration_open_ = false;
+        session->targets.reserve(threads_by_id_.size());
+        for (const auto& [thread_id, thread] : threads_by_id_) {
+          (void)thread_id;
+          if (thread->is_guest_thread() && thread != current_guest) {
+            session->targets.emplace_back(retain_object(thread));
+          }
+        }
+      }
+      title_drain_session_ = session;
+      is_owner = true;
     } else {
-      ++it;
+      session = title_drain_session_;
     }
   }
 
-  // If called from a guest thread, self-terminate last.
-  if (XThread::IsInThread()) {
-    threads_by_id_.erase(XThread::GetCurrentThread()->thread_id());
+  auto fail_stop_if_timed_out = [&]() {
+    std::string detail;
+    {
+      std::lock_guard session_lock(session->mutex);
+      if (session->state != TitleDrainSession::State::kTimedOut) {
+        return;
+      }
+      detail = session->failure_detail;
+    }
+    rex::FatalError(fmt::format(
+        "GoldenEye guest-thread drain timed out; runtime teardown is quarantined. {}",
+        detail));
+  };
 
-    // Now commit suicide (using Terminate, because we can't call into guest
-    // code anymore).
-    global_lock.unlock();
-    XThread::GetCurrentThread()->Terminate(0);
+  if (!is_owner) {
+    if (session->owner_host_thread == std::this_thread::get_id()) {
+      REXSYS_ERROR("TerminateTitle: recursive call by the active drain owner");
+      return false;
+    }
+
+    if (current_guest) {
+      bool current_is_target = false;
+      {
+        std::lock_guard session_lock(session->mutex);
+        current_is_target =
+            std::any_of(session->targets.begin(), session->targets.end(),
+                        [current_guest](const object_ref<XThread>& target) {
+                          return target.get() == current_guest;
+                        });
+      }
+      if (current_is_target) {
+        // A target must never wait for the session that contains itself.
+        current_guest->Terminate(0);
+        rex_unreachable();
+      }
+    }
+
+    {
+      std::unique_lock session_lock(session->mutex);
+      auto terminal = [&]() {
+        return session->state == TitleDrainSession::State::kSucceeded ||
+               session->state == TitleDrainSession::State::kTimedOut;
+      };
+      if (session->deadline == std::chrono::steady_clock::time_point::max()) {
+        session->condition.wait(session_lock, terminal);
+      } else if (!session->condition.wait_until(session_lock, session->deadline, terminal)) {
+        session->state = TitleDrainSession::State::kTimedOut;
+        session->failure_detail =
+            "a concurrent drain caller reached the shared absolute deadline";
+        session_lock.unlock();
+        session->condition.notify_all();
+      }
+    }
+    fail_stop_if_timed_out();
+    std::lock_guard session_lock(session->mutex);
+    return session->state == TitleDrainSession::State::kSucceeded;
   }
+
+  // Cancellation requests are issued to every target before any wait begins.
+  for (const auto& target : session->targets) {
+    target->PrepareForTitleDrain();
+    target->Terminate(0);
+  }
+
+  std::vector<std::string> unfinished;
+  for (const auto& target : session->targets) {
+    if (!target->WaitForExitUntil(session->deadline)) {
+      unfinished.emplace_back(
+          fmt::format("id={} name='{}'", target->thread_id(), target->thread_name_snapshot()));
+    }
+  }
+
+  if (!unfinished.empty()) {
+    std::string detail = "unfinished threads: ";
+    for (size_t i = 0; i < unfinished.size(); ++i) {
+      if (i) {
+        detail += ", ";
+      }
+      detail += unfinished[i];
+    }
+    {
+      std::lock_guard session_lock(session->mutex);
+      session->state = TitleDrainSession::State::kTimedOut;
+      session->failure_detail = std::move(detail);
+    }
+    session->condition.notify_all();
+    fail_stop_if_timed_out();
+    return false;
+  }
+
+  {
+    std::lock_guard session_lock(session->mutex);
+    if (session->state == TitleDrainSession::State::kTimedOut) {
+      // A concurrent waiter reached the same shared deadline first. Terminal
+      // drain state is monotonic and may never be rewritten to success.
+      session->condition.notify_all();
+    }
+  }
+  fail_stop_if_timed_out();
+
+  // Publish map removal only for entries that still refer to the snapshotted
+  // objects. A restored or newly assigned same-ID object must never be erased.
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (const auto& target : session->targets) {
+      auto it = threads_by_id_.find(target->thread_id());
+      if (it != threads_by_id_.end() && it->second == target.get()) {
+        threads_by_id_.erase(it);
+      }
+    }
+  }
+
+  // Release the joined secondary targets outside the global kernel lock and
+  // before publishing success. XThread destruction still uses KernelState, so
+  // a concurrent successful waiter must not be allowed to begin runtime
+  // teardown while these final references are being dropped.
+  std::vector<object_ref<XThread>> drained_targets;
+  bool terminal_timeout = false;
+  {
+    std::lock_guard session_lock(session->mutex);
+    if (session->state == TitleDrainSession::State::kTimedOut) {
+      terminal_timeout = true;
+    } else {
+      if (current_guest) {
+        session->state = TitleDrainSession::State::kOwnerExitPending;
+      }
+      drained_targets = std::move(session->targets);
+    }
+  }
+  if (terminal_timeout) {
+    fail_stop_if_timed_out();
+    return false;
+  }
+  drained_targets.clear();
+
+  if (!current_guest) {
+    {
+      std::lock_guard session_lock(session->mutex);
+      if (session->state == TitleDrainSession::State::kTimedOut) {
+        terminal_timeout = true;
+      } else {
+        session->state = TitleDrainSession::State::kSucceeded;
+      }
+    }
+    session->condition.notify_all();
+    if (terminal_timeout) {
+      fail_stop_if_timed_out();
+      return false;
+    }
+    return true;
+  }
+
+  if (current_guest) {
+    // A guest owner cannot join itself. Hand final completion to a retained
+    // host waiter; concurrent callers remain blocked until the owner has
+    // passed cancellation cleanup and TLS destruction and has been joined.
+    current_guest->PrepareForTitleDrain();
+    std::thread([this, session]() {
+      object_ref<XThread> owner;
+      {
+        std::lock_guard session_lock(session->mutex);
+        owner = session->owner_guest_ref;
+      }
+      const bool joined = owner && owner->WaitForExitUntil(session->deadline);
+      if (joined) {
+        auto global_lock = global_critical_region_.Acquire();
+        auto it = threads_by_id_.find(owner->thread_id());
+        if (it != threads_by_id_.end() && it->second == owner.get()) {
+          threads_by_id_.erase(it);
+        }
+      }
+
+      bool timed_out = false;
+      bool publish_success = false;
+      {
+        std::lock_guard session_lock(session->mutex);
+        if (session->state == TitleDrainSession::State::kTimedOut) {
+          timed_out = true;
+        } else if (joined) {
+          session->owner_guest_ref.reset();
+          publish_success = true;
+        } else {
+          session->state = TitleDrainSession::State::kTimedOut;
+          session->failure_detail = fmt::format(
+              "guest drain owner did not exit before the shared deadline: id={} name='{}'",
+              owner ? owner->thread_id() : 0,
+              owner ? owner->thread_name_snapshot() : std::string());
+          timed_out = true;
+        }
+      }
+
+      // The local owner reference can run the final XThread destructor, which
+      // still unregisters from and frees memory through KernelState. Drop it
+      // before making success visible to any runtime-teardown waiter.
+      owner.reset();
+
+      if (publish_success) {
+        std::lock_guard session_lock(session->mutex);
+        if (session->state == TitleDrainSession::State::kTimedOut) {
+          timed_out = true;
+        } else {
+          session->state = TitleDrainSession::State::kSucceeded;
+        }
+      }
+      session->condition.notify_all();
+      if (timed_out) {
+        rex::FatalError(fmt::format(
+            "GoldenEye guest-thread drain timed out; runtime teardown is quarantined. {}",
+            session->failure_detail));
+      }
+    }).detach();
+
+    current_guest->Terminate(0);
+    rex_unreachable();
+  }
+  rex_unreachable();
 }
 
-void KernelState::RegisterThread(XThread* thread) {
+bool KernelState::RegisterThread(XThread* thread) {
   auto global_lock = global_critical_region_.Acquire();
+  if (thread->is_guest_thread() && !guest_thread_registration_open_) {
+    REXSYS_WARN("RegisterThread: rejected guest thread {} while title drain is active",
+                thread->thread_id());
+    return false;
+  }
+  auto existing = threads_by_id_.find(thread->thread_id());
+  if (existing != threads_by_id_.end() && existing->second != thread) {
+    REXSYS_ERROR("RegisterThread: duplicate thread id {}", thread->thread_id());
+    return false;
+  }
   threads_by_id_[thread->thread_id()] = thread;
 
   // Thread count is now managed via thread-process linking in
   // XThread::InitializeGuestObject and XThread::Exit.
+  return true;
 }
 
 void KernelState::UnregisterThread(XThread* thread) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = threads_by_id_.find(thread->thread_id());
-  if (it != threads_by_id_.end()) {
+  if (it != threads_by_id_.end() && it->second == thread) {
     threads_by_id_.erase(it);
   }
 }

@@ -11,6 +11,7 @@
  */
 
 #include <string>
+#include <string_view>
 
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/trace_player.h>
@@ -23,6 +24,21 @@ namespace rex::graphics {
 
 struct SamplerInfo;
 struct TextureInfo;
+
+struct TraceReplayPreflight {
+  bool has_initial_edram_snapshot = false;
+  bool edram_requirements_finalized = false;
+  bool edram_requirements_tracked = false;
+  bool backend_supports_edram_requirements = false;
+
+  constexpr bool HasDeterministicEdramState() const {
+    return has_initial_edram_snapshot && edram_requirements_finalized &&
+           edram_requirements_tracked && backend_supports_edram_requirements;
+  }
+  constexpr bool PermitsReplay(bool allow_best_effort) const {
+    return HasDeterministicEdramState() || allow_best_effort;
+  }
+};
 
 class TraceDump {
  public:
@@ -37,6 +53,15 @@ class TraceDump {
 
   virtual void BeginHostCapture() = 0;
   virtual void EndHostCapture() = 0;
+  // Backends must accept the complete, finalized trace contract rather than
+  // advertise a global approximation. The default is fail-closed.
+  virtual bool SupportsCanonicalEdramRequirements(
+      const TraceEdramRequirements& requirements,
+      std::string& limitation_out) const {
+    (void)requirements;
+    limitation_out = "backend has not declared canonical EDRAM contract support";
+    return false;
+  }
 
   std::unique_ptr<Runtime> emulator_;
   GraphicsSystem* graphics_system_ = nullptr;

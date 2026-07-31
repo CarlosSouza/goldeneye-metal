@@ -36,10 +36,21 @@ TraceWriter::~TraceWriter() = default;
 bool TraceWriter::Open(const std::filesystem::path& path, uint32_t title_id) {
   Close();
 
-  auto canonical_path = std::filesystem::absolute(path);
+  std::error_code filesystem_error;
+  auto canonical_path = std::filesystem::absolute(path, filesystem_error);
+  if (filesystem_error) {
+    REXGPU_ERROR("TraceWriter: Failed to resolve trace path {}: {}", path.string(),
+                 filesystem_error.message());
+    return false;
+  }
   if (canonical_path.has_parent_path()) {
     auto base_path = canonical_path.parent_path();
-    std::filesystem::create_directories(base_path);
+    std::filesystem::create_directories(base_path, filesystem_error);
+    if (filesystem_error) {
+      REXGPU_ERROR("TraceWriter: Failed to create trace directory {}: {}",
+                   base_path.string(), filesystem_error.message());
+      return false;
+    }
   }
 
 #ifdef _WIN32
@@ -51,19 +62,30 @@ bool TraceWriter::Open(const std::filesystem::path& path, uint32_t title_id) {
     REXGPU_ERROR("TraceWriter: Failed to open trace file: {}", canonical_path.string());
     return false;
   }
+  path_ = canonical_path;
 
   REXGPU_INFO("TraceWriter: Opened trace file: {}", canonical_path.string());
 
   // Write header first. Must be at the top of the file.
-  TraceHeader header;
+  TraceHeader header = {};
   header.version = kTraceFormatVersion;
   // Use a static commit string for rexglue
   std::memset(header.build_commit_sha, 0, sizeof(header.build_commit_sha));
   std::strncpy(header.build_commit_sha, "rexglue-dev", sizeof(header.build_commit_sha) - 1);
   header.title_id = title_id;
-  fwrite(&header, sizeof(header), 1, file_);
+  header.edram_manifest = MakeTraceEdramRequirementsManifest();
+  if (fwrite(&header, sizeof(header), 1, file_) != 1) {
+    REXGPU_ERROR("TraceWriter: Failed to write trace header: {}", canonical_path.string());
+    Discard();
+    return false;
+  }
 
   cached_memory_reads_.clear();
+  edram_requirements_tracking_locked_ = false;
+  edram_requirements_tracking_enabled_ = false;
+  edram_requirements_tracking_valid_ = false;
+  allow_manifest_finalization_ = true;
+  edram_requirements_ = {};
   return true;
 }
 
@@ -77,17 +99,124 @@ void TraceWriter::Close() {
   if (file_) {
     cached_memory_reads_.clear();
 
+    if (allow_manifest_finalization_) {
+      FinalizeEdramRequirementsManifest();
+    }
     fflush(file_);
     fclose(file_);
     file_ = nullptr;
     REXGPU_INFO("TraceWriter: Closed trace file");
   }
+  path_.clear();
+  edram_requirements_tracking_locked_ = false;
+  edram_requirements_tracking_enabled_ = false;
+  edram_requirements_tracking_valid_ = false;
+  allow_manifest_finalization_ = true;
+  edram_requirements_ = {};
+}
+
+void TraceWriter::Discard() {
+  const std::filesystem::path discarded_path = path_;
+  if (file_) {
+    // A failed initialization may already have written a valid-looking header.
+    // Poison it before closing so even a filesystem removal failure is
+    // fail-closed when the path is later opened by a trace reader.
+    TraceHeader invalid_header = {};
+    std::clearerr(file_);
+    if (std::fseek(file_, 0, SEEK_SET) == 0) {
+      fwrite(&invalid_header, sizeof(invalid_header), 1, file_);
+      fflush(file_);
+    }
+  }
+  allow_manifest_finalization_ = false;
+  Close();
+  if (!discarded_path.empty()) {
+    std::error_code error;
+    if (!std::filesystem::remove(discarded_path, error) && error) {
+      REXGPU_ERROR("TraceWriter: Failed to remove incomplete trace {}: {}",
+                   discarded_path.string(), error.message());
+    }
+  }
+}
+
+bool TraceWriter::BeginEdramRequirementsTracking() {
+  if (!file_ || edram_requirements_tracking_locked_ ||
+      edram_requirements_tracking_enabled_) {
+    return false;
+  }
+  edram_requirements_tracking_enabled_ = true;
+  edram_requirements_tracking_valid_ = true;
+  edram_requirements_ = {};
+  return true;
+}
+
+bool TraceWriter::RequireEdramColorFormat(xenos::ColorRenderTargetFormat format) {
+  const uint32_t format_index = uint32_t(format);
+  if (!file_ || !edram_requirements_tracking_enabled_ ||
+      !(kTraceEdramKnownColorFormatMask & (format_index < 32 ? 1u << format_index : 0u))) {
+    InvalidateEdramRequirementsTracking();
+    return false;
+  }
+  edram_requirements_.color_format_mask |= 1u << format_index;
+  return true;
+}
+
+bool TraceWriter::RequireEdramDepthFormat(xenos::DepthRenderTargetFormat format) {
+  const uint32_t format_index = uint32_t(format);
+  if (!file_ || !edram_requirements_tracking_enabled_ ||
+      !(kTraceEdramKnownDepthFormatMask & (format_index < 32 ? 1u << format_index : 0u))) {
+    InvalidateEdramRequirementsTracking();
+    return false;
+  }
+  edram_requirements_.depth_format_mask |= 1u << format_index;
+  return true;
+}
+
+bool TraceWriter::RequireEdramMsaaSamples(xenos::MsaaSamples msaa_samples) {
+  const uint32_t samples_index = uint32_t(msaa_samples);
+  if (!file_ || !edram_requirements_tracking_enabled_ ||
+      !(kTraceEdramKnownMsaaSamplesMask &
+        (samples_index < 32 ? 1u << samples_index : 0u))) {
+    InvalidateEdramRequirementsTracking();
+    return false;
+  }
+  edram_requirements_.msaa_samples_mask |= 1u << samples_index;
+  return true;
+}
+
+void TraceWriter::InvalidateEdramRequirementsTracking() {
+  edram_requirements_tracking_valid_ = false;
+}
+
+void TraceWriter::LockEdramRequirementsTracking() {
+  edram_requirements_tracking_locked_ = true;
+}
+
+bool TraceWriter::FinalizeEdramRequirementsManifest() {
+  if (!file_ || std::fflush(file_) != 0 || std::ferror(file_)) {
+    return false;
+  }
+
+  const bool requirements_tracked =
+      edram_requirements_tracking_enabled_ && edram_requirements_tracking_valid_;
+  const TraceEdramRequirementsManifest manifest =
+      MakeTraceEdramRequirementsManifest(edram_requirements_, requirements_tracked, true);
+  const long previous_position = std::ftell(file_);
+  if (previous_position < 0 ||
+      std::fseek(file_, long(offsetof(TraceHeader, edram_manifest)), SEEK_SET) != 0 ||
+      std::fwrite(&manifest, sizeof(manifest), 1, file_) != 1 || std::fflush(file_) != 0 ||
+      std::fseek(file_, previous_position, SEEK_SET) != 0) {
+    REXGPU_ERROR("TraceWriter: Failed to finalize EDRAM requirements manifest");
+    return false;
+  }
+  return true;
 }
 
 void TraceWriter::WritePrimaryBufferStart(uint32_t base_ptr, uint32_t count) {
   if (!file_) {
     return;
   }
+  LockEdramRequirementsTracking();
   PrimaryBufferStartCommand cmd = {
       TraceCommandType::kPrimaryBufferStart,
       base_ptr,
@@ -100,6 +229,7 @@ void TraceWriter::WritePrimaryBufferEnd() {
   if (!file_) {
     return;
   }
+  LockEdramRequirementsTracking();
   PrimaryBufferEndCommand cmd = {
       TraceCommandType::kPrimaryBufferEnd,
   };
@@ -110,6 +240,7 @@ void TraceWriter::WriteIndirectBufferStart(uint32_t base_ptr, uint32_t count) {
   if (!file_) {
     return;
   }
+  LockEdramRequirementsTracking();
   IndirectBufferStartCommand cmd = {
       TraceCommandType::kIndirectBufferStart,
       base_ptr,
@@ -122,6 +253,7 @@ void TraceWriter::WriteIndirectBufferEnd() {
   if (!file_) {
     return;
   }
+  LockEdramRequirementsTracking();
   IndirectBufferEndCommand cmd = {
       TraceCommandType::kIndirectBufferEnd,
   };
@@ -132,6 +264,7 @@ void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
   if (!file_) {
     return;
   }
+  LockEdramRequirementsTracking();
   PacketStartCommand cmd = {
       TraceCommandType::kPacketStart,
       base_ptr,
@@ -145,6 +278,7 @@ void TraceWriter::WritePacketEnd() {
   if (!file_) {
     return;
   }
+  LockEdramRequirementsTracking();
   PacketEndCommand cmd = {
       TraceCommandType::kPacketEnd,
   };
@@ -204,6 +338,7 @@ class SnappySink : public snappy::Sink {
 
 void TraceWriter::WriteMemoryCommand(TraceCommandType type, uint32_t base_ptr, size_t length,
                                      const void* host_ptr) {
+  LockEdramRequirementsTracking();
   MemoryCommand cmd = {};
   cmd.type = type;
   cmd.base_ptr = base_ptr;
@@ -243,6 +378,7 @@ void TraceWriter::WriteMemoryCommand(TraceCommandType type, uint32_t base_ptr, s
 }
 
 void TraceWriter::WriteEdramSnapshot(const void* snapshot) {
+  LockEdramRequirementsTracking();
   EdramSnapshotCommand cmd = {};
   cmd.type = TraceCommandType::kEdramSnapshot;
 
@@ -278,6 +414,7 @@ void TraceWriter::WriteEvent(EventCommand::Type event_type) {
   if (!file_) {
     return;
   }
+  LockEdramRequirementsTracking();
   EventCommand cmd = {
       TraceCommandType::kEvent,
       event_type,
@@ -287,6 +424,7 @@ void TraceWriter::WriteEvent(EventCommand::Type event_type) {
 
 void TraceWriter::WriteRegisters(uint32_t first_register, const uint32_t* register_values,
                                  uint32_t register_count, bool execute_callbacks_on_play) {
+  LockEdramRequirementsTracking();
   RegistersCommand cmd = {};
   cmd.type = TraceCommandType::kRegisters;
   cmd.first_register = first_register;
@@ -325,6 +463,7 @@ void TraceWriter::WriteRegisters(uint32_t first_register, const uint32_t* regist
 void TraceWriter::WriteGammaRamp(const reg::DC_LUT_30_COLOR* gamma_ramp_256_entry_table,
                                  const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb,
                                  uint32_t gamma_ramp_rw_component) {
+  LockEdramRequirementsTracking();
   GammaRampCommand cmd = {};
   cmd.type = TraceCommandType::kGammaRamp;
   cmd.rw_component = uint8_t(gamma_ramp_rw_component);

@@ -66,6 +66,7 @@ if(REXGLUE_USE_METAL)
     set(REXGRAPHICS_METAL_SOURCES
         metal/graphics_system.cpp
         metal/command_processor.cpp
+        metal/edram_snapshot.cpp
         metal/draw_renderer.mm
         metal/msl_compiler.mm
         metal/shared_memory.mm
@@ -248,12 +249,15 @@ if(REXGLUE_USE_METAL)
     # visible render.
     add_executable(metal_pipeline_probe_test
         metal/pipeline_probe_test.mm
+        metal/edram_snapshot.cpp
         metal/msl_compiler.mm
+        xenos.cpp
     )
     target_include_directories(metal_pipeline_probe_test PRIVATE
         ${REXGLUE_ROOT}/include
     )
     target_link_libraries(metal_pipeline_probe_test PRIVATE
+        rexcore
         "-framework Metal"
         "-framework Foundation"
     )

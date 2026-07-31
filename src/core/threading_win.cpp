@@ -15,6 +15,10 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include <spdlog/spdlog.h>
 
+#include <iterator>
+#include <thread>
+#include <vector>
+
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
 
@@ -362,9 +366,35 @@ std::unique_ptr<Timer> Timer::CreateSynchronizationTimer() {
   }
 }
 
+struct Win32ThreadCompletion {
+  Win32ThreadCompletion() : event(CreateEvent(nullptr, TRUE, FALSE, nullptr)) {
+    if (!event) {
+      rex::FatalError("Unable to create Win32 thread completion event");
+    }
+  }
+
+  ~Win32ThreadCompletion() {
+    if (event) {
+      CloseHandle(event);
+    }
+  }
+
+  HANDLE event = nullptr;
+  std::mutex mutex;
+  bool callbacks_closed = false;
+  bool callback_captures_released = false;
+  size_t synchronous_callbacks_in_flight = 0;
+  bool completed = false;
+  DWORD wait_result = WAIT_FAILED;
+  std::vector<std::function<void()>> exit_callbacks;
+};
+
 class Win32Thread : public Win32Handle<Thread> {
  public:
-  explicit Win32Thread(HANDLE handle) : Win32Handle(handle) {}
+  explicit Win32Thread(HANDLE handle)
+      : Win32Handle(handle), completion_(std::make_shared<Win32ThreadCompletion>()) {
+    StartExitObserver();
+  }
   ~Win32Thread() = default;
 
   void set_name(std::string name) override {
@@ -433,8 +463,152 @@ class Win32Thread : public Win32Handle<Thread> {
 
   void Terminate(int exit_code) override { TerminateThread(handle_, exit_code); }
 
+  WaitResult WaitForExitUntil(std::chrono::steady_clock::time_point deadline) override {
+    DWORD timeout = INFINITE;
+    if (deadline != std::chrono::steady_clock::time_point::max()) {
+      const auto now = std::chrono::steady_clock::now();
+      if (deadline <= now) {
+        timeout = 0;
+      } else {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        timeout = static_cast<DWORD>(
+            std::min<int64_t>(remaining.count(), static_cast<int64_t>(INFINITE - 1)));
+      }
+    }
+    const DWORD result = WaitForSingleObject(completion_->event, timeout);
+    if (result == WAIT_OBJECT_0) {
+      std::lock_guard lock(completion_->mutex);
+      return completion_->wait_result == WAIT_OBJECT_0 ? WaitResult::kSuccess
+                                                       : WaitResult::kFailed;
+    }
+    if (result == WAIT_TIMEOUT) {
+      return WaitResult::kTimeout;
+    }
+    return WaitResult::kFailed;
+  }
+
+  void SetExitCallback(std::function<void()> callback) override {
+    if (!callback) {
+      return;
+    }
+    auto completion = completion_;
+    bool run_now = false;
+    bool track_synchronous_callback = false;
+    {
+      std::lock_guard lock(completion->mutex);
+      if (completion->callbacks_closed) {
+        run_now = true;
+        if (!completion->completed) {
+          ++completion->synchronous_callbacks_in_flight;
+          track_synchronous_callback = true;
+        }
+      } else {
+        completion->exit_callbacks.emplace_back(std::move(callback));
+      }
+    }
+    if (run_now) {
+      auto finish_synchronous_callback = [&]() {
+        callback = {};
+        if (!track_synchronous_callback) {
+          return;
+        }
+
+        bool signal_completion = false;
+        {
+          std::lock_guard lock(completion->mutex);
+          assert_true(completion->synchronous_callbacks_in_flight != 0);
+          --completion->synchronous_callbacks_in_flight;
+          if (completion->callback_captures_released &&
+              completion->synchronous_callbacks_in_flight == 0 &&
+              !completion->completed) {
+            completion->completed = true;
+            signal_completion = true;
+          }
+        }
+        if (signal_completion) {
+          SetEvent(completion->event);
+        }
+      };
+
+      try {
+        callback();
+      } catch (...) {
+        finish_synchronous_callback();
+        throw;
+      }
+      finish_synchronous_callback();
+    }
+  }
+
  private:
+  void StartExitObserver() {
+    HANDLE wait_handle = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), handle_, GetCurrentProcess(), &wait_handle, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+      rex::FatalError("Unable to duplicate Win32 thread handle for exit observation");
+    }
+
+    auto completion = completion_;
+    try {
+      std::thread([completion, wait_handle]() {
+        const DWORD wait_result = WaitForSingleObject(wait_handle, INFINITE);
+        CloseHandle(wait_handle);
+
+        // Drain to a fixed point. A callback registered while callbacks are
+        // running joins the next batch; a callback registered after the queue
+        // closes runs synchronously and is tracked until its captures release.
+        std::vector<std::function<void()>> callback_lifetimes;
+        while (true) {
+          std::vector<std::function<void()>> callbacks;
+          {
+            std::lock_guard lock(completion->mutex);
+            callbacks = std::move(completion->exit_callbacks);
+            if (callbacks.empty()) {
+              completion->wait_result = wait_result;
+              completion->callbacks_closed = true;
+              break;
+            }
+          }
+          for (auto& callback : callbacks) {
+            if (callback) {
+              callback();
+            }
+          }
+          // An XThread exit callback retains its owner. Keep the invoked
+          // callback alive until after completion publication so it cannot
+          // destroy the Win32Thread while the observer is still finishing.
+          callback_lifetimes.insert(
+              callback_lifetimes.end(), std::make_move_iterator(callbacks.begin()),
+              std::make_move_iterator(callbacks.end()));
+        }
+
+        callback_lifetimes.clear();
+
+        bool signal_completion = false;
+        {
+          std::lock_guard lock(completion->mutex);
+          completion->callback_captures_released = true;
+          if (completion->synchronous_callbacks_in_flight == 0) {
+            completion->completed = true;
+            signal_completion = true;
+          }
+        }
+        if (signal_completion) {
+          SetEvent(completion->event);
+        }
+      }).detach();
+    } catch (...) {
+      CloseHandle(wait_handle);
+      rex::FatalError("Unable to start Win32 thread exit observer");
+    }
+  }
+
   void AssertCallingThread() { assert_true(GetCurrentThreadId() == GetThreadId(handle_)); }
+
+  void* native_handle() const override { return completion_->event; }
+
+  std::shared_ptr<Win32ThreadCompletion> completion_;
 };
 
 thread_local std::unique_ptr<Win32Thread> current_thread_ = nullptr;

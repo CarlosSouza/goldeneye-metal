@@ -79,13 +79,23 @@ XObject::Type XObject::type() const {
   return type_;
 }
 
-void XObject::RetainHandle() {
-  kernel_state_->object_table()->RetainHandle(handles_[0]);
+bool XObject::RetainHandle() {
+  return !handles_.empty() && RetainHandle(handles_[0]);
+}
+
+bool XObject::RetainHandle(X_HANDLE handle) {
+  return kernel_state_ &&
+         kernel_state_->object_table()->RetainHandle(handle, this) == X_STATUS_SUCCESS;
 }
 
 bool XObject::ReleaseHandle() {
-  // FIXME: Return true when handle is actually released.
-  return kernel_state_->object_table()->ReleaseHandle(handles_[0]) == X_STATUS_SUCCESS;
+  return !handles_.empty() && ReleaseHandle(handles_[0]);
+}
+
+bool XObject::ReleaseHandle(X_HANDLE handle) {
+  // FIXME: Return true only when the table entry is actually removed.
+  return kernel_state_ &&
+         kernel_state_->object_table()->ReleaseHandle(handle, this) == X_STATUS_SUCCESS;
 }
 
 void XObject::Retain() {

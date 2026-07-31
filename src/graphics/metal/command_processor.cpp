@@ -15,6 +15,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -2648,8 +2649,73 @@ void MetalCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t
   InvalidateGoldenEyePostprocessAliases(base_ptr, length);
 }
 
-void MetalCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
-  (void)snapshot;
+bool MetalCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  if (!snapshot || !EnsureEdramBgraBacking()) {
+    return false;
+  }
+  if (!WaitForPipelineProbeSubmissions("canonical-edram-restore")) {
+    REXGPU_ERROR("Metal failed to drain private targets before restoring canonical EDRAM");
+    return false;
+  }
+  // A trace snapshot replaces the complete physical EDRAM allocation. Drop
+  // every private alias so no target created before the restore can later
+  // overwrite the new raw contents. Targets are recreated and hydrated lazily
+  // with the exact dimensions of their first replay operation.
+  host_render_target_context_override_ = nullptr;
+  for (auto& [key, target] : host_render_targets_) {
+    (void)key;
+    ReleasePipelineProbeContext(target.context);
+    target.context = nullptr;
+  }
+  host_render_targets_.clear();
+  for (auto& [key, target] : host_depth_stencil_targets_) {
+    (void)key;
+    ReleasePipelineProbeContext(target.context);
+    target.context = nullptr;
+  }
+  host_depth_stencil_targets_.clear();
+  std::memcpy(edram_bgra_.data(), snapshot, xenos::kEdramSizeBytes);
+  canonical_edram_ownership_.Reset();
+  canonical_edram_valid_ = true;
+  canonical_edram_transfer_active_ = false;
+  canonical_edram_unsupported_state_ = false;
+  latest_host_render_target_bgra_.clear();
+  latest_host_render_target_width_ = 0;
+  latest_host_render_target_height_ = 0;
+  last_host_render_target_probe_read_ = false;
+  return true;
+}
+
+void MetalCommandProcessor::InitializeTrace() {
+  if (!trace_writer_.BeginEdramRequirementsTracking()) {
+    REXGPU_ERROR("Metal trace initialization could not begin EDRAM requirement tracking");
+    MarkTraceInitializationIncomplete();
+    return;
+  }
+  CommandProcessor::InitializeTrace();
+  std::vector<uint8_t> canonical_edram;
+  std::string canonical_error;
+  if (!CaptureCanonicalEdramSnapshot(canonical_edram, &canonical_error)) {
+    REXGPU_ERROR("Metal trace initialization failed to capture canonical EDRAM: {}",
+                 canonical_error);
+    MarkTraceInitializationIncomplete();
+    return;
+  }
+  trace_writer_.WriteEdramSnapshot(canonical_edram.data());
+  if (!shared_memory_) {
+    REXGPU_ERROR("Metal trace initialization has no shared-memory capture source");
+    MarkTraceInitializationIncomplete();
+    return;
+  }
+  if (!FlushGpuCompletionMemoryWrites()) {
+    REXGPU_ERROR("Metal trace initialization failed to enqueue pending completion writes");
+    MarkTraceInitializationIncomplete();
+    return;
+  }
+  if (!shared_memory_->InitializeTraceDownload()) {
+    REXGPU_ERROR("Metal trace initialization failed to capture GPU-written shared memory");
+    MarkTraceInitializationIncomplete();
+  }
 }
 
 bool MetalCommandProcessor::SetupContext() {
@@ -2752,15 +2818,30 @@ void MetalCommandProcessor::ClearCaches() {
   if (shared_memory_) {
     shared_memory_->ClearCache();
   }
+  std::vector<uint8_t> canonical_edram;
+  std::string canonical_error;
+  if (!canonical_edram_unsupported_state_ &&
+      !CaptureCanonicalEdramSnapshot(canonical_edram, &canonical_error)) {
+    canonical_edram_unsupported_state_ = true;
+    REXGPU_WARN("Metal cache clear could not preserve canonical EDRAM: {}",
+                canonical_error);
+  }
+  if (!canonical_edram_unsupported_state_) {
+    canonical_edram_ownership_.Reset();
+  }
   for (auto& rt_entry : host_render_targets_) {
     if (rt_entry.second.context) {
       ResetPipelineProbeContext(rt_entry.second.context);
     }
+    rt_entry.second.canonical_hydrated = false;
+    rt_entry.second.canonical_hydrated_sequence = 0;
   }
   for (auto& depth_entry : host_depth_stencil_targets_) {
     if (depth_entry.second.context) {
       ResetPipelineProbeDepthStencilTarget(depth_entry.second.context);
     }
+    depth_entry.second.canonical_hydrated = false;
+    depth_entry.second.canonical_hydrated_sequence = 0;
   }
 }
 
@@ -2851,6 +2932,11 @@ void MetalCommandProcessor::ShutdownContext() {
     depth_entry.second.context = nullptr;
   }
   host_depth_stencil_targets_.clear();
+  canonical_edram_ownership_.Reset();
+  edram_bgra_.clear();
+  canonical_edram_valid_ = false;
+  canonical_edram_transfer_active_ = false;
+  canonical_edram_unsupported_state_ = false;
   ReleasePipelineProbeContext(host_render_target_context_);
   host_render_target_context_ = nullptr;
   host_render_target_context_override_ = nullptr;
@@ -5506,6 +5592,18 @@ bool MetalCommandProcessor::IssueCopy() {
     resolve_info_valid =
         draw_util::GetResolveInfo(*register_file_, *memory_, trace_writer_, resolve_scale_x,
                                   resolve_scale_y, false, false, resolve_info);
+    if (resolve_info_valid) {
+      if (!resolve_info.IsCopyingDepth() || active_copy_control.color_clear_enable) {
+        RecordCanonicalColorRequirement(
+            xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format),
+            resolve_info.color_edram_info.msaa_samples);
+      }
+      if (resolve_info.IsCopyingDepth() || active_copy_control.depth_clear_enable) {
+        RecordCanonicalDepthRequirement(
+            xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format),
+            resolve_info.depth_edram_info.msaa_samples);
+      }
+    }
     if (log_copy_diagnostics) {
       draw_util::ResolveCopyShaderConstants copy_shader_constants = {};
       uint32_t copy_group_count_x = 0;
@@ -6804,11 +6902,23 @@ bool MetalCommandProcessor::IssueCopy() {
             uint32_t clear_width = std::min(copy_width, clear_target_width - clear_x);
             uint32_t clear_height = std::min(copy_height, clear_target_height - clear_y);
             std::string clear_error;
-            if (QueuePipelineProbeContextClearRect(
+            if (PrepareCanonicalContextForUse(resolve_host_rt->context, clear_target_width,
+                                              clear_target_height, &clear_error) &&
+                QueuePipelineProbeContextClearRect(
                     resolve_host_rt->context, clear_target_width, clear_target_height, clear_x,
                     clear_y, clear_width, clear_height, double(clear_r) / 255.0,
                     double(clear_g) / 255.0, double(clear_b) / 255.0, double(clear_a) / 255.0,
                     &clear_error)) {
+              auto clear_owner_it = std::find_if(
+                  host_render_targets_.begin(), host_render_targets_.end(),
+                  [resolve_host_rt](const auto& entry) {
+                    return &entry.second == resolve_host_rt;
+                  });
+              if (clear_width && clear_height &&
+                  clear_owner_it != host_render_targets_.end()) {
+                MarkCanonicalColorTargetWritten(clear_owner_it->second,
+                                                clear_owner_it->first);
+              }
               if (gpu_tiled_resolve || regional_host_rt_readback) {
                 // A rectangular read is exact only inside its source region. Do
                 // not publish the zero-filled staging image as a full CPU mirror.
@@ -6917,10 +7027,19 @@ bool MetalCommandProcessor::IssueCopy() {
                               ? xenos::Float20e4To32(packed_depth) * 0.5f
                               : xenos::UNorm24To32(packed_depth);
       std::string depth_clear_error;
-      if (!QueuePipelineProbeContextDepthStencilClearRect(
-              depth_owner->context, target_width, target_height, clear_x, clear_y, clear_width,
-              clear_height, clear_depth, uint8_t(resolve_info.rb_depth_clear),
-              &depth_clear_error)) {
+      auto depth_owner_it = std::find_if(
+          host_depth_stencil_targets_.begin(), host_depth_stencil_targets_.end(),
+          [depth_owner](const auto& entry) { return &entry.second == depth_owner; });
+      bool depth_clear_succeeded =
+          depth_owner_it != host_depth_stencil_targets_.end() &&
+          PrepareCanonicalDepthTargetForUse(depth_owner_it->second, depth_owner_it->first,
+                                            target_width, target_height,
+                                            &depth_clear_error) &&
+          QueuePipelineProbeContextDepthStencilClearRect(
+              depth_owner->context, target_width, target_height, clear_x, clear_y,
+              clear_width, clear_height, clear_depth,
+              uint8_t(resolve_info.rb_depth_clear), &depth_clear_error);
+      if (!depth_clear_succeeded) {
         static std::atomic<uint32_t> depth_clear_failure_logs{0};
         uint32_t failure_index =
             depth_clear_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -6929,6 +7048,8 @@ bool MetalCommandProcessor::IssueCopy() {
                        failure_index, depth_clear_error.c_str());
           std::fflush(stderr);
         }
+      } else if (clear_width && clear_height) {
+        MarkCanonicalDepthTargetWritten(depth_owner_it->second, depth_owner_it->first);
       }
     } else {
       static std::atomic<uint32_t> missing_depth_clear_owner_logs{0};
@@ -8045,6 +8166,8 @@ bool MetalCommandProcessor::EnsureEdramBgraBacking() {
     return true;
   }
   edram_bgra_.assign(xenos::kEdramSizeBytes, 0);
+  canonical_edram_valid_ = true;
+  canonical_edram_unsupported_state_ = false;
   static std::atomic<uint32_t> edram_backing_logs{0};
   uint32_t edram_backing_index = edram_backing_logs.fetch_add(1, std::memory_order_relaxed) + 1;
   if (edram_backing_index <= 4 || (edram_backing_index & 0x3F) == 0) {
@@ -8053,6 +8176,450 @@ bool MetalCommandProcessor::EnsureEdramBgraBacking() {
     std::fflush(stderr);
   }
   return true;
+}
+
+CanonicalEdramSurfaceLayout MetalCommandProcessor::GetCanonicalColorLayout(
+    const HostRenderTarget& target) const {
+  reg::RB_COLOR_INFO color_info = {};
+  color_info.value = target.color_info;
+  reg::RB_SURFACE_INFO surface_info = {};
+  surface_info.value = target.surface_info;
+  CanonicalEdramSurfaceLayout layout;
+  layout.base_tiles =
+      (color_info.color_base | (color_info.color_base_bit_11 << 11)) &
+      (xenos::kEdramTileCount - 1);
+  layout.msaa_samples = surface_info.msaa_samples;
+  layout.is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_info.color_format);
+  layout.pitch_tiles =
+      xenos::GetSurfacePitchTiles(surface_info.surface_pitch, surface_info.msaa_samples,
+                                  layout.is_64bpp);
+  return layout;
+}
+
+CanonicalEdramSurfaceLayout MetalCommandProcessor::GetCanonicalDepthLayout(
+    const HostDepthStencilTarget& target) const {
+  reg::RB_DEPTH_INFO depth_info = {};
+  depth_info.value = target.depth_info;
+  reg::RB_SURFACE_INFO surface_info = {};
+  surface_info.value = target.surface_info;
+  CanonicalEdramSurfaceLayout layout;
+  layout.base_tiles =
+      (depth_info.depth_base | (depth_info.depth_base_bit_11 << 11)) &
+      (xenos::kEdramTileCount - 1);
+  layout.pitch_tiles =
+      xenos::GetSurfacePitchTiles(surface_info.surface_pitch, surface_info.msaa_samples, false);
+  layout.msaa_samples = surface_info.msaa_samples;
+  layout.is_depth = true;
+  return layout;
+}
+
+void MetalCommandProcessor::RecordCanonicalColorRequirement(
+    xenos::ColorRenderTargetFormat format, xenos::MsaaSamples msaa_samples) {
+  if (!trace_writer_.is_open()) {
+    return;
+  }
+  trace_writer_.RequireEdramColorFormat(format);
+  trace_writer_.RequireEdramMsaaSamples(msaa_samples);
+}
+
+void MetalCommandProcessor::RecordCanonicalDepthRequirement(
+    xenos::DepthRenderTargetFormat format, xenos::MsaaSamples msaa_samples) {
+  if (!trace_writer_.is_open()) {
+    return;
+  }
+  trace_writer_.RequireEdramDepthFormat(format);
+  trace_writer_.RequireEdramMsaaSamples(msaa_samples);
+}
+
+bool MetalCommandProcessor::CaptureCanonicalEdramSnapshot(std::vector<uint8_t>& snapshot_out,
+                                                          std::string* error_out) {
+  if (canonical_edram_unsupported_state_) {
+    if (error_out) {
+      *error_out =
+          "the live EDRAM state used a private Metal format outside the exact capture subset";
+    }
+    return false;
+  }
+  if (canonical_edram_transfer_active_) {
+    if (error_out) {
+      *error_out = "recursive canonical EDRAM transfer";
+    }
+    return false;
+  }
+  canonical_edram_transfer_active_ = true;
+  struct TransferGuard {
+    bool& active;
+    ~TransferGuard() { active = false; }
+  } transfer_guard{canonical_edram_transfer_active_};
+
+  if (!EnsureEdramBgraBacking() || !WaitForPipelineProbeSubmissions("canonical-edram-export")) {
+    if (error_out) {
+      *error_out = "failed to fence Metal targets before canonical EDRAM export";
+    }
+    return false;
+  }
+  snapshot_out = edram_bgra_;
+  std::vector<std::pair<CanonicalEdramOwnerKind, uint64_t>> owners;
+  owners.reserve(host_render_targets_.size() + host_depth_stencil_targets_.size());
+  for (uint32_t tile = 0; tile < xenos::kEdramTileCount; ++tile) {
+    const CanonicalEdramTileOwner& owner = canonical_edram_ownership_.owner(tile);
+    if (owner.kind != CanonicalEdramOwnerKind::kRawSnapshot && owner.target_key) {
+      owners.emplace_back(owner.kind, owner.target_key);
+    }
+  }
+  std::sort(owners.begin(), owners.end(), [](const auto& left, const auto& right) {
+    return std::tie(left.first, left.second) < std::tie(right.first, right.second);
+  });
+  owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
+
+  std::vector<uint8_t> target_snapshot;
+  for (const auto& [kind, key] : owners) {
+    target_snapshot = snapshot_out;
+    std::string target_error;
+    bool exported = false;
+    if (kind == CanonicalEdramOwnerKind::kColorTarget) {
+      auto target_it = host_render_targets_.find(key);
+      if (target_it == host_render_targets_.end() || !target_it->second.context) {
+        target_error = "authoritative color target no longer exists";
+      } else {
+        HostRenderTarget& target = target_it->second;
+        reg::RB_COLOR_INFO color_info = {};
+        color_info.value = target.color_info;
+        RecordCanonicalColorRequirement(color_info.color_format,
+                                        GetCanonicalColorLayout(target).msaa_samples);
+        exported = ExportPipelineProbeColorToCanonicalEdram(
+            target.context, target.canonical_width, target.canonical_height,
+            GetCanonicalColorLayout(target), color_info.color_format, target_snapshot.data(),
+            target_snapshot.size(), &target_error);
+      }
+    } else if (kind == CanonicalEdramOwnerKind::kDepthStencilTarget) {
+      auto target_it = host_depth_stencil_targets_.find(key);
+      if (target_it == host_depth_stencil_targets_.end() || !target_it->second.context) {
+        target_error = "authoritative depth/stencil target no longer exists";
+      } else {
+        HostDepthStencilTarget& target = target_it->second;
+        reg::RB_DEPTH_INFO depth_info = {};
+        depth_info.value = target.depth_info;
+        RecordCanonicalDepthRequirement(depth_info.depth_format,
+                                        GetCanonicalDepthLayout(target).msaa_samples);
+        exported = ExportPipelineProbeDepthStencilToCanonicalEdram(
+            target.context, target.width, target.height, GetCanonicalDepthLayout(target),
+            depth_info.depth_format, REXCVAR_GET(depth_float24_round), target_snapshot.data(),
+            target_snapshot.size(), &target_error);
+      }
+    }
+    if (!exported ||
+        !canonical_edram_ownership_.MergeOwnedTiles(snapshot_out, target_snapshot, kind, key)) {
+      if (error_out) {
+        *error_out = "failed to export authoritative canonical EDRAM target";
+        if (!target_error.empty()) {
+          error_out->append(": ");
+          error_out->append(target_error);
+        }
+      }
+      return false;
+    }
+  }
+  edram_bgra_ = snapshot_out;
+  canonical_edram_valid_ = true;
+  return true;
+}
+
+bool MetalCommandProcessor::RestoreCanonicalColorTarget(HostRenderTarget& target,
+                                                        uint64_t target_key,
+                                                        std::string* error_out) {
+  reg::RB_COLOR_INFO color_info = {};
+  color_info.value = target.color_info;
+  CanonicalEdramSurfaceLayout layout = GetCanonicalColorLayout(target);
+  if (!IsCanonicalEdramColorFormatSupportedByMetal(color_info.color_format) ||
+      !IsCanonicalEdramMsaaSupportedByMetal(layout.msaa_samples)) {
+    canonical_edram_unsupported_state_ = true;
+    return true;
+  }
+  if (canonical_edram_unsupported_state_ || !canonical_edram_valid_) {
+    return true;
+  }
+  const uint32_t width = target.canonical_width;
+  const uint32_t height = target.canonical_height;
+  if (!width || !height) {
+    if (error_out) {
+      *error_out = "canonical color target has no recorded extent";
+    }
+    return false;
+  }
+  bool needs_hydration =
+      !target.canonical_hydrated ||
+      canonical_edram_ownership_.SurfaceNeedsHydration(
+          layout, width, height, CanonicalEdramOwnerKind::kColorTarget, target_key,
+          target.canonical_hydrated_sequence);
+  if (!needs_hydration) {
+    return true;
+  }
+  if (!canonical_edram_transfer_active_) {
+    std::vector<uint8_t> synchronized_snapshot;
+    if (!CaptureCanonicalEdramSnapshot(synchronized_snapshot, error_out)) {
+      return false;
+    }
+  }
+  if (!RestorePipelineProbeColorFromCanonicalEdram(
+          target.context, width, height, layout, color_info.color_format, edram_bgra_.data(),
+          edram_bgra_.size(), error_out)) {
+    return false;
+  }
+  target.canonical_hydrated = true;
+  target.canonical_hydrated_sequence = canonical_edram_ownership_.sequence();
+  return true;
+}
+
+bool MetalCommandProcessor::RestoreCanonicalDepthTarget(HostDepthStencilTarget& target,
+                                                        uint64_t target_key,
+                                                        std::string* error_out) {
+  reg::RB_DEPTH_INFO depth_info = {};
+  depth_info.value = target.depth_info;
+  CanonicalEdramSurfaceLayout layout = GetCanonicalDepthLayout(target);
+  if (!IsCanonicalEdramDepthFormatSupportedByMetal(depth_info.depth_format) ||
+      !IsCanonicalEdramMsaaSupportedByMetal(layout.msaa_samples)) {
+    canonical_edram_unsupported_state_ = true;
+    return true;
+  }
+  if (canonical_edram_unsupported_state_ || !canonical_edram_valid_) {
+    return true;
+  }
+  const uint32_t width = target.width;
+  const uint32_t height = target.height;
+  if (!width || !height) {
+    if (error_out) {
+      *error_out = "canonical depth/stencil target has no recorded extent";
+    }
+    return false;
+  }
+  bool needs_hydration =
+      !target.canonical_hydrated ||
+      canonical_edram_ownership_.SurfaceNeedsHydration(
+          layout, width, height, CanonicalEdramOwnerKind::kDepthStencilTarget, target_key,
+          target.canonical_hydrated_sequence);
+  if (!needs_hydration) {
+    return true;
+  }
+  if (!canonical_edram_transfer_active_) {
+    std::vector<uint8_t> synchronized_snapshot;
+    if (!CaptureCanonicalEdramSnapshot(synchronized_snapshot, error_out)) {
+      return false;
+    }
+  }
+  if (!RestorePipelineProbeDepthStencilFromCanonicalEdram(
+          target.context, width, height, layout, depth_info.depth_format, edram_bgra_.data(),
+          edram_bgra_.size(), error_out)) {
+    return false;
+  }
+  target.canonical_hydrated = true;
+  target.canonical_hydrated_sequence = canonical_edram_ownership_.sequence();
+  return true;
+}
+
+bool MetalCommandProcessor::PrepareCanonicalContextForUse(void* context, uint32_t width,
+                                                          uint32_t height,
+                                                          std::string* error_out) {
+  if (!context || !width || !height) {
+    if (error_out) {
+      *error_out = "invalid canonical target context or extent";
+    }
+    return false;
+  }
+  auto color_it =
+      std::find_if(host_render_targets_.begin(), host_render_targets_.end(),
+                   [context](const auto& entry) { return entry.second.context == context; });
+  // Standalone diagnostic contexts don't represent guest EDRAM.
+  if (color_it == host_render_targets_.end()) {
+    return true;
+  }
+  HostRenderTarget& color_target = color_it->second;
+  auto depth_it = host_depth_stencil_targets_.find(color_target.depth_stencil_key);
+  if (depth_it == host_depth_stencil_targets_.end() || !depth_it->second.context) {
+    if (error_out) {
+      *error_out = "canonical color target has no attached depth/stencil owner";
+    }
+    return false;
+  }
+  HostDepthStencilTarget& depth_target = depth_it->second;
+  if (!EnsureEdramBgraBacking()) {
+    if (error_out) {
+      *error_out = "failed to allocate canonical EDRAM backing";
+    }
+    return false;
+  }
+
+  reg::RB_COLOR_INFO color_info = {};
+  color_info.value = color_target.color_info;
+  reg::RB_DEPTH_INFO depth_info = {};
+  depth_info.value = depth_target.depth_info;
+  CanonicalEdramSurfaceLayout color_layout = GetCanonicalColorLayout(color_target);
+  CanonicalEdramSurfaceLayout depth_layout = GetCanonicalDepthLayout(depth_target);
+  RecordCanonicalColorRequirement(color_info.color_format, color_layout.msaa_samples);
+  RecordCanonicalDepthRequirement(depth_info.depth_format, depth_layout.msaa_samples);
+  if (!IsCanonicalEdramColorFormatSupportedByMetal(color_info.color_format) ||
+      !IsCanonicalEdramDepthFormatSupportedByMetal(depth_info.depth_format) ||
+      !IsCanonicalEdramMsaaSupportedByMetal(color_layout.msaa_samples) ||
+      !IsCanonicalEdramMsaaSupportedByMetal(depth_layout.msaa_samples)) {
+    canonical_edram_unsupported_state_ = true;
+    color_target.canonical_width = width;
+    color_target.canonical_height = height;
+    depth_target.width = width;
+    depth_target.height = height;
+    color_target.canonical_hydrated = false;
+    depth_target.canonical_hydrated = false;
+    return true;
+  }
+  if (canonical_edram_unsupported_state_) {
+    color_target.canonical_width = width;
+    color_target.canonical_height = height;
+    depth_target.width = width;
+    depth_target.height = height;
+    return true;
+  }
+
+  const bool color_resized =
+      color_target.canonical_width != width || color_target.canonical_height != height;
+  const bool depth_resized = depth_target.width != width || depth_target.height != height;
+  if ((color_resized && color_target.canonical_hydrated) ||
+      (depth_resized && depth_target.canonical_hydrated)) {
+    std::vector<uint8_t> synchronized_snapshot;
+    if (!CaptureCanonicalEdramSnapshot(synchronized_snapshot, error_out)) {
+      return false;
+    }
+  }
+  if (color_resized) {
+    color_target.canonical_width = width;
+    color_target.canonical_height = height;
+    color_target.canonical_hydrated = false;
+    color_target.canonical_hydrated_sequence = 0;
+  }
+  if (depth_resized) {
+    depth_target.width = width;
+    depth_target.height = height;
+    depth_target.canonical_hydrated = false;
+    depth_target.canonical_hydrated_sequence = 0;
+  }
+  return RestoreCanonicalDepthTarget(depth_target, depth_it->first, error_out) &&
+         RestoreCanonicalColorTarget(color_target, color_it->first, error_out);
+}
+
+bool MetalCommandProcessor::PrepareCanonicalDepthTargetForUse(
+    HostDepthStencilTarget& target, uint64_t target_key, uint32_t width, uint32_t height,
+    std::string* error_out) {
+  if (!target.context || !width || !height || !EnsureEdramBgraBacking()) {
+    if (error_out) {
+      *error_out = "invalid canonical depth/stencil target or extent";
+    }
+    return false;
+  }
+  reg::RB_DEPTH_INFO depth_info = {};
+  depth_info.value = target.depth_info;
+  CanonicalEdramSurfaceLayout layout = GetCanonicalDepthLayout(target);
+  RecordCanonicalDepthRequirement(depth_info.depth_format, layout.msaa_samples);
+  if (!IsCanonicalEdramDepthFormatSupportedByMetal(depth_info.depth_format) ||
+      !IsCanonicalEdramMsaaSupportedByMetal(layout.msaa_samples)) {
+    canonical_edram_unsupported_state_ = true;
+    target.width = width;
+    target.height = height;
+    target.canonical_hydrated = false;
+    return true;
+  }
+  if (canonical_edram_unsupported_state_) {
+    target.width = width;
+    target.height = height;
+    return true;
+  }
+  const bool resized = target.width != width || target.height != height;
+  if (resized && target.canonical_hydrated) {
+    std::vector<uint8_t> synchronized_snapshot;
+    if (!CaptureCanonicalEdramSnapshot(synchronized_snapshot, error_out)) {
+      return false;
+    }
+  }
+  if (resized) {
+    target.width = width;
+    target.height = height;
+    target.canonical_hydrated = false;
+    target.canonical_hydrated_sequence = 0;
+  }
+  return RestoreCanonicalDepthTarget(target, target_key, error_out);
+}
+
+void MetalCommandProcessor::MarkCanonicalColorTargetWritten(HostRenderTarget& target,
+                                                            uint64_t target_key) {
+  reg::RB_COLOR_INFO color_info = {};
+  color_info.value = target.color_info;
+  RecordCanonicalColorRequirement(color_info.color_format,
+                                  GetCanonicalColorLayout(target).msaa_samples);
+  if (!IsCanonicalEdramColorFormatSupportedByMetal(color_info.color_format)) {
+    canonical_edram_unsupported_state_ = true;
+  }
+  if (canonical_edram_unsupported_state_ || !target.canonical_width ||
+      !target.canonical_height) {
+    target.canonical_hydrated = false;
+    return;
+  }
+  target.canonical_hydrated_sequence = canonical_edram_ownership_.MarkSurface(
+      GetCanonicalColorLayout(target), target.canonical_width, target.canonical_height,
+      CanonicalEdramOwnerKind::kColorTarget, target_key);
+  target.canonical_hydrated = true;
+}
+
+void MetalCommandProcessor::MarkCanonicalDepthTargetWritten(HostDepthStencilTarget& target,
+                                                            uint64_t target_key) {
+  reg::RB_DEPTH_INFO depth_info = {};
+  depth_info.value = target.depth_info;
+  RecordCanonicalDepthRequirement(depth_info.depth_format,
+                                  GetCanonicalDepthLayout(target).msaa_samples);
+  if (!IsCanonicalEdramDepthFormatSupportedByMetal(depth_info.depth_format)) {
+    canonical_edram_unsupported_state_ = true;
+  }
+  if (canonical_edram_unsupported_state_ || !target.width || !target.height) {
+    target.canonical_hydrated = false;
+    return;
+  }
+  target.canonical_hydrated_sequence = canonical_edram_ownership_.MarkSurface(
+      GetCanonicalDepthLayout(target), target.width, target.height,
+      CanonicalEdramOwnerKind::kDepthStencilTarget, target_key);
+  target.canonical_hydrated = true;
+}
+
+void MetalCommandProcessor::MarkCanonicalWritesForContext(
+    void* context, uint32_t shader_color_target_mask,
+    const ProbeDepthStencilState* depth_state) {
+  if (!context) {
+    return;
+  }
+  for (auto& [key, target] : host_render_targets_) {
+    if (target.context != context) {
+      continue;
+    }
+    bool color_written =
+        register_file_ && (shader_color_target_mask & (UINT32_C(1) << target.rt_index)) &&
+        ((register_file_->values[XE_GPU_REG_RB_COLOR_MASK] >> (target.rt_index * 4)) & 0xF) &&
+        register_file_->Get<reg::RB_MODECONTROL>().edram_mode ==
+            xenos::EdramMode::kColorDepth;
+    if (color_written) {
+      MarkCanonicalColorTargetWritten(target, key);
+    }
+    bool depth_written = depth_state && depth_state->depth_write_enabled;
+    auto stencil_face_writes = [](const ProbeStencilFaceState& face) {
+      return face.write_mask &&
+             (face.stencil_failure_operation || face.depth_failure_operation ||
+              face.depth_stencil_pass_operation);
+    };
+    depth_written |= depth_state && depth_state->stencil_test_enabled &&
+                     (stencil_face_writes(depth_state->front) ||
+                      stencil_face_writes(depth_state->back));
+    if (depth_written) {
+      auto depth_it = host_depth_stencil_targets_.find(target.depth_stencil_key);
+      if (depth_it != host_depth_stencil_targets_.end()) {
+        MarkCanonicalDepthTargetWritten(depth_it->second, depth_it->first);
+      }
+    }
+    return;
+  }
 }
 
 bool MetalCommandProcessor::DumpHostRenderTargetToEdram(const HostRenderTarget& target) {
@@ -10427,6 +10994,7 @@ bool MetalCommandProcessor::RenderFullscreenPixelShader(MetalShader& pixel_shade
   if (host_render_target_context) {
     void* host_context = GetActiveHostRenderTargetContext();
     bool sample_count_configured =
+        PrepareCanonicalContextForUse(host_context, width, height, &render_error) &&
         SetPipelineProbeContextSampleCount(host_context, sample_count, &render_error);
     rendered =
         sample_count_configured &&
@@ -10444,6 +11012,9 @@ bool MetalCommandProcessor::RenderFullscreenPixelShader(MetalShader& pixel_shade
             fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
             UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
             UINT32_MAX, fragment_bool_loop_constants_buffer_index);
+    if (rendered) {
+      MarkCanonicalWritesForContext(host_context, UINT32_MAX, nullptr);
+    }
     if (rendered && RefreshHostRenderTargetBacking(width, height)) {
       bgra_out = latest_host_render_target_bgra_;
     }
@@ -10795,12 +11366,13 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
   std::vector<uint8_t> before_context_bgra;
   if (use_persistent_host_context) {
     bool sample_count_configured =
+        PrepareCanonicalContextForUse(persistent_host_context, width, height, &render_error) &&
         SetPipelineProbeContextSampleCount(persistent_host_context, sample_count, &render_error);
     if (sample_count_configured) {
       ReadPipelineProbeContext(persistent_host_context, width, height, before_context_bgra,
                                nullptr);
     }
-    rendered =
+    bool rendered_to_context =
         sample_count_configured &&
         RenderPipelineProbeToContext(
             persistent_host_context, pipeline_state, &host_system_constants,
@@ -10815,7 +11387,12 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
             fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(),
             probe_vertices.data(), probe_vertices.size() * sizeof(HostPixelProbeVertex), 3,
             bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t), UINT32_MAX,
-            fragment_bool_loop_constants_buffer_index, nullptr, &host_rasterization_state) &&
+            fragment_bool_loop_constants_buffer_index, nullptr, &host_rasterization_state);
+    if (rendered_to_context) {
+      MarkCanonicalWritesForContext(persistent_host_context, UINT32_MAX, nullptr);
+    }
+    rendered =
+        rendered_to_context &&
         ReadPipelineProbeContext(persistent_host_context, width, height, bgra_out, &render_error);
   } else {
     const uint8_t* initial_bgra = nullptr;
@@ -12309,8 +12886,16 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
     bool persistent_probe_ok =
         (!vertex_writes_shared_memory || vertex_buffer_bindings.shared_memory != UINT32_MAX) &&
         (!pixel_writes_shared_memory || fragment_shared_memory_buffer_index != UINT32_MAX);
+    if (persistent_probe_ok && host_render_target_debug &&
+        !PrepareCanonicalContextForUse(persistent_context, probe_width, probe_height,
+                                       &persistent_probe_error)) {
+      persistent_probe_ok = false;
+    }
     if (!persistent_probe_ok) {
-      persistent_probe_error = "shader writes shared memory but has no reflected stage binding";
+      if (persistent_probe_error.empty()) {
+        persistent_probe_error =
+            "shader writes shared memory but has no reflected stage binding";
+      }
     }
     if (persistent_writes_shared_memory && persistent_probe_ok &&
         !WaitForPipelineProbeSubmissions("shared-memory-writer")) {
@@ -12354,6 +12939,11 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
         std::fflush(stderr);
       }
       return false;
+    }
+    if (host_render_target_debug) {
+      MarkCanonicalWritesForContext(
+          persistent_context, pixel_shader ? pixel_shader->writes_color_targets() : 0,
+          probe_depth_stencil_state_ptr);
     }
     ++async_probe_submission_count_;
     ++async_probe_submissions_since_global_wait_;
@@ -12430,6 +13020,9 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
                 vertex_buffer_bindings.float_constants, vertex_buffer_bindings.fetch_constants,
                 nullptr, 0, UINT32_MAX, UINT32_MAX,
                 vertex_sampler_slots.empty() ? nullptr : vertex_sampler_slots.data(), nullptr);
+            if (solid_context_ok) {
+              MarkCanonicalWritesForContext(persistent_context, UINT32_MAX, nullptr);
+            }
             bool solid_read_ok =
                 solid_context_ok && RefreshHostRenderTargetBacking(probe_width, probe_height);
             nonzero = solid_read_ok && BgraHasNonZeroRgb(latest_host_render_target_bgra_);

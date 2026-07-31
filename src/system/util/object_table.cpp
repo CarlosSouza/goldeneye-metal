@@ -130,26 +130,37 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
   return result;
 }
 
-X_STATUS ObjectTable::DuplicateHandle(X_HANDLE handle, X_HANDLE* out_handle) {
-  X_STATUS result = X_STATUS_SUCCESS;
+X_STATUS ObjectTable::DuplicateHandle(X_HANDLE handle, X_HANDLE* out_handle, bool close_source) {
+  auto global_lock = global_critical_region_.Acquire();
   handle = TranslateHandle(handle);
 
-  XObject* object = LookupObject(handle, false);
-  if (object) {
-    result = AddHandle(object, out_handle);
-    object->Release();  // Release the ref that LookupObject took
-  } else {
-    result = X_STATUS_INVALID_HANDLE;
+  ObjectTableEntry* source_entry = LookupTable(handle);
+  if (!source_entry || !source_entry->object) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+
+  XObject* source_object = source_entry->object;
+  X_STATUS result = AddHandle(source_object, out_handle);
+
+  // DUPLICATE_CLOSE_SOURCE closes the source even if allocating the duplicate
+  // failed. Keep the table lock across both operations, and verify the source
+  // identity as defense in depth against future changes to this function.
+  if (close_source) {
+    (void)ReleaseHandle(handle, source_object);
   }
 
   return result;
 }
 
 X_STATUS ObjectTable::RetainHandle(X_HANDLE handle) {
+  return RetainHandle(handle, nullptr);
+}
+
+X_STATUS ObjectTable::RetainHandle(X_HANDLE handle, const XObject* expected_object) {
   auto global_lock = global_critical_region_.Acquire();
 
   ObjectTableEntry* entry = LookupTable(handle);
-  if (!entry) {
+  if (!entry || !entry->object || (expected_object && entry->object != expected_object)) {
     return X_STATUS_INVALID_HANDLE;
   }
 
@@ -158,10 +169,15 @@ X_STATUS ObjectTable::RetainHandle(X_HANDLE handle) {
 }
 
 X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle) {
+  return ReleaseHandle(handle, nullptr);
+}
+
+X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle, const XObject* expected_object) {
   auto global_lock = global_critical_region_.Acquire();
 
   ObjectTableEntry* entry = LookupTable(handle);
-  if (!entry) {
+  if (!entry || !entry->object || entry->handle_ref_count <= 0 ||
+      (expected_object && entry->object != expected_object)) {
     return X_STATUS_INVALID_HANDLE;
   }
 
@@ -176,19 +192,21 @@ X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle) {
 }
 
 X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
-  X_STATUS result = X_STATUS_SUCCESS;
-
   handle = TranslateHandle(handle);
   if (!handle) {
     return X_STATUS_INVALID_HANDLE;
   }
 
+  // LookupTable returns storage owned by the table and Resize may relocate it.
+  // Keep the global lock from lookup through removal so a concurrent AddHandle
+  // can't invalidate the entry pointer. The region is recursive because
+  // ReleaseHandle reaches this function while already holding it.
+  auto global_lock = global_critical_region_.Acquire();
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
     return X_STATUS_INVALID_HANDLE;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
   if (entry->object) {
     auto object = entry->object;
     entry->object = nullptr;

@@ -38,6 +38,33 @@ FATAL_PATTERNS = (
     re.compile(r"GPU tiled resolve failed", re.I),
     re.compile(r"shared-memory upload failed", re.I),
     re.compile(r"\[vpad\] FAILED", re.I),
+    # Match only emitted stall records, not aggregate text such as
+    # "GEWATCHDOG STALL count=0".
+    re.compile(r"\bGEWATCHDOG STALL(?=:\s+ring\b|\s+rpi=0x[0-9a-f]+\b)", re.I),
+    re.compile(r"\bGENOPRESENT STALL(?=:\s+ring\b|\s+rpi=0x[0-9a-f]+\b)", re.I),
+    re.compile(
+        r"\[GE-PLAYER-STUCK-v1\]\s+"
+        r"(?:suspected live-render movement stall:|pipeline ring=|sample=\d+/\d+\s)",
+        re.I,
+    ),
+    # Snapshot overflow/underflow diagnostics are distinct from an ABI repair.
+    re.compile(
+        r"\[GE-GUARD-AUDIO-CALLBACK-v1\]\s+repaired callback ABI "
+        r"hit=[1-9]\d*\b",
+        re.I,
+    ),
+    # A zero-valued ledger snapshot is expected diagnostic context. Fail only
+    # on nonzero/incomplete ownership state or a concrete mismatch record.
+    re.compile(
+        r"\bCSLEDGER\b[^\r\n]*(?:"
+        r"\bincomplete=(?:true|[1-9]\d*)\b|"
+        r"\bleave_mismatches=[1-9]\d*\b|"
+        r"\b(?:matching[ _]+leave[ _]+mismatch|"
+        r"latest[ _]+(?:owner-thread|owner)[ _]+leave[ _]+mismatch)"
+        r"\s+cs=0x[0-9a-f]+\b"
+        r")",
+        re.I,
+    ),
 )
 ACTIVE_PROCESS: subprocess.Popen[bytes] | None = None
 LOCAL_MULTIPLAYER_READY = re.compile(
@@ -389,6 +416,8 @@ def build_environment(
 
 
 class LocalMultiplayerInputDriver:
+    SOAK_HEARTBEAT_INTERVAL_SECONDS = 1.0
+
     def __init__(self, players: int, command_fd: int):
         self.players = players
         self.command_fd = command_fd
@@ -406,6 +435,9 @@ class LocalMultiplayerInputDriver:
         self.completed = False
         self.sent: list[dict[str, Any]] = []
         self.error: str | None = None
+        self.soak_active = False
+        self.soak_heartbeat_batches: list[list[int]] = []
+        self.next_soak_heartbeat_at = 0.0
 
     def _pulse_button(self, player: int, button: str, hold_ms: int = 250) -> str:
         self.sequence += 1
@@ -416,6 +448,10 @@ class LocalMultiplayerInputDriver:
     ) -> str:
         self.sequence += 1
         return f"PULSE_AXIS {self.sequence} {player} {axis} {value} {hold_ms}\n"
+
+    def _reset(self, player: int) -> str:
+        self.sequence += 1
+        return f"RESET {self.sequence} {player}\n"
 
     def _send(
         self,
@@ -453,7 +489,70 @@ class LocalMultiplayerInputDriver:
             )
         )
 
-    def advance(self, log_path: Path, elapsed: float) -> None:
+    def _send_soak_heartbeat(self, elapsed: float) -> None:
+        first_sequence = self.sequence + 1
+        commands = [self._reset(player) for player in range(1, self.players + 1)]
+        if self._send(
+            commands,
+            elapsed,
+            "verify post-ready virtual-gamepad input continuity",
+            0.0,
+        ):
+            self.soak_heartbeat_batches.append(
+                list(range(first_sequence, self.sequence + 1))
+            )
+            self.next_soak_heartbeat_at = (
+                elapsed + self.SOAK_HEARTBEAT_INTERVAL_SECONDS
+            )
+
+    def begin_post_ready_soak(
+        self, elapsed: float, *, heartbeat_enabled: bool
+    ) -> None:
+        # Readiness is emitted only after the title has consumed the final
+        # navigation pulse and observed a stable local match.
+        self.completed = True
+        self.phase = "post-ready-soak"
+        self.soak_active = heartbeat_enabled
+        if heartbeat_enabled:
+            self._send_soak_heartbeat(elapsed)
+
+    def _advance_soak_heartbeat(self, elapsed: float) -> None:
+        if self.soak_heartbeat_batches:
+            pending = [
+                sequence
+                for sequence in self.soak_heartbeat_batches[-1]
+                if sequence not in self.acknowledged_sequences
+            ]
+            if pending:
+                return
+        if elapsed >= self.next_soak_heartbeat_at:
+            self._send_soak_heartbeat(elapsed)
+
+    def finish_post_ready_soak(self, log_path: Path, elapsed: float) -> None:
+        if not self.soak_active or self.error:
+            return
+        self.advance(log_path, elapsed, allow_soak_heartbeat=False)
+        if self.error:
+            return
+        if not self.soak_heartbeat_batches:
+            self.error = "post-ready virtual-gamepad heartbeat was not sent"
+            return
+        missing = [
+            sequence
+            for batch in self.soak_heartbeat_batches
+            for sequence in batch
+            if sequence not in self.acknowledged_sequences
+        ]
+        if missing:
+            missing_text = ", ".join(str(sequence) for sequence in missing)
+            self.error = (
+                "post-ready virtual-gamepad heartbeat was not acknowledged: "
+                f"{missing_text}"
+            )
+
+    def advance(
+        self, log_path: Path, elapsed: float, *, allow_soak_heartbeat: bool = True
+    ) -> None:
         if self.error or self.command_fd < 0:
             return
         log_text = combined_cycle_text(log_path)
@@ -479,6 +578,11 @@ class LocalMultiplayerInputDriver:
             self.observed_state = int(latest.group(1))
             self.observed_menu = latest.group(2)
             self.observed_joined = int(latest.group(3))
+
+        if self.soak_active:
+            if allow_soak_heartbeat:
+                self._advance_soak_heartbeat(elapsed)
+            return
 
         if self.phase == "boot":
             if self.observed_state == 7:
@@ -642,7 +746,12 @@ def run_cycle(
     ready = False
     ready_elapsed: float | None = None
     exited_before_ready: int | None = None
+    exited_during_soak: int | None = None
     readiness_details: dict[str, Any] = {}
+    pre_ready_abort_log_matches: list[str] = []
+    soak_elapsed = 0.0
+    soak_completed = False
+    soak_abort_log_matches: list[str] = []
     launch_error: str | None = None
     with log_path.open("wb") as log:
         try:
@@ -691,6 +800,9 @@ def run_cycle(
                     input_driver.advance(log_path, elapsed)
                     if input_driver.error:
                         break
+                pre_ready_abort_log_matches = detect_fatal_logs(cycle_root)
+                if pre_ready_abort_log_matches:
+                    break
                 ready, readiness_details = readiness(
                     args.mode,
                     log_path,
@@ -706,13 +818,53 @@ def run_cycle(
                     break
                 time.sleep(args.poll_seconds)
 
+            if ready:
+                if input_driver:
+                    input_driver.begin_post_ready_soak(
+                        time.monotonic() - started,
+                        heartbeat_enabled=args.post_ready_soak_seconds > 0,
+                    )
+                soak_started = time.monotonic()
+                soak_deadline = soak_started + args.post_ready_soak_seconds
+                while True:
+                    now = time.monotonic()
+                    soak_elapsed = now - soak_started
+                    if now >= soak_deadline:
+                        soak_completed = True
+                        break
+                    log.flush()
+                    if process.poll() is not None:
+                        exited_during_soak = process.returncode
+                        break
+                    if input_driver:
+                        input_driver.advance(log_path, now - started)
+                        if input_driver.error:
+                            break
+                    soak_abort_log_matches = detect_fatal_logs(cycle_root)
+                    if soak_abort_log_matches:
+                        break
+                    time.sleep(min(args.poll_seconds, soak_deadline - now))
+
+            if (
+                input_driver
+                and ready
+                and soak_completed
+                and exited_during_soak is None
+                and not soak_abort_log_matches
+            ):
+                input_driver.finish_post_ready_soak(
+                    log_path, time.monotonic() - started
+                )
             if input_driver:
                 input_driver.close()
             capture: str | None = None
             capture_error: str | None = None
+            capture_skipped_reason: str | None = None
             capture_validation: dict[str, Any] | None = None
             regression: dict[str, Any] | None = None
-            if ready and args.capture:
+            if ready and args.capture and process.poll() is not None:
+                capture_skipped_reason = "application exited before capture"
+            elif ready and args.capture:
                 capture_path = cycle_root / f"{args.mode}.png"
                 try:
                     capture_validation = rendering.capture_window(
@@ -741,6 +893,7 @@ def run_cycle(
         else:
             capture = None
             capture_error = None
+            capture_skipped_reason = None
             capture_validation = None
             regression = None
             shutdown = {"exit_code": None}
@@ -749,6 +902,9 @@ def run_cycle(
         "error": input_driver.error if input_driver else None,
         "phase": input_driver.phase if input_driver else None,
         "completed": input_driver.completed if input_driver else None,
+        "soak_heartbeat_batches": (
+            input_driver.soak_heartbeat_batches if input_driver else []
+        ),
         "last_sequence": input_driver.last_sequence if input_driver else 0,
         "last_ack": input_driver.last_ack if input_driver else 0,
         "acknowledged_sequences": (
@@ -760,7 +916,11 @@ def run_cycle(
     }
 
     elapsed = time.monotonic() - started
-    fatal_logs = detect_fatal_logs(cycle_root)
+    fatal_logs = sorted(
+        set(pre_ready_abort_log_matches)
+        .union(soak_abort_log_matches)
+        .union(detect_fatal_logs(cycle_root))
+    )
     crash_reports = collect_crash_reports(cycle_root, started_epoch)
     profile_artifacts: str | None = None
     final_profile_passed: bool | None = None
@@ -794,7 +954,11 @@ def run_cycle(
         failures.append(f"launch failed: {launch_error}")
     if input_script["error"]:
         failures.append(f"virtual-gamepad input failed: {input_script['error']}")
-    if not ready and not input_script["error"]:
+    if (
+        not ready
+        and not input_script["error"]
+        and not pre_ready_abort_log_matches
+    ):
         if exited_before_ready is not None:
             failures.append(
                 f"application exited with code {exited_before_ready} before {args.mode} readiness"
@@ -803,6 +967,10 @@ def run_cycle(
             failures.append(
                 f"{args.mode} readiness was not reached within {args.ready_timeout:.1f} seconds"
             )
+    if exited_during_soak is not None:
+        failures.append(
+            f"application exited with code {exited_during_soak} during post-ready soak"
+        )
     failures.extend(readiness_details.get("profile_failures", []))
     failures.extend(fatal_logs)
     if final_profile_passed is False:
@@ -822,7 +990,7 @@ def run_cycle(
         failures.append("application did not exit before the shutdown deadline")
     if shutdown.get("descendant_cleanup_required"):
         failures.append("application left a child process running after shutdown")
-    if shutdown.get("process_exited_before_request"):
+    if shutdown.get("process_exited_before_request") and exited_during_soak is None:
         failures.append(
             f"application exited before the requested shutdown (code {shutdown.get('exit_code')})"
         )
@@ -844,6 +1012,13 @@ def run_cycle(
         "elapsed_seconds": elapsed,
         "ready": ready,
         "ready_seconds": ready_elapsed,
+        "pre_ready_abort_log_matches": pre_ready_abort_log_matches,
+        "post_ready_soak": {
+            "requested_seconds": args.post_ready_soak_seconds,
+            "elapsed_seconds": soak_elapsed if ready else None,
+            "completed": soak_completed,
+            "abort_log_matches": soak_abort_log_matches,
+        },
         "paths": {
             "user_data": str(cycle_root / "user-data"),
             "cache": str(cycle_root / "cache"),
@@ -852,6 +1027,7 @@ def run_cycle(
         "readiness": readiness_details,
         "input_script": input_script,
         "capture": capture,
+        "capture_skipped_reason": capture_skipped_reason,
         "capture_validation": capture_validation,
         "render_comparison": regression,
         "profile_artifacts": profile_artifacts,
@@ -882,6 +1058,10 @@ def write_suite_summary(
         fps = cycle.get("readiness", {}).get("aggregate", {}).get("real_window_fps")
         if fps:
             mean_fps.append(float(fps["mean"]))
+    soak_cycles_completed = sum(
+        bool(cycle.get("post_ready_soak", {}).get("completed"))
+        for cycle in cycles
+    )
     summary = {
         "status": "pass" if passed == len(cycles) else "fail",
         "mode": args.mode,
@@ -903,6 +1083,8 @@ def write_suite_summary(
         "isolated_state": True,
         "game_data": str(args.game_data),
         "reference": str(args.reference) if args.reference else None,
+        "post_ready_soak_seconds": args.post_ready_soak_seconds,
+        "post_ready_soak_cycles_completed": soak_cycles_completed,
         "cycles": cycles,
     }
     (suite_root / "summary.json").write_text(
@@ -913,6 +1095,10 @@ def write_suite_summary(
         f"mode: {args.mode}",
         f"cycles: {passed}/{len(cycles)} passed",
         f"native clean shutdowns: {summary['native_clean_shutdowns']}/{len(cycles)}",
+        (
+            f"requested post-ready soak: {args.post_ready_soak_seconds:g} seconds; "
+            f"completed: {soak_cycles_completed}/{len(cycles)} cycles"
+        ),
     ]
     if mean_fps:
         lines.append(
@@ -958,6 +1144,15 @@ def main() -> int:
     parser.add_argument("--game-data", type=Path, default=default_game_data)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--ready-timeout", type=finite_float, default=150.0)
+    parser.add_argument(
+        "--post-ready-soak-seconds",
+        type=finite_float,
+        default=10.0,
+        help=(
+            "keep each ready run alive for this many additional seconds while "
+            "checking stability markers"
+        ),
+    )
     parser.add_argument("--menu-settle-seconds", type=finite_float, default=20.0)
     parser.add_argument("--poll-seconds", type=finite_float, default=1.0)
     parser.add_argument("--warmup-windows", type=int, default=1)
@@ -1056,6 +1251,7 @@ def main() -> int:
         args.ready_timeout <= 0
         or args.poll_seconds <= 0
         or args.shutdown_timeout <= 0
+        or args.post_ready_soak_seconds < 0
         or args.menu_settle_seconds < 0
         or args.capture_delay < 0
     ):

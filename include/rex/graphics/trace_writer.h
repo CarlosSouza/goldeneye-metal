@@ -18,6 +18,7 @@
 
 #include <rex/graphics/registers.h>
 #include <rex/graphics/trace_protocol.h>
+#include <rex/graphics/xenos.h>
 
 namespace rex::graphics {
 
@@ -27,10 +28,25 @@ class TraceWriter {
   ~TraceWriter();
 
   bool is_open() const { return file_ != nullptr; }
+  bool has_error() const { return file_ && std::ferror(file_) != 0; }
 
   bool Open(const std::filesystem::path& path, uint32_t title_id);
   void Flush();
   void Close();
+  // Invalidates and removes a trace whose initialization did not complete.
+  // Invalidating the header first keeps a removal failure from leaving a file
+  // that readers could mistake for a valid capture.
+  void Discard();
+
+  // Enables whole-capture EDRAM requirement collection. This must be called
+  // before the initial EDRAM snapshot or first GPU command is written. A clean
+  // trace without successful tracking is finalized with an explicitly unknown
+  // contract and is never deterministic.
+  bool BeginEdramRequirementsTracking();
+  bool RequireEdramColorFormat(xenos::ColorRenderTargetFormat format);
+  bool RequireEdramDepthFormat(xenos::DepthRenderTargetFormat format);
+  bool RequireEdramMsaaSamples(xenos::MsaaSamples msaa_samples);
+  void InvalidateEdramRequirementsTracking();
 
   void WritePrimaryBufferStart(uint32_t base_ptr, uint32_t count);
   void WritePrimaryBufferEnd();
@@ -51,15 +67,23 @@ class TraceWriter {
                       uint32_t gamma_ramp_rw_component);
 
  private:
+  void LockEdramRequirementsTracking();
+  bool FinalizeEdramRequirementsManifest();
   void WriteMemoryCommand(TraceCommandType type, uint32_t base_ptr, size_t length,
                           const void* host_ptr = nullptr);
 
   std::set<uint64_t> cached_memory_reads_;
   uint8_t* membase_;
   FILE* file_ = nullptr;
+  std::filesystem::path path_;
 
   bool compress_output_ = true;
   size_t compression_threshold_ = 1024;
+  bool edram_requirements_tracking_locked_ = false;
+  bool edram_requirements_tracking_enabled_ = false;
+  bool edram_requirements_tracking_valid_ = false;
+  bool allow_manifest_finalization_ = true;
+  TraceEdramRequirements edram_requirements_;
 };
 
 }  // namespace rex::graphics

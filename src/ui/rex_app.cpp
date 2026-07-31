@@ -44,9 +44,14 @@
 #include <fmt/format.h>
 #include <imgui.h>
 
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
+#include <vector>
 
 // DXGI is used (Windows, both backends built) to read the primary GPU's PCI
 // vendor id so "auto" can route AMD parts to Vulkan. Loaded dynamically below,
@@ -124,6 +129,132 @@ uint32_t PrimaryGpuVendorId() {
 }  // namespace
 
 namespace rex {
+
+namespace {
+
+// Owns a prepared-suspended main thread until Resume commits. If launch is
+// cancelled (or Resume fails), the lease releases both host and guest
+// ownership before runtime teardown can begin.
+class PreparedMainThreadLease {
+ public:
+  ~PreparedMainThreadLease() { CancelAndWait(); }
+
+  bool Arm(system::object_ref<system::XThread> thread) {
+    std::lock_guard lock(mutex_);
+    if (thread_ || !thread) {
+      return false;
+    }
+    const std::vector<X_HANDLE> handles = thread->handles();
+    if (handles.empty() || !thread->RetainHandle(handles.front())) {
+      return false;
+    }
+    guest_handle_ = handles.front();
+    thread_ = std::move(thread);
+    return true;
+  }
+
+  system::XThread* get() const {
+    std::lock_guard lock(mutex_);
+    return thread_.get();
+  }
+
+  bool Resume() {
+    std::lock_guard lock(mutex_);
+    if (!thread_ || XFAILED(thread_->Resume())) {
+      return false;
+    }
+    resumed_ = true;
+    return true;
+  }
+
+  system::object_ref<system::XThread> Retain() const {
+    std::lock_guard lock(mutex_);
+    return system::object_ref<system::XThread>(thread_);
+  }
+
+  void Disarm() {
+    system::object_ref<system::XThread> thread;
+    X_HANDLE guest_handle = 0;
+    {
+      std::lock_guard lock(mutex_);
+      thread = std::move(thread_);
+      guest_handle = std::exchange(guest_handle_, 0);
+      resumed_ = false;
+    }
+    if (thread && guest_handle) {
+      // Drop only the lease's retained reference. Guest ownership continues
+      // normally after a successful launch.
+      (void)thread->ReleaseHandle(guest_handle);
+    }
+  }
+
+  void CancelAndWait() {
+    system::object_ref<system::XThread> thread;
+    X_HANDLE guest_handle = 0;
+    bool resumed = false;
+    {
+      std::lock_guard lock(mutex_);
+      thread = std::move(thread_);
+      guest_handle = std::exchange(guest_handle_, 0);
+      resumed = std::exchange(resumed_, false);
+    }
+    if (!thread) {
+      return;
+    }
+
+    auto* host_thread = thread->thread();
+    thread->Terminate(0);
+    if (host_thread) {
+      (void)rex::thread::Wait(host_thread, false);
+    }
+    // Terminate releases the self-handle. The exact handle retained by Arm
+    // remains valid even if guest code closed its own reference meanwhile.
+    // Before Resume, the guest cannot have closed the original reference, so
+    // release that too. Dropping the final object_ref then destroys the native
+    // Thread, whose POSIX teardown joins the cancelled pthread.
+    if (guest_handle) {
+      (void)thread->ReleaseHandle(guest_handle);
+      if (!resumed) {
+        (void)thread->ReleaseHandle(guest_handle);
+      }
+    }
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  system::object_ref<system::XThread> thread_;
+  X_HANDLE guest_handle_ = 0;
+  bool resumed_ = false;
+};
+
+class ModuleLaunchDecision {
+ public:
+  enum class Outcome {
+    kRunning,
+    kAborted,
+  };
+
+  void Complete(Outcome outcome) {
+    {
+      std::lock_guard lock(mutex_);
+      outcome_ = outcome;
+    }
+    wake_.notify_all();
+  }
+
+  Outcome Wait() {
+    std::unique_lock lock(mutex_);
+    wake_.wait(lock, [this]() { return outcome_.has_value(); });
+    return *outcome_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::optional<Outcome> outcome_;
+};
+
+}  // namespace
 
 // --- ReXApp ---
 
@@ -520,37 +651,125 @@ bool ReXApp::SetupPresentation() {
 
 void ReXApp::LaunchModule() {
   app_context().CallInUIThreadDeferred([this]() {
-    OnPreLaunchModule();
+    if (!module_launch_coordinator_.RunPreLaunch([this]() {
+          OnPreLaunchModule();
 
-    auto main_thread = runtime_->PrepareModuleLaunch();
-    if (!main_thread) {
+          auto* graphics_system =
+              static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+          if (graphics_system && !runtime_->cache_root().empty()) {
+            uint32_t title_id = runtime_->kernel_state()->title_id();
+            if (title_id != 0) {
+              REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
+              graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+            }
+          }
+        })) {
+      REXLOG_DEBUG("Skipping deferred module launch because shutdown has begun");
+      return;
+    }
+
+    auto prepared_thread = std::make_shared<PreparedMainThreadLease>();
+    const auto prepare_result = module_launch_coordinator_.PrepareLaunch(
+        [this, prepared_thread]() {
+          auto main_thread = runtime_->PrepareModuleLaunch();
+          if (!main_thread) {
+            return false;
+          }
+          return prepared_thread->Arm(std::move(main_thread));
+        },
+        [prepared_thread](bool terminate) {
+          if (terminate) {
+            prepared_thread->CancelAndWait();
+          } else {
+            prepared_thread->Disarm();
+          }
+        });
+    if (prepare_result == ui::ModuleLaunchCoordinator::PrepareResult::kCancelled) {
+      return;
+    }
+    if (prepare_result != ui::ModuleLaunchCoordinator::PrepareResult::kPrepared) {
       REXLOG_ERROR("Failed to launch module");
       app_context().QuitFromUIThread();
       return;
     }
 
-    auto* graphics_system =
-        static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
-    if (graphics_system && !runtime_->cache_root().empty()) {
-      uint32_t title_id = runtime_->kernel_state()->title_id();
-      if (title_id != 0) {
-        REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
-        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+    auto launch_decision = std::make_shared<ModuleLaunchDecision>();
+    bool waiter_created = false;
+    std::string waiter_error;
+    const auto commit_result = module_launch_coordinator_.CommitLaunch(
+        [this, prepared_thread, launch_decision, &waiter_created, &waiter_error]() {
+          OnPostLaunchModule(prepared_thread->get());
+          try {
+            auto waiter_thread = prepared_thread->Retain();
+            module_thread_ = std::thread(
+                [this, main_thread = std::move(waiter_thread), launch_decision]() mutable {
+                  main_thread->Wait(0, 0, 0, nullptr);
+                  OnGuestThreadExit(main_thread.get());
+                  module_launch_coordinator_.GuestExited();
+                  REXLOG_INFO("Execution complete");
+                  if (launch_decision->Wait() == ModuleLaunchDecision::Outcome::kRunning &&
+                      !shutting_down_.load(std::memory_order_acquire)) {
+                    app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
+                  }
+                });
+            waiter_created = true;
+          } catch (const std::system_error& error) {
+            waiter_error = error.what();
+          }
+        },
+        [prepared_thread, &waiter_created]() {
+          return waiter_created && prepared_thread->Resume();
+        },
+        [this, prepared_thread, &waiter_created]() {
+          if (!waiter_created) {
+            OnGuestThreadExit(prepared_thread->get());
+          }
+        });
+    if (commit_result == ui::ModuleLaunchCoordinator::CommitResult::kCancelled) {
+      return;
+    }
+    if (commit_result == ui::ModuleLaunchCoordinator::CommitResult::kResumeFailed) {
+      launch_decision->Complete(ModuleLaunchDecision::Outcome::kAborted);
+      if (module_thread_.joinable()) {
+        module_thread_.join();
       }
+      if (!waiter_created) {
+        REXLOG_ERROR("Failed to create the main guest waiter: {}", waiter_error);
+      } else {
+        REXLOG_ERROR("Failed to resume the main guest thread");
+      }
+      app_context().QuitFromUIThread();
+      return;
+    }
+    if (commit_result != ui::ModuleLaunchCoordinator::CommitResult::kRunning) {
+      launch_decision->Complete(ModuleLaunchDecision::Outcome::kAborted);
+      if (module_thread_.joinable()) {
+        module_thread_.join();
+      }
+      REXLOG_ERROR("Invalid deferred module launch state");
+      app_context().QuitFromUIThread();
+      return;
     }
 
-    OnPostLaunchModule(main_thread.get());
-    main_thread->Resume();
-
-    module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
-      main_thread->Wait(0, 0, 0, nullptr);
-      OnGuestThreadExit(main_thread.get());
-      REXLOG_INFO("Execution complete");
-      if (!shutting_down_.load(std::memory_order_acquire)) {
-        app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
-      }
-    });
+    launch_decision->Complete(ModuleLaunchDecision::Outcome::kRunning);
   });
+}
+
+void ReXApp::BeginModuleShutdown() {
+  module_launch_coordinator_.BeginShutdown([this]() { OnPreTerminateTitle(); },
+                                           [this]() {
+#if !REX_PLATFORM_MAC
+                                             if (runtime_ && runtime_->kernel_state()) {
+                                               runtime_->kernel_state()->TerminateTitle();
+                                             }
+#endif
+                                           },
+#if REX_PLATFORM_MAC
+                                           false
+#else
+                                           true
+#endif
+  );
 }
 
 std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
@@ -593,16 +812,13 @@ void ReXApp::RequestShutdown() {
     // Keep this fallback orderly and idempotent as well.
     REXLOG_INFO("Application shutting down...");
     shutting_down_.store(true, std::memory_order_release);
+    BeginModuleShutdown();
 #if REX_PLATFORM_MAC
     // macOS can't recover ordinary mutexes owned by a guest thread stopped via
     // asynchronous pthread cancellation. Let the native entry point finish
     // the accepted close event and end the process at the OS boundary instead
     // of destructing a runtime containing potentially orphaned locks.
     immediate_process_exit_.store(true, std::memory_order_release);
-#else
-    if (runtime_ && runtime_->kernel_state()) {
-      runtime_->kernel_state()->TerminateTitle();
-    }
 #endif
     app_context().QuitFromUIThread();
   });
@@ -616,15 +832,12 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
+  BeginModuleShutdown();
 #if REX_PLATFORM_MAC
   // See RequestShutdown. RequestCloseImpl will restore native cursor/window
   // state after this callback returns; the macOS main then exits the process
   // before unsafe guest-runtime destruction begins.
   immediate_process_exit_.store(true, std::memory_order_release);
-#else
-  if (runtime_ && runtime_->kernel_state()) {
-    runtime_->kernel_state()->TerminateTitle();
-  }
 #endif
   app_context().QuitFromUIThread();
 }

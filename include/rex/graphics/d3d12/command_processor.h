@@ -56,11 +56,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
-  void RequestFrameTrace(const std::filesystem::path& root_path) override;
+  bool RequestFrameTrace(const std::filesystem::path& root_path) override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
-  void RestoreEdramSnapshot(const void* snapshot) override;
+  bool RestoreEdramSnapshot(const void* snapshot) override;
 
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());

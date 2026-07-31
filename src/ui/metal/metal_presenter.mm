@@ -149,6 +149,59 @@ bool GetPackedBgraLayout(uint32_t width, uint32_t height, size_t& row_pitch_out,
   return true;
 }
 
+bool AlignUp(size_t value, size_t alignment, size_t& aligned_out) {
+  if (!alignment) {
+    return false;
+  }
+  size_t remainder = value % alignment;
+  if (!remainder) {
+    aligned_out = value;
+    return true;
+  }
+  size_t padding = alignment - remainder;
+  if (value > std::numeric_limits<size_t>::max() - padding) {
+    return false;
+  }
+  aligned_out = value + padding;
+  return true;
+}
+
+uint8_t SelectGuestComponent(const uint8_t* rgba, uint32_t selector) {
+  switch (selector) {
+    case 0:
+    case 1:
+    case 2:
+    case 3:
+      return rgba[selector];
+    case 5:
+      return UINT8_MAX;
+    default:
+      return 0;
+  }
+}
+
+void CopyBgraToRgbx(const uint8_t* source, size_t source_row_pitch, uint32_t width, uint32_t height,
+                    uint32_t guest_swizzle, uint8_t* destination, size_t destination_row_pitch) {
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t* source_row = source + size_t(y) * source_row_pitch;
+    uint8_t* destination_row = destination + size_t(y) * destination_row_pitch;
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint8_t* source_pixel = source_row + size_t(x) * 4;
+      const uint8_t rgba[] = {
+          source_pixel[2],
+          source_pixel[1],
+          source_pixel[0],
+          source_pixel[3],
+      };
+      uint8_t* destination_pixel = destination_row + size_t(x) * 4;
+      destination_pixel[0] = SelectGuestComponent(rgba, (guest_swizzle >> 0) & 7);
+      destination_pixel[1] = SelectGuestComponent(rgba, (guest_swizzle >> 3) & 7);
+      destination_pixel[2] = SelectGuestComponent(rgba, (guest_swizzle >> 6) & 7);
+      destination_pixel[3] = UINT8_MAX;
+    }
+  }
+}
+
 uint64_t HashGuestFrame(const uint8_t* data, size_t size, uint32_t width, uint32_t height) {
   uint64_t hash = UINT64_C(0x9E3779B185EBCA87) ^ uint64_t(size) ^ (uint64_t(width) << 32) ^ height;
   while (size >= sizeof(uint64_t)) {
@@ -420,8 +473,116 @@ Surface::TypeFlags MetalPresenter::GetSupportedSurfaceTypes() const {
 }
 
 bool MetalPresenter::CaptureGuestOutput(RawImage& image_out) {
-  (void)image_out;
-  return false;
+  image_out = {};
+
+  @autoreleasepool {
+    GuestOutputProperties properties;
+    uint32_t mailbox_index;
+    std::unique_lock<std::mutex> consumer_lock(
+        ConsumeGuestOutput(mailbox_index, &properties, nullptr));
+    if (mailbox_index == UINT32_MAX) {
+      return false;
+    }
+
+    const GuestOutputMailboxTexture& mailbox_texture =
+        guest_output_mailbox_textures_[mailbox_index];
+    const uint32_t width = properties.frontbuffer_width;
+    const uint32_t height = properties.frontbuffer_height;
+    size_t packed_row_pitch = 0;
+    size_t packed_size = 0;
+    if (!GetPackedBgraLayout(width, height, packed_row_pitch, packed_size)) {
+      REXLOG_ERROR("MetalPresenter: invalid guest output capture dimensions {}x{}", width, height);
+      return false;
+    }
+
+    RawImage captured;
+    captured.width = width;
+    captured.height = height;
+    captured.stride = packed_row_pitch;
+    captured.data.resize(packed_size);
+
+    if (mailbox_texture.texture && mailbox_texture.direct_valid) {
+      id<MTLTexture> source_texture = (id<MTLTexture>)mailbox_texture.texture;
+      if (mailbox_texture.width != width || mailbox_texture.height != height ||
+          source_texture.width != width || source_texture.height != height ||
+          source_texture.pixelFormat != MTLPixelFormatBGRA8Unorm ||
+          source_texture.textureType != MTLTextureType2D || source_texture.sampleCount != 1) {
+        REXLOG_ERROR("MetalPresenter: invalid direct guest output texture for capture");
+        return false;
+      }
+
+      id<MTLDevice> device = (id<MTLDevice>)metal_device_;
+      size_t row_alignment =
+          size_t([device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm]);
+      size_t readback_row_pitch = 0;
+      if (!AlignUp(packed_row_pitch, row_alignment, readback_row_pitch) ||
+          size_t(height) > std::numeric_limits<size_t>::max() / readback_row_pitch) {
+        REXLOG_ERROR("MetalPresenter: guest output capture readback size overflow");
+        return false;
+      }
+      size_t readback_size = readback_row_pitch * height;
+
+      id<MTLBuffer> readback_buffer = [device newBufferWithLength:readback_size
+                                                          options:MTLResourceStorageModeShared];
+      if (!readback_buffer) {
+        REXLOG_ERROR("MetalPresenter: failed to allocate guest output capture buffer");
+        return false;
+      }
+      [readback_buffer setLabel:@"ReXGlue guest output capture readback"];
+
+      id<MTLCommandBuffer> command_buffer = [(id<MTLCommandQueue>)command_queue_ commandBuffer];
+      id<MTLBlitCommandEncoder> blit_encoder =
+          command_buffer ? [command_buffer blitCommandEncoder] : nil;
+      if (!command_buffer || !blit_encoder) {
+        REXLOG_ERROR("MetalPresenter: failed to create guest output capture commands");
+        [readback_buffer release];
+        return false;
+      }
+
+      command_buffer.label = @"ReXGlue guest output capture";
+      [blit_encoder copyFromTexture:source_texture
+                        sourceSlice:0
+                        sourceLevel:0
+                       sourceOrigin:MTLOriginMake(0, 0, 0)
+                         sourceSize:MTLSizeMake(width, height, 1)
+                           toBuffer:readback_buffer
+                  destinationOffset:0
+             destinationBytesPerRow:readback_row_pitch
+           destinationBytesPerImage:readback_size];
+      [blit_encoder endEncoding];
+      [command_buffer commit];
+      [command_buffer waitUntilCompleted];
+
+      if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+        NSError* error = command_buffer.error;
+        const char* error_text = error ? error.localizedDescription.UTF8String : "unknown error";
+        REXLOG_ERROR("MetalPresenter: guest output capture did not complete: {}", error_text);
+        [readback_buffer release];
+        return false;
+      }
+
+      const void* readback_contents = readback_buffer.contents;
+      if (!readback_contents) {
+        REXLOG_ERROR("MetalPresenter: guest output capture buffer is not CPU-accessible");
+        [readback_buffer release];
+        return false;
+      }
+      CopyBgraToRgbx(static_cast<const uint8_t*>(readback_contents), readback_row_pitch, width,
+                     height, mailbox_texture.guest_swizzle, captured.data.data(), captured.stride);
+      [readback_buffer release];
+    } else {
+      const std::shared_ptr<const std::vector<uint8_t>>& cpu_bgra = mailbox_texture.cpu_bgra;
+      if (!cpu_bgra || cpu_bgra->size() < packed_size) {
+        REXLOG_ERROR("MetalPresenter: no matching CPU guest output available for capture");
+        return false;
+      }
+      CopyBgraToRgbx(cpu_bgra->data(), packed_row_pitch, width, height, 0x688, captured.data.data(),
+                     captured.stride);
+    }
+
+    image_out = std::move(captured);
+    return true;
+  }
 }
 
 void MetalPresenter::UpdateGuestFrontbuffer(uint32_t width, uint32_t height, const void* pixels,
@@ -433,15 +594,17 @@ void MetalPresenter::UpdateGuestFrontbuffer(uint32_t width, uint32_t height, con
     return;
   }
 
-  std::lock_guard<std::mutex> lock(guest_frame_mutex_);
-  guest_frame_width_ = width;
-  guest_frame_height_ = height;
-  guest_frame_bgra_.resize(packed_size);
-  auto* dst = guest_frame_bgra_.data();
+  auto packed_bgra = std::make_shared<std::vector<uint8_t>>(packed_size);
+  auto* dst = packed_bgra->data();
   auto* src = static_cast<const uint8_t*>(pixels);
   for (uint32_t y = 0; y < height; ++y) {
     std::memcpy(dst + size_t(y) * packed_pitch, src + size_t(y) * row_pitch, packed_pitch);
   }
+
+  std::lock_guard<std::mutex> lock(guest_frame_mutex_);
+  guest_frame_width_ = width;
+  guest_frame_height_ = height;
+  guest_frame_bgra_ = std::move(packed_bgra);
   FinalizeGuestFrameLocked();
   guest_frame_id_ = RecordGuestFrameArrivalLocked();
   BuildGuestFpsOverlayLocked(guest_frame_width_, guest_frame_height_);
@@ -456,9 +619,11 @@ void MetalPresenter::UpdateGuestFrontbuffer(uint32_t width, uint32_t height,
     return;
   }
 
+  packed_bgra.resize(packed_size);
+  auto immutable_bgra = std::make_shared<const std::vector<uint8_t>>(std::move(packed_bgra));
+
   std::lock_guard<std::mutex> lock(guest_frame_mutex_);
-  guest_frame_bgra_ = std::move(packed_bgra);
-  guest_frame_bgra_.resize(packed_size);
+  guest_frame_bgra_ = std::move(immutable_bgra);
   guest_frame_width_ = width;
   guest_frame_height_ = height;
   FinalizeGuestFrameLocked();
@@ -468,7 +633,8 @@ void MetalPresenter::UpdateGuestFrontbuffer(uint32_t width, uint32_t height,
 
 void MetalPresenter::FinalizeGuestFrameLocked() {
   if (profile_enabled_) {
-    uint64_t source_hash = HashGuestFrame(guest_frame_bgra_.data(), guest_frame_bgra_.size(),
+    const std::vector<uint8_t>& guest_frame_bgra = *guest_frame_bgra_;
+    uint64_t source_hash = HashGuestFrame(guest_frame_bgra.data(), guest_frame_bgra.size(),
                                           guest_frame_width_, guest_frame_height_);
     bool unchanged = profile_last_source_valid_ && source_hash == profile_last_source_hash_ &&
                      guest_frame_width_ == profile_last_source_width_ &&
@@ -822,6 +988,7 @@ bool MetalPresenter::RefreshGuestOutputImpl(
   }
   mailbox_texture.direct_valid = refresher_succeeded && context.direct_valid();
   mailbox_texture.guest_swizzle = mailbox_texture.direct_valid ? context.guest_swizzle() : 0x688;
+  mailbox_texture.cpu_bgra.reset();
   if (refresher_succeeded) {
     {
       std::lock_guard<std::mutex> lock(guest_frame_mutex_);
@@ -835,12 +1002,16 @@ bool MetalPresenter::RefreshGuestOutputImpl(
         guest_frame_refresh_generation_ = guest_frame_generation_;
       } else {
         guest_frame_id = RecordGuestFrameArrivalLocked();
-        if (!mailbox_texture.direct_valid && !guest_frame_bgra_.empty()) {
+        if (!mailbox_texture.direct_valid && guest_frame_bgra_ && !guest_frame_bgra_->empty()) {
           // A repeated CPU image is still a new guest refresh. Keep its pixels
           // and ID paired under the same ownership lock.
           guest_frame_id_ = guest_frame_id;
           guest_frame_refresh_generation_ = guest_frame_generation_;
         }
+      }
+      if (!mailbox_texture.direct_valid && guest_frame_bgra_ &&
+          guest_frame_width_ == frontbuffer_width && guest_frame_height_ == frontbuffer_height) {
+        mailbox_texture.cpu_bgra = guest_frame_bgra_;
       }
       mailbox_texture.guest_frame_id = guest_frame_id;
       BuildGuestFpsOverlayLocked(frontbuffer_width, frontbuffer_height);
@@ -1074,7 +1245,8 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
 
     if (use_cpu_fallback) {
       std::lock_guard<std::mutex> lock(guest_frame_mutex_);
-      if (!guest_frame_bgra_.empty() && guest_frame_width_ && guest_frame_height_) {
+      if (guest_frame_bgra_ && !guest_frame_bgra_->empty() && guest_frame_width_ &&
+          guest_frame_height_) {
         if (!guest_texture_ || guest_texture_width_ != guest_frame_width_ ||
             guest_texture_height_ != guest_frame_height_) {
           if (guest_texture_) {
@@ -1097,7 +1269,7 @@ Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawe
           uint64_t upload_start_ns = profile_enabled_ ? profiling::NowNs() : 0;
           [(id<MTLTexture>)guest_texture_ replaceRegion:region
                                             mipmapLevel:0
-                                              withBytes:guest_frame_bgra_.data()
+                                              withBytes:guest_frame_bgra_->data()
                                             bytesPerRow:size_t(guest_frame_width_) * 4];
           if (profile_enabled_) {
             std::lock_guard<std::mutex> profile_lock(profile_mutex_);

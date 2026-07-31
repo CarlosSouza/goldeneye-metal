@@ -95,13 +95,30 @@ class TraceReader {
 
   const Frame* frame(int n) const { return &frames_[n]; }
   int frame_count() const { return int(frames_.size()); }
+  // True only when a validated 10 MiB EDRAM snapshot appears before the first
+  // GPU packet in the stream. Standalone replay must not infer initialized
+  // render-target or depth contents when this is false.
+  bool has_initial_edram_snapshot() const { return has_initial_edram_snapshot_; }
+  const TraceEdramRequirements& edram_requirements() const {
+    return header()->edram_manifest.requirements;
+  }
+  bool edram_requirements_finalized() const {
+    return (header()->edram_manifest.flags & kTraceEdramManifestFlagFinalized) != 0;
+  }
+  bool edram_requirements_tracked() const {
+    return (header()->edram_manifest.flags &
+            kTraceEdramManifestFlagRequirementsTracked) != 0;
+  }
+  bool has_finalized_edram_requirements() const {
+    return edram_requirements_finalized() && edram_requirements_tracked();
+  }
 
   bool Open(const std::string_view path);
 
   void Close();
 
  protected:
-  void ParseTrace();
+  bool ParseTrace();
   bool DecompressMemory(MemoryEncodingFormat encoding_format, const void* src, size_t src_size,
                         void* dest, size_t dest_size);
 
@@ -109,6 +126,7 @@ class TraceReader {
   const uint8_t* trace_data_ = nullptr;
   size_t trace_size_ = 0;
   std::vector<Frame> frames_;
+  bool has_initial_edram_snapshot_ = false;
 };
 
 }  // namespace rex::graphics

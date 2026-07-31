@@ -141,7 +141,7 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       graphics_system_(graphics_system),
       register_file_(graphics_system_->register_file()),
       trace_writer_(graphics_system->memory()->physical_membase()),
-      worker_running_(true),
+      worker_running_(false),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)) {
   assert_not_null(write_ptr_index_event_);
 }
@@ -168,31 +168,101 @@ bool CommandProcessor::Initialize() {
     }
   }
 
-  worker_running_ = true;
-  worker_thread_ = system::object_ref<system::XHostThread>(
+  auto worker_thread = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
         WorkerThreadMain();
         return 0;
       }));
-  worker_thread_->set_name("GPU Commands");
-  worker_thread_->Create();
+  worker_thread->set_name("GPU Commands");
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    paused_.store(false, std::memory_order_relaxed);
+    worker_paused_.store(false, std::memory_order_relaxed);
+    worker_running_.store(true, std::memory_order_release);
+  }
+  X_STATUS create_status = worker_thread->Create();
+  if (XFAILED(create_status)) {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    worker_running_.store(false, std::memory_order_release);
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    if (worker_running_.load(std::memory_order_relaxed) && !worker_thread_) {
+      worker_thread_ = worker_thread;
+      worker_accepting_functions_ = true;
+      return true;
+    }
+  }
 
-  return true;
+  // Shutdown won while XHostThread::Create was publishing its native thread.
+  // The worker was never exposed through worker_thread_, so drain the local
+  // owner here before Initialize returns.
+  write_ptr_index_event_->Set();
+  worker_thread->Wait(0, 0, 0, nullptr);
+  return false;
 }
 
 void CommandProcessor::Shutdown() {
-  EndTracing();
-
-  worker_running_ = false;
+  system::object_ref<system::XHostThread> worker_thread;
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    // Closing the acceptance gate and stopping the worker under the same lock
+    // makes CallInThread's success result a drain guarantee: anything already
+    // queued remains ahead of the worker's final running-state check.
+    if (worker_accepting_functions_) {
+      // This is the final accepted worker operation. It runs after every trace
+      // request accepted before shutdown, and no later request can overtake it.
+      pending_fns_.push([this]() { EndTracingOnThread(); });
+    }
+    worker_accepting_functions_ = false;
+    paused_.store(false, std::memory_order_release);
+    worker_paused_.store(false, std::memory_order_release);
+    worker_running_.store(false, std::memory_order_release);
+    worker_thread = worker_thread_;
+  }
   write_ptr_index_event_->Set();
-  worker_thread_->Wait(0, 0, 0, nullptr);
-  worker_thread_.reset();
+  if (worker_thread) {
+    worker_thread->Wait(0, 0, 0, nullptr);
+  }
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    if (worker_thread_.get() == worker_thread.get()) {
+      worker_thread_.reset();
+    }
+  }
+  // Normally the queued worker operation already did this. The fallback is
+  // needed if initialization never exposed a worker or its context exited
+  // before draining accepted functions. With the worker joined, it is safe to
+  // finalize here; the trace lock also excludes any direct packet span still
+  // unwinding after worker shutdown was published.
+  EndTracingOnThread();
+  // A healthy worker drained the queue before exit. If context setup failed or
+  // a test/tool harness exposed the gate without a worker, release leftovers
+  // rather than retaining callbacks that can never run.
+  std::queue<std::function<void()>> abandoned_functions;
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    abandoned_functions.swap(pending_fns_);
+  }
 }
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                uint32_t title_id, bool blocking) {}
 
-void CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
+bool CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
+  const std::filesystem::path requested_path = root_path;
+  if (!CallInThread(
+          [this, requested_path]() { RequestFrameTraceOnThread(requested_path); })) {
+    REXGPU_WARN("Frame trace request rejected because the command worker is not accepting work");
+    return false;
+  }
+  return true;
+}
+
+void CommandProcessor::RequestFrameTraceOnThread(
+    const std::filesystem::path& root_path) {
+  std::lock_guard<std::shared_mutex> lifecycle_lock(trace_lifecycle_mutex_);
   if (trace_state_ == TraceState::kStreaming) {
     REXGPU_ERROR("Streaming trace; cannot also trace frame.");
     return;
@@ -203,9 +273,20 @@ void CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path)
   }
   trace_state_ = TraceState::kSingleFrame;
   trace_frame_path_ = root_path;
+  trace_capture_active_.store(true, std::memory_order_release);
 }
 
-void CommandProcessor::BeginTracing(const std::filesystem::path& root_path) {
+bool CommandProcessor::BeginTracing(const std::filesystem::path& root_path) {
+  const std::filesystem::path requested_path = root_path;
+  if (!CallInThread([this, requested_path]() { BeginTracingOnThread(requested_path); })) {
+    REXGPU_WARN("Streaming trace request rejected because the command worker is not accepting work");
+    return false;
+  }
+  return true;
+}
+
+void CommandProcessor::BeginTracingOnThread(const std::filesystem::path& root_path) {
+  std::lock_guard<std::shared_mutex> lifecycle_lock(trace_lifecycle_mutex_);
   if (trace_state_ == TraceState::kStreaming) {
     REXGPU_ERROR("Streaming already active; ignoring request.");
     return;
@@ -217,15 +298,33 @@ void CommandProcessor::BeginTracing(const std::filesystem::path& root_path) {
   // Streaming starts on the next primary buffer execute.
   trace_state_ = TraceState::kStreaming;
   trace_stream_path_ = root_path;
+  trace_capture_active_.store(true, std::memory_order_release);
 }
 
-void CommandProcessor::EndTracing() {
-  if (!trace_writer_.is_open()) {
-    return;
+bool CommandProcessor::EndTracing() {
+  if (!CallInThread([this]() { EndTracingOnThread(); })) {
+    REXGPU_WARN("Trace stop request rejected because the command worker is not accepting work");
+    return false;
   }
-  assert_true(trace_state_ == TraceState::kStreaming);
+  return true;
+}
+
+void CommandProcessor::EndTracingOnThread() {
+  std::lock_guard<std::shared_mutex> lifecycle_lock(trace_lifecycle_mutex_);
+  const TraceState previous_state = trace_state_;
   trace_state_ = TraceState::kDisabled;
-  trace_writer_.Close();
+  trace_stream_path_.clear();
+  trace_frame_path_.clear();
+  if (trace_writer_.is_open()) {
+    if (previous_state == TraceState::kStreaming) {
+      trace_writer_.Close();
+    } else {
+      // A single-frame capture is only complete when its swap closes it.
+      // Stopping early (including shutdown) must not publish a partial trace.
+      trace_writer_.Discard();
+    }
+  }
+  trace_capture_active_.store(false, std::memory_order_release);
 }
 
 void CommandProcessor::RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
@@ -263,16 +362,16 @@ void CommandProcessor::RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ra
   OnGammaRampPWLValueWritten();
 }
 
-void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (!fn || !worker_running_.load(std::memory_order_acquire)) {
-    return;
+bool CommandProcessor::CallInThread(std::function<void()> fn) {
+  if (!fn) {
+    return false;
   }
 
   bool run_inline = false;
   {
     std::lock_guard<std::mutex> lock(pending_fns_mutex_);
-    if (!worker_running_.load(std::memory_order_relaxed)) {
-      return;
+    if (!worker_accepting_functions_) {
+      return false;
     }
     run_inline =
         pending_fns_.empty() && worker_thread_ && system::XThread::IsInThread(worker_thread_.get());
@@ -289,6 +388,7 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
     // future WPTR write.
     write_ptr_index_event_->Set();
   }
+  return true;
 }
 
 bool CommandProcessor::HasPendingFunctions() const {
@@ -356,9 +456,36 @@ void CommandProcessor::WorkerThreadMain() {
     std::function<void()> fn;
     while (TryPopPendingFunction(&fn)) {
       fn();
+      if (worker_paused_.load(std::memory_order_acquire)) {
+        break;
+      }
     }
 
-    if (!worker_running_.load(std::memory_order_acquire)) {
+    if (worker_paused_.load(std::memory_order_acquire)) {
+      // Keep pause cooperative rather than suspending the native worker.
+      // Native self-suspension has a lost-resume window if shutdown races the
+      // instant between signaling Pause's fence and incrementing the host
+      // thread's suspend count.
+      while (worker_running_.load(std::memory_order_acquire) &&
+             worker_paused_.load(std::memory_order_acquire)) {
+        rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
+      }
+      if (!worker_running_.load(std::memory_order_acquire)) {
+        worker_paused_.store(false, std::memory_order_release);
+      }
+      continue;
+    }
+
+    bool should_exit = false;
+    {
+      std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+      // Check the stopped state atomically with queue emptiness. A caller may
+      // enqueue between the final TryPopPendingFunction and this point; if it
+      // was accepted before Shutdown closed the gate, loop once more to drain
+      // it rather than exiting with an orphaned callback.
+      should_exit = !worker_running_.load(std::memory_order_relaxed) && pending_fns_.empty();
+    }
+    if (should_exit) {
       break;
     }
 
@@ -440,31 +567,35 @@ void CommandProcessor::WorkerThreadMain() {
 }
 
 void CommandProcessor::Pause() {
-  if (paused_) {
+  std::lock_guard<std::mutex> pause_lock(pause_mutex_);
+  if (paused_.load(std::memory_order_relaxed)) {
     return;
   }
-  paused_ = true;
+  paused_.store(true, std::memory_order_release);
 
   thread::Fence fence;
-  CallInThread([&fence]() {
-    fence.Signal();
-    thread::Thread::GetCurrentThread()->Suspend();
-  });
-
+  if (!CallInThread([this, &fence]() {
+        worker_paused_.store(true, std::memory_order_release);
+        fence.Signal();
+      })) {
+    paused_.store(false, std::memory_order_release);
+    return;
+  }
   fence.Wait();
 }
 
 void CommandProcessor::Resume() {
-  if (!paused_) {
+  std::lock_guard<std::mutex> pause_lock(pause_mutex_);
+  if (!paused_.load(std::memory_order_relaxed)) {
     return;
   }
-  paused_ = false;
-
-  worker_thread_->thread()->Resume();
+  paused_.store(false, std::memory_order_release);
+  worker_paused_.store(false, std::memory_order_release);
+  write_ptr_index_event_->Set();
 }
 
 bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
-  assert_true(paused_);
+  assert_true(paused_.load(std::memory_order_acquire));
 
   const CommandRingState::Snapshot snapshot = ring_state_.GetSnapshot();
 
@@ -1069,6 +1200,11 @@ void CommandProcessor::NotifyWaitRegMemMemoryWrite(uint32_t address, uint32_t le
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index,
                                                 uint32_t primary_buffer_ptr,
                                                 uint32_t primary_buffer_size) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(trace_lifecycle_mutex_);
+  std::unique_lock<std::mutex> trace_lock(trace_execution_mutex_, std::defer_lock);
+  if (trace_capture_active_.load(std::memory_order_acquire)) {
+    trace_lock.lock();
+  }
   SCOPE_profile_cpu_f("gpu");
 
   // If we have a pending trace stream open it now. That way we ensure we get
@@ -1078,8 +1214,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
         kernel_state_->GetExecutableModule() ? kernel_state_->GetExecutableModule()->title_id() : 0;
     auto file_name = fmt::format("{:08X}_stream.xtr", title_id);
     auto path = trace_stream_path_ / file_name;
-    trace_writer_.Open(path, title_id);
-    InitializeTrace();
+    OpenAndInitializeTrace(path, title_id);
   }
 
   // Adjust pointer base.
@@ -1137,8 +1272,10 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
-void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+bool CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count,
+                                             PacketExecutionMode mode) {
   SCOPE_profile_cpu_f("gpu");
+  bool all_packets_succeeded = true;
 
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
 
@@ -1146,9 +1283,13 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
-    if (!ExecutePacket(&reader)) {
+    if (!ExecutePacket(&reader, mode)) {
+      all_packets_succeeded = false;
       // Return up a level if we encounter a bad packet.
       REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
+      if (mode == PacketExecutionMode::kTraceFailClosed) {
+        break;
+      }
       if (graphics_system_ && graphics_system_->name() == "Metal") {
         static std::atomic<uint32_t> metal_indirect_fail_soft_logs{0};
         uint32_t fail_soft_index =
@@ -1172,15 +1313,35 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   } while (reader.read_count());
 
   trace_writer_.WriteIndirectBufferEnd();
+  return all_packets_succeeded;
 }
 
-void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
+bool CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
+  return ExecutePacketSpan(ptr, count, PacketExecutionMode::kLiveFailSoft);
+}
+
+bool CommandProcessor::ExecutePacketForTrace(uint32_t ptr, uint32_t count) {
+  return ExecutePacketSpan(ptr, count, PacketExecutionMode::kTraceFailClosed);
+}
+
+bool CommandProcessor::ExecutePacketSpan(uint32_t ptr, uint32_t count,
+                                         PacketExecutionMode mode) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(trace_lifecycle_mutex_);
+  std::unique_lock<std::mutex> trace_lock(trace_execution_mutex_, std::defer_lock);
+  if (trace_capture_active_.load(std::memory_order_acquire)) {
+    trace_lock.lock();
+  }
+  bool all_packets_succeeded = true;
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
-    if (!ExecutePacket(&reader)) {
+    if (!ExecutePacket(&reader, mode)) {
+      all_packets_succeeded = false;
       REXGPU_ERROR("**** ExecutePacket: Failed to execute packet.");
+      if (mode == PacketExecutionMode::kTraceFailClosed) {
+        break;
+      }
       if (graphics_system_ && graphics_system_->name() == "Metal") {
         static std::atomic<uint32_t> metal_direct_fail_soft_logs{0};
         uint32_t fail_soft_index =
@@ -1202,9 +1363,11 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+  return all_packets_succeeded;
 }
 
-bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader,
+                                     PacketExecutionMode mode) {
   const auto packet_offset = reader->read_offset();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
@@ -1230,7 +1393,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
       result = ExecutePacketType2(reader, packet);
       break;
     case 0x03:
-      result = ExecutePacketType3(reader, packet);
+      result = ExecutePacketType3(reader, packet, mode);
       break;
     default:
       assert_unhandled_case(packet_type);
@@ -1303,7 +1466,8 @@ bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t p
   return true;
 }
 
-bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet) {
+bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet,
+                                          PacketExecutionMode mode) {
   // Type-3 packet.
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
@@ -1350,7 +1514,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
     case PM4_INDIRECT_BUFFER:
     case PM4_INDIRECT_BUFFER_PFD:
-      result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count);
+      result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count, mode);
       break;
     case PM4_WAIT_REG_MEM:
       result = ExecutePacketType3_WAIT_REG_MEM(reader, packet, count);
@@ -1380,10 +1544,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
       break;
     case PM4_DRAW_INDX:
-      result = ExecutePacketType3_DRAW_INDX(reader, packet, count);
+      result = ExecutePacketType3_DRAW_INDX(reader, packet, count, mode);
       break;
     case PM4_DRAW_INDX_2:
-      result = ExecutePacketType3_DRAW_INDX_2(reader, packet, count);
+      result = ExecutePacketType3_DRAW_INDX_2(reader, packet, count, mode);
       break;
     case PM4_SET_CONSTANT:
       result = ExecutePacketType3_SET_CONSTANT(reader, packet, count);
@@ -1474,9 +1638,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
                        unimplemented_log_index, opcode, count);
           std::fflush(stderr);
         }
-        result = true;
+        result = mode == PacketExecutionMode::kLiveFailSoft;
       } else {
-        assert_always();
+        if (mode == PacketExecutionMode::kLiveFailSoft) {
+          assert_always();
+        }
       }
       reader->AdvanceRead(count * sizeof(uint32_t));
       break;
@@ -1505,6 +1671,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       if (trace_state_ == TraceState::kSingleFrame) {
         trace_state_ = TraceState::kDisabled;
         trace_writer_.Close();
+        trace_capture_active_.store(false, std::memory_order_release);
       }
     } else if (trace_state_ == TraceState::kSingleFrame) {
       // New trace request - we only start tracing at the beginning of a frame.
@@ -1512,8 +1679,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       auto file_name =
           fmt::format("{:08X}_{}.xtr", title_id, counter_.load(std::memory_order_acquire) - 1);
       auto path = trace_frame_path_ / file_name;
-      trace_writer_.Open(path, title_id);
-      InitializeTrace();
+      OpenAndInitializeTrace(path, title_id);
     }
   }
 
@@ -1634,14 +1800,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 }
 
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
-                                                          uint32_t packet, uint32_t count) {
+                                                          uint32_t packet, uint32_t count,
+                                                          PacketExecutionMode mode) {
   // indirect buffer dispatch
   uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
-  ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
-  return true;
+  return ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length, mode);
 }
 
 bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet,
@@ -1678,6 +1844,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       EnvironmentFlagEnabled("GOLDENEYE_METAL_VDSWAP_SCAVENGE");
   const bool fast_wait_metal =
       vd_swap_scavenger_enabled && graphics_system_ && graphics_system_->name() == "Metal";
+  // ExecutePacket is also used synchronously by trace playback, diagnostics,
+  // and packet-level tests without starting the command processor worker. A
+  // false worker_running_ at entry means there is no worker lifecycle to
+  // cancel this wait. Only treat a later transition to false as shutdown when
+  // execution entered while the worker was active.
+  const bool cancel_wait_if_worker_stops = worker_running_.load(std::memory_order_acquire);
   const auto wait_started = std::chrono::steady_clock::now();
   const auto wait_deadline = wait_started + std::chrono::milliseconds(60);
   auto remaining_wait_timeout = [&wait_deadline](std::chrono::milliseconds requested_timeout) {
@@ -1823,7 +1995,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         }
         rex::thread::SyncMemory();
 
-        if (!worker_running_) {
+        if (cancel_wait_if_worker_stops &&
+            !worker_running_.load(std::memory_order_acquire)) {
           // Short-circuited exit.
           if (memory_change_wait_armed) {
             EndWaitRegMemMemoryChange();
@@ -2111,7 +2284,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
 
 bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,
                                               const char* opcode_name, uint32_t viz_query_condition,
-                                              uint32_t count_remaining) {
+                                              uint32_t count_remaining,
+                                              PacketExecutionMode mode) {
   // if viz_query_condition != 0, this is a conditional draw based on viz query.
   // This ID matches the one issued in PM4_VIZ_QUERY
   // uint32_t viz_id = viz_query_condition & 0x3F;
@@ -2227,11 +2401,12 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // for instance, features not supported by the host), don't terminate command
   // buffer processing as that would leave rendering in a way more inconsistent
   // state than just a single dropped draw command.
-  return true;
+  return mode == PacketExecutionMode::kTraceFailClosed ? draw_succeeded : true;
 }
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,
-                                                    uint32_t count) {
+                                                    uint32_t count,
+                                                    PacketExecutionMode mode) {
   // "initiate fetch of index buffer and draw"
   // Generally used by Xbox 360 Direct3D 9 for kDMA and kAutoIndex sources.
   // With a viz query token as the first one.
@@ -2244,15 +2419,16 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
   uint32_t viz_query_condition = reader->ReadAndSwap<uint32_t>();
   --count_remaining;
   return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX", viz_query_condition,
-                                count_remaining);
+                                count_remaining, mode);
 }
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet,
-                                                      uint32_t count) {
+                                                      uint32_t count,
+                                                      PacketExecutionMode mode) {
   // "draw using supplied indices in packet"
   // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
   // No viz query token.
-  return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX_2", 0, count);
+  return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX_2", 0, count, mode);
 }
 
 bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet,
@@ -2528,6 +2704,29 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
     }
   }
 
+  return true;
+}
+
+bool CommandProcessor::OpenAndInitializeTrace(const std::filesystem::path& path,
+                                              uint32_t title_id) {
+  trace_initialization_incomplete_ = false;
+  if (!trace_writer_.Open(path, title_id)) {
+    REXGPU_ERROR("Trace initialization failed to open {}", path.string());
+    trace_state_ = TraceState::kDisabled;
+    trace_capture_active_.store(false, std::memory_order_release);
+    return false;
+  }
+
+  InitializeTrace();
+  trace_writer_.Flush();
+  if (trace_initialization_incomplete_ || trace_writer_.has_error()) {
+    REXGPU_ERROR("Trace initialization failed; discarding incomplete trace {}",
+                 path.string());
+    trace_writer_.Discard();
+    trace_state_ = TraceState::kDisabled;
+    trace_capture_active_.store(false, std::memory_order_release);
+    return false;
+  }
   return true;
 }
 

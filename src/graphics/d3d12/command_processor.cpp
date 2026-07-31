@@ -151,13 +151,13 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
 
-void D3D12CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
+bool D3D12CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
   // Capture with PIX if attached.
   if (GetD3D12Provider().GetGraphicsAnalysis() != nullptr) {
     pix_capture_requested_.store(true, std::memory_order_relaxed);
-    return;
+    return true;
   }
-  CommandProcessor::RequestFrameTrace(root_path);
+  return CommandProcessor::RequestFrameTrace(root_path);
 }
 
 void D3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
@@ -165,12 +165,16 @@ void D3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t
   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
 }
 
-void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+bool D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  if (!snapshot) {
+    return false;
+  }
   // Starting a new frame because descriptors may be needed.
   if (!BeginSubmission(true)) {
-    return;
+    return false;
   }
   render_target_cache_->RestoreEdramSnapshot(snapshot);
+  return true;
 }
 
 bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,

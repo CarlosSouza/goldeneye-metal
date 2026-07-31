@@ -9,13 +9,15 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  * @modified    2026 - Rewired onto the current Runtime/RuntimeConfig API and
  *                     made fully headless + dependency-free (BMP/RAW dump),
- *                     for use as a backend reference/diff oracle.
+ *                     for deterministic backend comparison when the trace and
+ *                     selected backend pass the state-fidelity preflight.
  */
 
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -23,8 +25,8 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/trace_dump.h>
 #include <rex/graphics/trace_player.h>
+#include <rex/graphics/trace_reader.h>
 #include <rex/logging.h>
-#include <rex/memory.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
 #include <rex/system/xtypes.h>
@@ -33,6 +35,24 @@
 namespace rex::graphics {
 
 namespace {
+
+bool WriteFile(const std::filesystem::path& path, const void* data, size_t size) {
+  if (size && !data) {
+    return false;
+  }
+  FILE* file = rex::filesystem::OpenFile(path, "wb");
+  if (!file) {
+    return false;
+  }
+  bool succeeded = !size || std::fwrite(data, 1, size, file) == size;
+  if (std::fflush(file) != 0) {
+    succeeded = false;
+  }
+  if (std::fclose(file) != 0) {
+    succeeded = false;
+  }
+  return succeeded;
+}
 
 // Write a 24-bit, bottom-up BMP from RGBX (R8 G8 B8 X8) pixel data. BMP is the
 // simplest broadly-viewable format with zero dependencies; macOS Preview/sips
@@ -43,10 +63,23 @@ bool WriteBmp(const std::filesystem::path& path, const ui::RawImage& image) {
   if (!w || !h || image.data.empty()) {
     return false;
   }
-  const uint32_t row_bytes = w * 3;
-  const uint32_t padded_row = (row_bytes + 3u) & ~3u;
-  const uint32_t pixel_array = padded_row * h;
-  const uint32_t file_size = 54 + pixel_array;
+  const size_t src_stride = image.stride ? image.stride : size_t(w) * 4;
+  if (size_t(w) > std::numeric_limits<size_t>::max() / 4 || src_stride < size_t(w) * 4 ||
+      size_t(h) > std::numeric_limits<size_t>::max() / src_stride ||
+      image.data.size() < src_stride * size_t(h)) {
+    return false;
+  }
+  uint64_t row_bytes_64 = uint64_t(w) * 3;
+  uint64_t padded_row_64 = (row_bytes_64 + 3u) & ~uint64_t(3);
+  uint64_t pixel_array_64 = padded_row_64 * h;
+  uint64_t file_size_64 = 54 + pixel_array_64;
+  if (row_bytes_64 > UINT32_MAX || padded_row_64 > UINT32_MAX || pixel_array_64 > UINT32_MAX ||
+      file_size_64 > UINT32_MAX || file_size_64 > std::numeric_limits<size_t>::max()) {
+    return false;
+  }
+  const uint32_t padded_row = uint32_t(padded_row_64);
+  const uint32_t pixel_array = uint32_t(pixel_array_64);
+  const uint32_t file_size = uint32_t(file_size_64);
 
   std::vector<uint8_t> buf(file_size, 0);
   auto put16 = [&](size_t off, uint16_t v) {
@@ -70,7 +103,6 @@ bool WriteBmp(const std::filesystem::path& path, const ui::RawImage& image) {
   put16(28, 24);  // bits per pixel
   put32(34, pixel_array);
 
-  const size_t src_stride = image.stride ? image.stride : size_t(w) * 4;
   for (uint32_t y = 0; y < h; ++y) {
     // BMP scanlines are bottom-up.
     const uint8_t* src = image.data.data() + size_t(h - 1 - y) * src_stride;
@@ -83,13 +115,7 @@ bool WriteBmp(const std::filesystem::path& path, const ui::RawImage& image) {
     }
   }
 
-  FILE* f = std::fopen(path.string().c_str(), "wb");
-  if (!f) {
-    return false;
-  }
-  std::fwrite(buf.data(), 1, buf.size(), f);
-  std::fclose(f);
-  return true;
+  return WriteFile(path, buf.data(), buf.size());
 }
 
 }  // namespace
@@ -100,21 +126,122 @@ TraceDump::~TraceDump() = default;
 
 int TraceDump::Main(const std::vector<std::string>& args) {
   if (args.size() < 2) {
-    REXGPU_ERROR("usage: trace_dump <trace_file> [output_base] [frame_index]");
+    REXGPU_ERROR(
+        "usage: trace_dump <trace_file> [output_base] [frame_index] "
+        "[--best-effort]");
     return 5;
   }
 
-  std::filesystem::path path = rex::to_path(args[1]);
-  std::filesystem::path output_path;
-  if (args.size() >= 3) {
-    output_path = rex::to_path(args[2]);
+  std::vector<std::string_view> positional_args;
+  bool allow_best_effort = false;
+  for (size_t i = 1; i < args.size(); ++i) {
+    if (args[i] == "--best-effort") {
+      allow_best_effort = true;
+    } else if (args[i].starts_with("--")) {
+      REXGPU_ERROR("Unknown trace dump option '{}'", args[i]);
+      return 5;
+    } else {
+      positional_args.emplace_back(args[i]);
+    }
   }
-  if (args.size() >= 4) {
-    frame_index_ = std::atoi(args[3].c_str());
+  if (positional_args.empty() || positional_args.size() > 3) {
+    REXGPU_ERROR(
+        "usage: trace_dump <trace_file> [output_base] [frame_index] "
+        "[--best-effort]");
+    return 5;
+  }
+
+  std::filesystem::path path = rex::to_path(positional_args[0]);
+  std::filesystem::path output_path;
+  if (positional_args.size() >= 2) {
+    output_path = rex::to_path(positional_args[1]);
+  }
+  if (positional_args.size() >= 3) {
+    std::string_view frame_index_arg = positional_args[2];
+    int parsed_frame_index = 0;
+    auto [end_ptr, error] =
+        std::from_chars(frame_index_arg.data(), frame_index_arg.data() + frame_index_arg.size(),
+                        parsed_frame_index);
+    if (frame_index_arg.empty() || error != std::errc() ||
+        end_ptr != frame_index_arg.data() + frame_index_arg.size() || parsed_frame_index < 0) {
+      REXGPU_ERROR("Invalid frame index '{}'; expected a non-negative integer",
+                   std::string(frame_index_arg));
+      return 5;
+    }
+    frame_index_ = parsed_frame_index;
   }
 
   auto abs_path = std::filesystem::absolute(path);
   REXGPU_INFO("Loading trace file {} (frame {})...", rex::path_to_utf8(abs_path), frame_index_);
+
+  // Validate the trace before reserving guest memory or creating the graphics
+  // backend. This keeps malformed, incomplete and out-of-range trace errors
+  // visible even on hosts where runtime setup itself isn't available.
+  {
+    TraceReader preflight_reader;
+    if (!preflight_reader.Open(rex::path_to_utf8(abs_path))) {
+      REXGPU_ERROR("Unable to load or validate trace file");
+      return 5;
+    }
+    if (!preflight_reader.frame_count()) {
+      REXGPU_ERROR("Trace contains no completed swap frames");
+      return 6;
+    }
+    if (frame_index_ < 0 || frame_index_ >= preflight_reader.frame_count()) {
+      REXGPU_ERROR("Frame {} is out of range (trace has {} frames)", frame_index_,
+                   preflight_reader.frame_count());
+      return 6;
+    }
+    std::string backend_edram_limitation;
+    bool backend_supports_edram_requirements = false;
+    if (preflight_reader.has_finalized_edram_requirements()) {
+      backend_supports_edram_requirements = SupportsCanonicalEdramRequirements(
+          preflight_reader.edram_requirements(), backend_edram_limitation);
+    }
+    const TraceReplayPreflight replay_preflight = {
+        preflight_reader.has_initial_edram_snapshot(),
+        preflight_reader.edram_requirements_finalized(),
+        preflight_reader.edram_requirements_tracked(),
+        backend_supports_edram_requirements,
+    };
+    if (!replay_preflight.HasDeterministicEdramState()) {
+      if (!replay_preflight.PermitsReplay(allow_best_effort)) {
+        if (!replay_preflight.has_initial_edram_snapshot) {
+          REXGPU_ERROR(
+              "Trace has no initial 10 MiB EDRAM snapshot. Standalone replay "
+              "would start with undefined color, depth and stencil state.");
+        }
+        if (!replay_preflight.edram_requirements_finalized) {
+          REXGPU_ERROR(
+              "Trace ended without a finalized whole-capture EDRAM requirements manifest.");
+        } else if (!replay_preflight.edram_requirements_tracked) {
+          REXGPU_ERROR(
+              "Trace was finalized without EDRAM requirements tracking; its "
+              "render-target contract is unknown.");
+        } else if (!replay_preflight.backend_supports_edram_requirements) {
+          REXGPU_ERROR("Selected backend cannot satisfy this trace's canonical EDRAM contract: {}",
+                       backend_edram_limitation);
+        }
+        REXGPU_ERROR(
+            "Refusing to label this replay deterministic. Pass --best-effort "
+            "only for diagnostic output.");
+        return 6;
+      }
+      REXGPU_WARN(
+          "BEST-EFFORT TRACE REPLAY: output is diagnostic and must not be used "
+          "as a deterministic backend oracle.");
+      if (!replay_preflight.has_initial_edram_snapshot) {
+        REXGPU_WARN("The trace has no initial canonical EDRAM snapshot.");
+      }
+      if (!replay_preflight.edram_requirements_finalized) {
+        REXGPU_WARN("The trace EDRAM requirements manifest is unfinalized.");
+      } else if (!replay_preflight.edram_requirements_tracked) {
+        REXGPU_WARN("The trace EDRAM requirements contract is unknown.");
+      } else if (!replay_preflight.backend_supports_edram_requirements) {
+        REXGPU_WARN("Backend EDRAM limitation: {}", backend_edram_limitation);
+      }
+    }
+  }
 
   if (!Setup()) {
     REXGPU_ERROR("Unable to setup trace dump tool");
@@ -130,7 +257,10 @@ int TraceDump::Main(const std::vector<std::string>& args) {
     output_path.replace_extension();
   }
   base_output_path_ = output_path;
-  rex::filesystem::CreateParentFolder(base_output_path_);
+  if (!rex::filesystem::CreateParentFolder(base_output_path_)) {
+    REXGPU_ERROR("Unable to create output directory for {}", rex::path_to_utf8(base_output_path_));
+    return 5;
+  }
 
   return Run();
 }
@@ -170,17 +300,28 @@ bool TraceDump::Load(const std::filesystem::path& trace_file_path) {
 }
 
 int TraceDump::Run() {
-  BeginHostCapture();
-  player_->SeekFrame(frame_index_);
-  const auto* frame = player_->current_frame();
-  if (!frame) {
-    REXGPU_ERROR("Frame {} is out of range", frame_index_);
-    EndHostCapture();
+  if (!player_->frame_count()) {
+    REXGPU_ERROR("Trace contains no completed swap frames");
     return 6;
   }
-  player_->SeekCommand(static_cast<int>(frame->commands.size()) - 1);
-  player_->WaitOnPlayback();
+  if (frame_index_ < 0 || frame_index_ >= player_->frame_count()) {
+    REXGPU_ERROR("Frame {} is out of range (trace has {} frames)", frame_index_,
+                 player_->frame_count());
+    return 6;
+  }
+
+  BeginHostCapture();
+  if (!player_->SeekFrame(frame_index_)) {
+    REXGPU_ERROR("Unable to start playback for frame {}", frame_index_);
+    EndHostCapture();
+    return 7;
+  }
+  bool playback_succeeded = player_->WaitOnPlayback();
   EndHostCapture();
+  if (!playback_succeeded) {
+    REXGPU_ERROR("Playback failed while replaying frame {}", frame_index_);
+    return 8;
+  }
 
   int result = 0;
   ui::Presenter* presenter = graphics_system_->presenter();
@@ -197,50 +338,13 @@ int TraceDump::Run() {
     // Raw RGBX for byte-exact backend diffing.
     std::filesystem::path raw_path = base_output_path_;
     raw_path += ".rgba";
-    if (FILE* f = std::fopen(raw_path.string().c_str(), "wb")) {
-      std::fwrite(image.data.data(), 1, image.data.size(), f);
-      std::fclose(f);
+    if (!WriteFile(raw_path, image.data.data(), image.data.size())) {
+      REXGPU_ERROR("Failed to write raw output {}", rex::path_to_utf8(raw_path));
+      result = 1;
     }
   } else {
     REXGPU_ERROR("CaptureGuestOutput failed (no presenter, or backend capture unimplemented)");
     result = 1;
-  }
-
-  // Backend-agnostic capture: dump the resolved swap surface straight from guest
-  // memory. The headless offscreen presenter can't always capture, and reading
-  // guest memory works for ANY backend once the resolve path writes pixels. The
-  // swap frontbuffer for this title's menu trace is at 0x1EFC8000, 1280x720.
-  // Guest swap data is BGRA and may be Xenos-tiled; this dumps raw bytes as
-  // linear (channels/tiling may be scrambled) purely to reveal whether the
-  // resolve produced real STRUCTURE vs. an empty surface.
-  if (auto* mem = graphics_system_->memory()) {
-    constexpr uint32_t kSwapAddr = 0x1EFC8000u;
-    constexpr uint32_t kSwapW = 1280u;
-    constexpr uint32_t kSwapH = 720u;
-    if (const uint8_t* src = mem->TranslatePhysical<const uint8_t*>(kSwapAddr)) {
-      ui::RawImage gm;
-      gm.width = kSwapW;
-      gm.height = kSwapH;
-      gm.stride = size_t(kSwapW) * 4;
-      gm.data.assign(src, src + gm.stride * size_t(kSwapH));
-      uint64_t nonzero = 0;
-      for (size_t i = 0; i + 3 < gm.data.size(); i += 4) {
-        if (gm.data[i] | gm.data[i + 1] | gm.data[i + 2]) {
-          ++nonzero;
-        }
-      }
-      std::filesystem::path gm_bmp = base_output_path_;
-      gm_bmp += ".guestmem.bmp";
-      WriteBmp(gm_bmp, gm);
-      std::filesystem::path gm_raw = base_output_path_;
-      gm_raw += ".guestmem.rgba";
-      if (FILE* f = std::fopen(gm_raw.string().c_str(), "wb")) {
-        std::fwrite(gm.data.data(), 1, gm.data.size(), f);
-        std::fclose(f);
-      }
-      REXGPU_INFO("guestmem swap dump 0x{:08X} {}x{}: {} nonzero px -> {}", kSwapAddr, kSwapW, kSwapH,
-                  nonzero, rex::path_to_utf8(gm_bmp));
-    }
   }
 
   player_.reset();

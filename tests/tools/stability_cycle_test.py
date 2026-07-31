@@ -11,6 +11,8 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,6 +25,49 @@ SPEC.loader.exec_module(stability)
 
 
 class StabilityCycleTest(unittest.TestCase):
+    def _cycle_fixture(
+        self,
+        root: Path,
+        source: str,
+        **overrides,
+    ) -> tuple[SimpleNamespace, Path]:
+        executable = root / "fake-game.py"
+        executable.write_text(
+            textwrap.dedent(source),
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        runtime = root / "runtime"
+        runtime.mkdir()
+        (runtime / "librexruntime.dylib").touch()
+        game_data = root / "game-data"
+        game_data.mkdir()
+        (game_data / "default.xex").write_bytes(b"fixture")
+        suite = root / "suite"
+        suite.mkdir()
+        values = {
+            "mode": "menu",
+            "players": 2,
+            "executable": executable,
+            "runtime_dir": runtime,
+            "game_data": game_data,
+            "ready_timeout": 5.0,
+            "post_ready_soak_seconds": 0.5,
+            "poll_seconds": 0.02,
+            "menu_settle_seconds": 0.0,
+            "warmup_windows": 0,
+            "observe_windows": 1,
+            "capture": False,
+            "capture_delay": 0.0,
+            "capture_retries": 1,
+            "render_min_luma_stddev": 1.0,
+            "reference": None,
+            "quit_method": "signal",
+            "shutdown_timeout": 1.0,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values), suite
+
     def test_cli_rejects_non_finite_timeout(self):
         result = subprocess.run(
             [
@@ -38,6 +83,95 @@ class StabilityCycleTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("finite number", result.stderr)
+
+    def test_cli_rejects_non_finite_post_ready_soak(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools/stability-cycle.py"),
+                "--post-ready-soak-seconds",
+                "nan",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("finite number", result.stderr)
+
+    def test_serious_stability_markers_fail_log_scan(self):
+        markers = (
+            "GEWATCHDOG STALL: ring rpi=0x1 wpi=0x2 [PENDING]",
+            "[ge] GENOPRESENT STALL rpi=0x00000001 wpi=0x00000002 PENDING",
+            (
+                "[GE-PLAYER-STUCK-v1] suspected live-render movement stall: "
+                "samples=16"
+            ),
+            (
+                "[GE-GUARD-AUDIO-CALLBACK-v1] repaired callback ABI "
+                "hit=1 site=0x823E4BA8"
+            ),
+            (
+                "[ge] GENOPRESENT CSLEDGER owner=0x1 cs=0x2 found=1 "
+                "depth=1 enters=1 incomplete=1 dropped=0 leave_mismatches=0"
+            ),
+            (
+                "[ge] GENOPRESENT CSLEDGER owner=0x1 cs=0x2 found=1 "
+                "depth=1 enters=1 incomplete=0 dropped=0 leave_mismatches=2"
+            ),
+            (
+                "[ge] GENOPRESENT CSLEDGER matching_leave_mismatch "
+                "cs=0x00000002 leave_lr=0x823E4BAC"
+            ),
+            (
+                "GENOPRESENT CSLEDGER latest owner-thread leave mismatch "
+                "cs=0x2 leave_lr=0x823E4BAC"
+            ),
+            (
+                "GENOPRESENT CSLEDGER owner=0x1 cs=0x2 found=true "
+                "incomplete=true dropped=0 leave_mismatches=0"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            cycle_root = Path(temporary)
+            log_path = cycle_root / "raw.log"
+            for marker in markers:
+                with self.subTest(marker=marker):
+                    log_path.write_text(marker + "\n", encoding="utf-8")
+                    matches = stability.detect_fatal_logs(cycle_root)
+                    self.assertTrue(matches, marker)
+
+    def test_benign_stability_summaries_do_not_fail_log_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cycle_root = Path(temporary)
+            (cycle_root / "raw.log").write_text(
+                "\n".join(
+                    (
+                        "summary: GEWATCHDOG STALL count=0",
+                        "summary: GENOPRESENT STALL count=0",
+                        "[GE-PLAYER-STUCK-v1] reports=0",
+                        "[GE-GUARD-AUDIO-CALLBACK-v1] repairs=0",
+                        (
+                            "[GE-GUARD-AUDIO-CALLBACK-v1] snapshot overflow "
+                            "hit=1 depth=8 guest_sp=0x1"
+                        ),
+                        (
+                            "[ge] GENOPRESENT CSLEDGER owner=0x1 cs=0x2 found=1 "
+                            "depth=1 enters=1 incomplete=0 dropped=0 "
+                            "leave_mismatches=0"
+                        ),
+                        (
+                            "GENOPRESENT CSLEDGER owner=0x1 cs=0x2 found=true "
+                            "incomplete=false dropped=0 leave_mismatches=0"
+                        ),
+                        "summary: CSLEDGER matching_leave_mismatch count=0",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(stability.detect_fatal_logs(cycle_root), [])
 
     def test_process_group_cleanup_detects_and_kills_surviving_child(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -71,7 +205,11 @@ class StabilityCycleTest(unittest.TestCase):
             finally:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
+                    # terminate_process already proved and reported descendant
+                    # cleanup above. Under a test runner, the dead parent's PID
+                    # may be recycled for a process group we don't own before
+                    # this defensive finalizer runs.
                     pass
                 process.wait(timeout=3)
 
@@ -294,6 +432,49 @@ class StabilityCycleTest(unittest.TestCase):
                 driver.close()
                 os.close(read_fd)
 
+    def test_post_ready_multiplayer_heartbeats_require_fresh_acks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "raw.log"
+            log_path.write_text("[vpad] READY pads=2\n", encoding="utf-8")
+            read_fd, write_fd = os.pipe()
+            os.set_blocking(read_fd, False)
+            driver = stability.LocalMultiplayerInputDriver(2, write_fd)
+            driver.ready_elapsed = 1.0
+            try:
+                driver.begin_post_ready_soak(10.0, heartbeat_enabled=True)
+                self.assertEqual(
+                    os.read(read_fd, 4096).decode("ascii"),
+                    "RESET 1 1\nRESET 2 2\n",
+                )
+
+                with log_path.open("a", encoding="utf-8") as stream:
+                    stream.write("[vpad] ACK seq=1\n[vpad] ACK seq=2\n")
+                driver.advance(log_path, 10.5)
+                driver.finish_post_ready_soak(log_path, 10.5)
+                self.assertIsNone(driver.error)
+                with self.assertRaises(BlockingIOError):
+                    os.read(read_fd, 4096)
+
+                driver.advance(log_path, 11.1)
+                self.assertEqual(
+                    os.read(read_fd, 4096).decode("ascii"),
+                    "RESET 3 1\nRESET 4 2\n",
+                )
+                with log_path.open("a", encoding="utf-8") as stream:
+                    stream.write("[vpad] ACK seq=3\n")
+                driver.finish_post_ready_soak(log_path, 11.5)
+                self.assertEqual(
+                    driver.error,
+                    (
+                        "post-ready virtual-gamepad heartbeat was not "
+                        "acknowledged: 4"
+                    ),
+                )
+                self.assertEqual(driver.soak_heartbeat_batches, [[1, 2], [3, 4]])
+            finally:
+                driver.close()
+                os.close(read_fd)
+
     def test_binary_capability_scan_handles_chunk_boundaries(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "binary"
@@ -359,6 +540,8 @@ class StabilityCycleTest(unittest.TestCase):
                 str(suite),
                 "--ready-timeout",
                 "5",
+                "--post-ready-soak-seconds",
+                "0.15",
                 "--poll-seconds",
                 "0.05",
                 "--warmup-windows",
@@ -388,7 +571,15 @@ class StabilityCycleTest(unittest.TestCase):
             summary = json.loads((suite / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["status"], "pass")
             self.assertEqual(summary["cycles_passed"], 2)
+            self.assertEqual(summary["post_ready_soak_cycles_completed"], 2)
             self.assertTrue(summary["isolated_state"])
+            self.assertIn(
+                (
+                    "requested post-ready soak: 0.15 seconds; "
+                    "completed: 2/2 cycles"
+                ),
+                (suite / "summary.txt").read_text(encoding="utf-8"),
+            )
             for number in (1, 2):
                 cycle_root = suite / f"cycle-{number:03d}"
                 state_root = cycle_root / "user-data"
@@ -406,8 +597,112 @@ class StabilityCycleTest(unittest.TestCase):
                 )
                 self.assertTrue((cycle_root / "raw.log").is_file())
                 self.assertTrue((cycle_root / "cycle.json").is_file())
+                cycle = json.loads(
+                    (cycle_root / "cycle.json").read_text(encoding="utf-8")
+                )
+                self.assertTrue(cycle["post_ready_soak"]["completed"])
+                self.assertEqual(
+                    cycle["post_ready_soak"]["requested_seconds"], 0.15
+                )
+                self.assertGreaterEqual(
+                    cycle["post_ready_soak"]["elapsed_seconds"], 0.15
+                )
             self.assertEqual(
                 sorted(path.name for path in game_data.iterdir()), ["default.xex"]
+            )
+
+    def test_fatal_marker_before_readiness_aborts_without_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, suite = self._cycle_fixture(
+                root,
+                """\
+                #!/usr/bin/env python3
+                import signal, sys, time
+                signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+                print(
+                    "GEWATCHDOG STALL: ring rpi=0x1 wpi=0x2 [PENDING]",
+                    flush=True,
+                )
+                while True:
+                    time.sleep(0.05)
+                """,
+                ready_timeout=5.0,
+                post_ready_soak_seconds=2.0,
+            )
+            started = time.monotonic()
+            cycle = stability.run_cycle(args, suite, 1)
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertFalse(cycle["ready"])
+            self.assertTrue(cycle["pre_ready_abort_log_matches"])
+            self.assertTrue(
+                any("GEWATCHDOG STALL" in failure for failure in cycle["failures"])
+            )
+            self.assertFalse(
+                any("readiness was not reached" in failure for failure in cycle["failures"])
+            )
+
+            self.assertFalse(stability.write_suite_summary(suite, [cycle], args))
+            summary = json.loads((suite / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["post_ready_soak_cycles_completed"], 0)
+            self.assertIn(
+                "completed: 0/1 cycles",
+                (suite / "summary.txt").read_text(encoding="utf-8"),
+            )
+
+    def test_exit_during_soak_skips_capture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, suite = self._cycle_fixture(
+                root,
+                """\
+                #!/usr/bin/env python3
+                import time
+                print(
+                    "[ge] GOLDENEYE_AUTO_START=menu injecting Start",
+                    flush=True,
+                )
+                print(
+                    "[metal-profile] window swaps=1-64 "
+                    "elapsed_ns=1066666688 avg_frame_ns=16666667 fps=60.0",
+                    flush=True,
+                )
+                for event, calls in (
+                    ("draw", 640),
+                    ("copy", 64),
+                    ("swap", 64),
+                    ("wait_reg_mem", 64),
+                ):
+                    print(
+                        f"[metal-profile] command swaps=1-64 event={event} "
+                        f"calls={calls} avg_calls_per_swap=1 total_ns=64000000 "
+                        "avg_ns_per_swap=1000000 max_call_ns=2000000 "
+                        "max_swap_ns=3000000",
+                        flush=True,
+                    )
+                time.sleep(0.15)
+                """,
+                capture=True,
+                post_ready_soak_seconds=1.0,
+            )
+            with mock.patch.object(
+                stability.rendering, "capture_window"
+            ) as capture_window:
+                cycle = stability.run_cycle(args, suite, 1)
+            capture_window.assert_not_called()
+            self.assertTrue(cycle["ready"])
+            self.assertEqual(
+                cycle["capture_skipped_reason"],
+                "application exited before capture",
+            )
+            self.assertTrue(
+                any(
+                    "during post-ready soak" in failure
+                    for failure in cycle["failures"]
+                )
+            )
+            self.assertFalse(
+                any("capture failed" in failure for failure in cycle["failures"])
             )
 
     def test_failure_logged_during_shutdown_fails_final_profile(self):
@@ -462,6 +757,8 @@ class StabilityCycleTest(unittest.TestCase):
                     str(suite),
                     "--ready-timeout",
                     "5",
+                    "--post-ready-soak-seconds",
+                    "0",
                     "--poll-seconds",
                     "0.05",
                     "--warmup-windows",
@@ -547,6 +844,8 @@ class StabilityCycleTest(unittest.TestCase):
                     str(suite),
                     "--ready-timeout",
                     "5",
+                    "--post-ready-soak-seconds",
+                    "0",
                     "--menu-settle-seconds",
                     "0",
                     "--poll-seconds",

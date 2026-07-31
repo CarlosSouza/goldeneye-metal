@@ -458,6 +458,15 @@ class Thread : public WaitHandle {
   // threads that had been waiting for the thread to terminate.
   virtual void Terminate(int exit_code) = 0;
 
+  // Waits for the native thread to have completely exited, including host TLS
+  // destructors and cancellation cleanup. Unlike Wait(), this never performs
+  // an unbounded native join after the deadline has expired.
+  virtual WaitResult WaitForExitUntil(std::chrono::steady_clock::time_point deadline) = 0;
+
+  // Registers work that must run after the native thread has been joined but
+  // before WaitForExitUntil or a normal thread wait reports completion.
+  virtual void SetExitCallback(std::function<void()> callback) = 0;
+
  protected:
   std::string name_;
 };

@@ -10,20 +10,38 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <unordered_set>
 
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
 
+std::uint64_t CurrentProcessId() {
+#if defined(_WIN32)
+  return static_cast<std::uint64_t>(_getpid());
+#else
+  return static_cast<std::uint64_t>(getpid());
+#endif
+}
+
 struct TempProject {
   fs::path root;
   explicit TempProject(const std::string& tag = "migration_scan_test")
-      : root(fs::temp_directory_path() / tag) {
+      : root(fs::temp_directory_path() /
+             (tag + "-" + std::to_string(CurrentProcessId()) + "-" +
+              std::to_string(next_id.fetch_add(1, std::memory_order_relaxed)))) {
     fs::remove_all(root);
     fs::create_directories(root / "generated");
   }
@@ -39,6 +57,9 @@ struct TempProject {
     std::ofstream f(root / rel);
     f << content;
   }
+
+ private:
+  inline static std::atomic<std::uint64_t> next_id{0};
 };
 
 }  // namespace

@@ -10,10 +10,15 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -21,6 +26,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/metal/command_processor.h>
+#include <rex/graphics/trace_reader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -53,7 +59,7 @@ class RoutingCommandProcessor final : public rex::graphics::CommandProcessor {
 
   void IssueSwap(uint32_t, uint32_t, uint32_t) override {}
   void TracePlaybackWroteMemory(uint32_t, uint32_t) override {}
-  void RestoreEdramSnapshot(const void*) override {}
+  bool RestoreEdramSnapshot(const void*) override { return true; }
 
   const std::vector<WriteKind>& writes() const { return writes_; }
   void ConfigureCompletionWait(uint32_t address, uint32_t value, uint32_t pending_wait_count = 0,
@@ -92,12 +98,71 @@ class RoutingCommandProcessor final : public rex::graphics::CommandProcessor {
   uint32_t return_wait_call_count() const { return return_wait_call_count_; }
   uint64_t completed_wait_poll_count() const { return completed_wait_poll_count_; }
   bool completed_wait_matched() const { return completed_wait_matched_; }
+  void StopWorkerDuringNextCompletionWait() {
+    worker_running_.store(true, std::memory_order_release);
+    stop_worker_during_completion_wait_ = true;
+  }
+  void SetTraceInitializationFailure(bool fail) { fail_trace_initialization_ = fail; }
+  bool OpenTraceForTest(const std::filesystem::path& path) {
+    return OpenAndInitializeTrace(path, 0x584108A9);
+  }
+  bool trace_is_open_for_test() const { return trace_writer_.is_open(); }
+  bool trace_is_disabled_for_test() const { return trace_state_ == TraceState::kDisabled; }
+  bool trace_is_streaming_for_test() const { return trace_state_ == TraceState::kStreaming; }
+  bool trace_is_single_frame_for_test() const { return trace_state_ == TraceState::kSingleFrame; }
+  void AcceptCallsForTest() {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    worker_running_.store(true, std::memory_order_release);
+    worker_accepting_functions_ = true;
+  }
+  bool RunOnePendingCallForTest() {
+    std::function<void()> fn;
+    if (!TryPopPendingFunction(&fn)) {
+      return false;
+    }
+    fn();
+    return true;
+  }
+  void BlockNextGpuWriteForTest() {
+    std::lock_guard<std::mutex> lock(blocked_write_mutex_);
+    block_next_gpu_write_ = true;
+    blocked_write_entered_ = false;
+    release_blocked_write_ = false;
+  }
+  bool WaitForBlockedGpuWriteForTest(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(blocked_write_mutex_);
+    return blocked_write_cv_.wait_for(
+        lock, timeout, [this]() { return blocked_write_entered_; });
+  }
+  void ReleaseBlockedGpuWriteForTest() {
+    {
+      std::lock_guard<std::mutex> lock(blocked_write_mutex_);
+      release_blocked_write_ = true;
+    }
+    blocked_write_cv_.notify_all();
+  }
 
  protected:
   bool SetupContext() override { return true; }
   void ShutdownContext() override {}
+  void InitializeTrace() override {
+    CommandProcessor::InitializeTrace();
+    if (fail_trace_initialization_) {
+      MarkTraceInitializationIncomplete();
+    }
+  }
 
   bool WriteGpuMemory(uint32_t address, const void* data, size_t length) override {
+    {
+      std::unique_lock<std::mutex> lock(blocked_write_mutex_);
+      if (block_next_gpu_write_) {
+        block_next_gpu_write_ = false;
+        blocked_write_entered_ = true;
+        blocked_write_cv_.notify_all();
+        blocked_write_cv_.wait(
+            lock, [this]() { return release_blocked_write_; });
+      }
+    }
     writes_.push_back(WriteKind::kImmediate);
     return CommandProcessor::WriteGpuMemory(address, data, length);
   }
@@ -120,6 +185,11 @@ class RoutingCommandProcessor final : public rex::graphics::CommandProcessor {
       uint32_t address, uint32_t length, std::chrono::milliseconds timeout) override {
     ++completion_wait_call_count_;
     completion_wait_timeout_ = timeout;
+    if (stop_worker_during_completion_wait_) {
+      stop_worker_during_completion_wait_ = false;
+      worker_running_.store(false, std::memory_order_release);
+      return GpuCompletionMemoryWriteWaitResult::kPending;
+    }
     if (!completion_wait_address_ || address != completion_wait_address_ ||
         length != sizeof(completion_wait_value_)) {
       return GpuCompletionMemoryWriteWaitResult::kUnavailable;
@@ -212,6 +282,22 @@ class RoutingCommandProcessor final : public rex::graphics::CommandProcessor {
   uint32_t return_wait_call_count_ = 0;
   uint64_t completed_wait_poll_count_ = 0;
   bool completed_wait_matched_ = false;
+  bool stop_worker_during_completion_wait_ = false;
+  bool fail_trace_initialization_ = false;
+  std::mutex blocked_write_mutex_;
+  std::condition_variable blocked_write_cv_;
+  bool block_next_gpu_write_ = false;
+  bool blocked_write_entered_ = false;
+  bool release_blocked_write_ = false;
+};
+
+struct TemporaryDirectory {
+  std::filesystem::path path;
+
+  ~TemporaryDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path, error);
+  }
 };
 
 void StorePacketDword(rex::memory::Memory& memory, uint32_t packet_address, uint32_t index,
@@ -233,6 +319,158 @@ void StoreWaitRegMemPacket(rex::memory::Memory& memory, uint32_t packet_address,
 }
 
 }  // namespace
+
+TEST_CASE("Incomplete trace initialization is discarded and disarms the request",
+          "[graphics][trace]") {
+  rex::InitLogging();
+  rex::memory::Memory memory;
+
+  TestGraphicsSystem graphics_system(memory);
+  RoutingCommandProcessor command_processor(graphics_system);
+  TemporaryDirectory temporary{
+      std::filesystem::temp_directory_path() /
+      ("rex-trace-initialization-" +
+       std::to_string(reinterpret_cast<uintptr_t>(&command_processor)))};
+  REQUIRE(std::filesystem::create_directories(temporary.path));
+
+  CHECK_FALSE(command_processor.BeginTracing(temporary.path));
+  CHECK(command_processor.trace_is_disabled_for_test());
+  CHECK_FALSE(command_processor.EndTracing());
+
+  command_processor.AcceptCallsForTest();
+  command_processor.SetTraceInitializationFailure(true);
+
+  REQUIRE(command_processor.BeginTracing(temporary.path));
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  REQUIRE(command_processor.trace_is_streaming_for_test());
+  const auto streaming_path = temporary.path / "stream.xtr";
+  CHECK_FALSE(command_processor.OpenTraceForTest(streaming_path));
+  CHECK(command_processor.trace_is_disabled_for_test());
+  CHECK_FALSE(command_processor.trace_is_open_for_test());
+  CHECK_FALSE(std::filesystem::exists(streaming_path));
+
+  REQUIRE(command_processor.RequestFrameTrace(temporary.path));
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  REQUIRE(command_processor.trace_is_single_frame_for_test());
+  const auto frame_path = temporary.path / "frame.xtr";
+  CHECK_FALSE(command_processor.OpenTraceForTest(frame_path));
+  CHECK(command_processor.trace_is_disabled_for_test());
+  CHECK_FALSE(command_processor.trace_is_open_for_test());
+  CHECK_FALSE(std::filesystem::exists(frame_path));
+
+  REQUIRE(command_processor.BeginTracing(temporary.path));
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  REQUIRE(command_processor.trace_is_streaming_for_test());
+  CHECK_FALSE(command_processor.OpenTraceForTest(temporary.path));
+  CHECK(command_processor.trace_is_disabled_for_test());
+
+  command_processor.SetTraceInitializationFailure(false);
+  REQUIRE(command_processor.BeginTracing(temporary.path));
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  const auto successful_path = temporary.path / "complete.xtr";
+  REQUIRE(command_processor.OpenTraceForTest(successful_path));
+  CHECK(command_processor.trace_is_open_for_test());
+  REQUIRE(command_processor.EndTracing());
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  CHECK(command_processor.trace_is_disabled_for_test());
+  CHECK(std::filesystem::exists(successful_path));
+  command_processor.Shutdown();
+}
+
+TEST_CASE("Trace stop cancels pending and discards incomplete frame captures",
+          "[graphics][trace][trace_lifecycle]") {
+  rex::InitLogging();
+  rex::memory::Memory memory;
+
+  TestGraphicsSystem graphics_system(memory);
+  RoutingCommandProcessor command_processor(graphics_system);
+  TemporaryDirectory temporary{
+      std::filesystem::temp_directory_path() /
+      ("rex-trace-stop-" +
+       std::to_string(reinterpret_cast<uintptr_t>(&command_processor)))};
+  REQUIRE(std::filesystem::create_directories(temporary.path));
+  command_processor.AcceptCallsForTest();
+
+  REQUIRE(command_processor.BeginTracing(temporary.path));
+  CHECK(command_processor.trace_is_disabled_for_test());
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  CHECK(command_processor.trace_is_streaming_for_test());
+  REQUIRE(command_processor.EndTracing());
+  CHECK(command_processor.trace_is_streaming_for_test());
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  CHECK(command_processor.trace_is_disabled_for_test());
+
+  REQUIRE(command_processor.RequestFrameTrace(temporary.path));
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  REQUIRE(command_processor.trace_is_single_frame_for_test());
+  const auto incomplete_frame_path = temporary.path / "incomplete-frame.xtr";
+  REQUIRE(command_processor.OpenTraceForTest(incomplete_frame_path));
+  REQUIRE(std::filesystem::exists(incomplete_frame_path));
+  REQUIRE(command_processor.EndTracing());
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  CHECK(command_processor.trace_is_disabled_for_test());
+  CHECK_FALSE(command_processor.trace_is_open_for_test());
+  CHECK_FALSE(std::filesystem::exists(incomplete_frame_path));
+
+  command_processor.Shutdown();
+  CHECK_FALSE(command_processor.BeginTracing(temporary.path));
+}
+
+TEST_CASE("Trace finalization waits for an active direct packet span",
+          "[graphics][trace][trace_lifecycle]") {
+  using namespace std::chrono_literals;
+
+  rex::InitLogging();
+  rex::memory::Memory memory;
+  REQUIRE(memory.Initialize());
+
+  TestGraphicsSystem graphics_system(memory);
+  RoutingCommandProcessor command_processor(graphics_system);
+  TemporaryDirectory temporary{
+      std::filesystem::temp_directory_path() /
+      ("rex-trace-packet-serialization-" +
+       std::to_string(reinterpret_cast<uintptr_t>(&command_processor)))};
+  REQUIRE(std::filesystem::create_directories(temporary.path));
+  command_processor.AcceptCallsForTest();
+
+  REQUIRE(command_processor.BeginTracing(temporary.path));
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  const auto trace_path = temporary.path / "serialized.xtr";
+  REQUIRE(command_processor.OpenTraceForTest(trace_path));
+
+  constexpr uint32_t kPacketAddress = 0x00100000;
+  constexpr uint32_t kWriteAddress = 0x00110000;
+  StorePacketDword(
+      memory, kPacketAddress, 0,
+      rex::graphics::xenos::MakePacketType3(
+          rex::graphics::xenos::PM4_REG_TO_MEM, 2));
+  StorePacketDword(memory, kPacketAddress, 1, 0);
+  StorePacketDword(memory, kPacketAddress, 2, kWriteAddress);
+
+  command_processor.BlockNextGpuWriteForTest();
+  auto packet_future = std::async(std::launch::async, [&]() {
+    return command_processor.ExecutePacket(kPacketAddress, 3);
+  });
+  REQUIRE(command_processor.WaitForBlockedGpuWriteForTest(1s));
+
+  REQUIRE(command_processor.EndTracing());
+  auto stop_future = std::async(std::launch::async, [&]() {
+    return command_processor.RunOnePendingCallForTest();
+  });
+  CHECK(stop_future.wait_for(25ms) == std::future_status::timeout);
+
+  command_processor.ReleaseBlockedGpuWriteForTest();
+  REQUIRE(packet_future.wait_for(1s) == std::future_status::ready);
+  CHECK(packet_future.get());
+  REQUIRE(stop_future.wait_for(1s) == std::future_status::ready);
+  CHECK(stop_future.get());
+  CHECK(command_processor.trace_is_disabled_for_test());
+  CHECK_FALSE(command_processor.trace_is_open_for_test());
+
+  rex::graphics::TraceReader reader;
+  CHECK(reader.Open(trace_path.string()));
+  command_processor.Shutdown();
+}
 
 TEST_CASE("EVENT_WRITE_EXT reports are not routed through the completion fence hook",
           "[graphics][completion]") {
@@ -504,6 +742,34 @@ TEST_CASE("WAIT_REG_MEM disarms an initial-match memory notification without blo
   CHECK(command_processor.return_wait_call_count() == 0);
   CHECK(command_processor.completed_wait_poll_count() == 1);
   CHECK(command_processor.completed_wait_matched());
+}
+
+TEST_CASE("WAIT_REG_MEM distinguishes direct execution from an active worker shutdown",
+          "[graphics][completion]") {
+  rex::InitLogging();
+  rex::memory::Memory memory;
+  REQUIRE(memory.Initialize());
+
+  TestGraphicsSystem graphics_system(memory);
+  RoutingCommandProcessor command_processor(graphics_system);
+
+  constexpr uint32_t kPacketAddress = 0x00100000;
+  constexpr uint32_t kTargetAddress = 0x00130000;
+  constexpr uint32_t kPendingValue = 1;
+  constexpr uint32_t kCompletedValue = 0;
+  std::memcpy(memory.TranslatePhysical(kTargetAddress), &kPendingValue, sizeof(kPendingValue));
+  command_processor.ConfigureCompletionWait(kTargetAddress, kCompletedValue);
+  command_processor.ConfigureMemoryChangeWait(kTargetAddress, {});
+  command_processor.StopWorkerDuringNextCompletionWait();
+  StoreWaitRegMemPacket(memory, kPacketAddress, kTargetAddress, kCompletedValue);
+
+  command_processor.ExecutePacket(kPacketAddress, 6);
+
+  CHECK(command_processor.completion_wait_call_count() == 1);
+  CHECK(command_processor.end_memory_change_wait_call_count() == 1);
+  CHECK(command_processor.return_wait_call_count() == 1);
+  CHECK(command_processor.completed_wait_poll_count() == 1);
+  CHECK_FALSE(command_processor.completed_wait_matched());
 }
 
 TEST_CASE("Metal packet writes remain guest-visible without an initialized Metal context",

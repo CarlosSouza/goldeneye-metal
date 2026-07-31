@@ -653,11 +653,15 @@ void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_
   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
 }
 
-void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+bool VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  if (!snapshot) {
+    return false;
+  }
   if (!BeginSubmission(true)) {
-    return;
+    return false;
   }
   render_target_cache_->RestoreEdramSnapshot(snapshot);
+  return true;
 }
 
 bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,

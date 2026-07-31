@@ -19,8 +19,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <cstddef>
 #include <ctime>
 #include <deque>
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <thread>
 
 #include <pthread.h>
 #include <semaphore.h>
@@ -597,6 +599,25 @@ struct ThreadStartData {
   Thread* thread_obj;
 };
 
+struct PosixThreadCompletion {
+  pthread_t thread = {};
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool joinable = false;
+  bool reaper_started = false;
+  // The native thread has been joined, the callback queue has been closed,
+  // and the reaper will no longer access the PosixCondition.
+  bool callbacks_closed = false;
+  // Invoked callback objects may retain the Thread wrapper. Strong completion
+  // is not published until those captures and any concurrently registered
+  // synchronous callbacks have been released.
+  bool callback_captures_released = false;
+  size_t synchronous_callbacks_in_flight = 0;
+  bool completed = false;
+  int join_result = 0;
+  std::vector<std::function<void()>> exit_callbacks;
+};
+
 template <>
 class PosixCondition<Thread> : public PosixConditionBase {
   enum class State {
@@ -612,7 +633,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
         signaled_(false),
         exit_code_(0),
         state_(State::kUninitialized),
-        suspend_count_(0) {
+        suspend_count_(0),
+        completion_(std::make_shared<PosixThreadCompletion>()) {
     sem_init(&suspend_sem_, 0, 0);
 #if REX_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
@@ -644,6 +666,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return false;
     }
     pthread_attr_destroy(&attr);
+    {
+      std::lock_guard lock(completion_->mutex);
+      completion_->thread = thread_;
+      completion_->joinable = true;
+    }
     return true;
   }
 
@@ -654,7 +681,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
         signaled_(false),
         exit_code_(0),
         state_(State::kRunning),
-        suspend_count_(0) {
+        suspend_count_(0),
+        completion_(std::make_shared<PosixThreadCompletion>()) {
     sem_init(&suspend_sem_, 0, 0);
 #if REX_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
@@ -665,6 +693,19 @@ class PosixCondition<Thread> : public PosixConditionBase {
     // Match Canary/Edge behavior.
     // Force-cancel/join from the condition destructor can self-join/crash
     // depending on shutdown ordering, so threads must be stopped explicitly.
+    bool joinable = false;
+    bool safe_to_destroy = false;
+    {
+      std::lock_guard lock(completion_->mutex);
+      joinable = completion_->joinable;
+      safe_to_destroy = completion_->callbacks_closed;
+    }
+    if (joinable && !safe_to_destroy) {
+      rex::FatalError("POSIX Thread destroyed before its native thread was joined");
+    }
+    if (safe_to_destroy) {
+      DestroySuspendSemaphoreOnce();
+    }
   }
 
   bool Signal() override { return true; }
@@ -930,15 +971,19 @@ class PosixCondition<Thread> : public PosixConditionBase {
         return;
       }
       state_ = State::kFinished;
+      // A thread may still be in the create-suspended startup wait. Wake that
+      // wait so the startup trampoline can observe kFinished and leave without
+      // ever invoking the user routine. This also closes the race where a
+      // termination request arrives before the new thread publishes kSuspended.
+      suspend_count_ = 0;
+      state_signal_.notify_all();
     }
 
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-
+      std::lock_guard lock(mutex_);
       exit_code_ = exit_code;
-      signaled_ = true;
-      cond_.notify_all();
     }
+    (void)EnsureReaperStarted();
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
     } else {
@@ -952,6 +997,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
       }
 #endif
     }
+  }
+
+  [[noreturn]] void ExitCurrent(int exit_code) {
+    {
+      std::lock_guard lock(mutex_);
+      exit_code_ = exit_code;
+    }
+    (void)EnsureReaperStarted();
+    pthread_exit(reinterpret_cast<void*>(static_cast<intptr_t>(exit_code)));
   }
 
   void WaitStarted() const {
@@ -969,14 +1023,162 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void* native_handle() const override { return reinterpret_cast<void*>(thread_); }
 
+  WaitResult WaitForExitUntil(std::chrono::steady_clock::time_point deadline) {
+    auto completion = completion_;
+    if (!EnsureReaperStarted()) {
+      return WaitResult::kFailed;
+    }
+
+    std::unique_lock lock(completion->mutex);
+    if (deadline == std::chrono::steady_clock::time_point::max()) {
+      completion->condition.wait(lock, [&]() { return completion->completed; });
+    } else if (!completion->condition.wait_until(lock, deadline,
+                                                 [&]() { return completion->completed; })) {
+      return WaitResult::kTimeout;
+    }
+    return completion->join_result == 0 ? WaitResult::kSuccess : WaitResult::kFailed;
+  }
+
+  void SetExitCallback(std::function<void()>&& callback) {
+    if (!callback) {
+      return;
+    }
+    auto completion = completion_;
+    bool run_now = false;
+    bool track_synchronous_callback = false;
+    {
+      std::lock_guard lock(completion->mutex);
+      if (completion->callbacks_closed) {
+        run_now = true;
+        if (!completion->completed) {
+          ++completion->synchronous_callbacks_in_flight;
+          track_synchronous_callback = true;
+        }
+      } else {
+        completion->exit_callbacks.emplace_back(std::move(callback));
+      }
+    }
+    if (run_now) {
+      auto finish_synchronous_callback = [&]() {
+        // The callback object itself may own the last Thread reference. Release
+        // it before removing this callback from the strong-completion count.
+        callback = {};
+        if (!track_synchronous_callback) {
+          return;
+        }
+
+        bool notify_completion = false;
+        {
+          std::lock_guard lock(completion->mutex);
+          assert_true(completion->synchronous_callbacks_in_flight != 0);
+          --completion->synchronous_callbacks_in_flight;
+          if (completion->callback_captures_released &&
+              completion->synchronous_callbacks_in_flight == 0 &&
+              !completion->completed) {
+            completion->completed = true;
+            notify_completion = true;
+          }
+        }
+        if (notify_completion) {
+          completion->condition.notify_all();
+        }
+      };
+
+      try {
+        callback();
+      } catch (...) {
+        finish_synchronous_callback();
+        throw;
+      }
+      finish_synchronous_callback();
+    }
+  }
+
  private:
+  bool EnsureReaperStarted() {
+    auto completion = completion_;
+    std::lock_guard lock(completion->mutex);
+    if (!completion->joinable) {
+      return false;
+    }
+    if (completion->reaper_started) {
+      return true;
+    }
+    completion->reaper_started = true;
+    try {
+      std::thread([completion, this]() {
+        const int join_result = pthread_join(completion->thread, nullptr);
+
+        // Drain callbacks to a fixed point. Closing the callback list while
+        // holding completion->mutex makes a racing SetExitCallback either join
+        // this batch or run synchronously as a tracked late callback.
+        std::vector<std::function<void()>> callback_lifetimes;
+        while (true) {
+          std::vector<std::function<void()>> callbacks;
+          {
+            std::lock_guard completion_lock(completion->mutex);
+            callbacks = std::move(completion->exit_callbacks);
+            if (callbacks.empty()) {
+              // A POSIX thread wait handle becomes signaled only after the
+              // native join and exit callbacks, so ordinary bounded Wait()
+              // never enters an unbounded post-execution join. Publish the
+              // callback-queue closure only after the final access to this
+              // PosixCondition; callback capture release may destroy it.
+              std::lock_guard signal_lock(mutex_);
+              exit_code_ = join_result == 0 ? exit_code_ : join_result;
+              signaled_ = true;
+              completion->join_result = join_result;
+              cond_.notify_all();
+              completion->callbacks_closed = true;
+              break;
+            }
+          }
+          for (auto& callback : callbacks) {
+            if (callback) {
+              callback();
+            }
+          }
+          callback_lifetimes.insert(
+              callback_lifetimes.end(),
+              std::make_move_iterator(callbacks.begin()),
+              std::make_move_iterator(callbacks.end()));
+        }
+
+        // Releasing these callback objects may destroy the PosixCondition.
+        // From this point onward, use only the shared completion state.
+        callback_lifetimes.clear();
+
+        bool notify_completion = false;
+        {
+          std::lock_guard completion_lock(completion->mutex);
+          completion->callback_captures_released = true;
+          if (completion->synchronous_callbacks_in_flight == 0) {
+            completion->completed = true;
+            notify_completion = true;
+          }
+        }
+        if (notify_completion) {
+          completion->condition.notify_all();
+        }
+      }).detach();
+    } catch (...) {
+      completion->reaper_started = false;
+      return false;
+    }
+    return true;
+  }
+
+  void DestroySuspendSemaphoreOnce() {
+    std::call_once(suspend_sem_destroy_once_, [this]() { sem_destroy(&suspend_sem_); });
+  }
+
+  static void ThreadExitCleanup(void* parameter);
   static void* ThreadStartRoutine(void* parameter);
   inline bool signaled() const override { return signaled_; }
   inline void post_execution() override {
-    if (thread_) {
-      pthread_join(thread_, nullptr);
-    }
-    sem_destroy(&suspend_sem_);
+    // The reaper only signals after its one native join and exit callbacks.
+    // There is no native work left that could overrun the caller's deadline.
+    DestroySuspendSemaphoreOnce();
   }
   pthread_t thread_;
   bool signaled_;
@@ -988,6 +1190,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
   mutable std::mutex callback_mutex_;
   mutable std::condition_variable state_signal_;
   std::deque<std::function<void()>> user_callbacks_;
+  std::shared_ptr<PosixThreadCompletion> completion_;
+  std::once_flag suspend_sem_destroy_once_;
   std::atomic<bool> has_pending_user_callbacks_{false};
 #if REX_PLATFORM_ANDROID
   // Name accessible via name() on Android before API 26 which added
@@ -1339,13 +1543,27 @@ class PosixThread : public PosixConditionHandle<Thread> {
 
   void Terminate(int exit_code) override { handle_.Terminate(exit_code); }
 
+  WaitResult WaitForExitUntil(std::chrono::steady_clock::time_point deadline) override {
+    return handle_.WaitForExitUntil(deadline);
+  }
+
+  void SetExitCallback(std::function<void()> callback) override {
+    handle_.SetExitCallback(std::move(callback));
+  }
+
   void WaitSuspended() { handle_.WaitSuspended(); }
+
+  [[noreturn]] void ExitCurrent(int exit_code) { handle_.ExitCurrent(exit_code); }
 };
 
 thread_local PosixThread* current_thread_ = nullptr;
 
 void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #if !REX_PLATFORM_ANDROID
+  int previous_cancel_state = PTHREAD_CANCEL_ENABLE;
+  if (pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous_cancel_state) != 0) {
+    assert_always();
+  }
   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
     assert_always();
   }
@@ -1363,38 +1581,62 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 
   current_thread_ = thread;
   current_thread_condition_ = &thread->handle_;
+  bool run_start_routine = true;
+  pthread_cleanup_push(&PosixCondition<Thread>::ThreadExitCleanup, thread);
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-    if (create_suspended) {
-      thread->handle_.suspend_count_ = 1;
+    if (thread->handle_.state_ == State::kFinished) {
+      // Terminate() won the publication race. Preserve the terminal state and
+      // never run guest code.
+      thread->handle_.suspend_count_ = 0;
+      run_start_routine = false;
+    } else {
+      if (create_suspended) {
+        thread->handle_.suspend_count_ = 1;
+      }
+      thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
     }
-    thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
     thread->handle_.state_signal_.notify_all();
   }
 
-  if (create_suspended) {
+#if !REX_PLATFORM_ANDROID
+  if (pthread_setcancelstate(previous_cancel_state, nullptr) != 0) {
+    assert_always();
+  }
+#endif
+
+  if (create_suspended && run_start_routine) {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-    thread->handle_.state_signal_.wait(lock,
-                                       [thread] { return thread->handle_.suspend_count_ == 0; });
+    thread->handle_.state_signal_.wait(lock, [thread] {
+      return thread->handle_.suspend_count_ == 0 ||
+             thread->handle_.state_ == State::kFinished;
+    });
+    run_start_routine = thread->handle_.state_ != State::kFinished;
   }
 
-  start_routine();
+  if (run_start_routine) {
+    start_routine();
+  }
 
+  pthread_cleanup_pop(1);
+  return nullptr;
+}
+
+void PosixCondition<Thread>::ThreadExitCleanup(void* parameter) {
+  auto* thread = static_cast<PosixThread*>(parameter);
+  if (!thread) {
+    return;
+  }
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = State::kFinished;
+    thread->handle_.state_signal_.notify_all();
   }
 
-  {
-    std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
-    thread->handle_.exit_code_ = 0;
-    thread->handle_.signaled_ = true;
-    thread->handle_.cond_.notify_all();
-  }
+  (void)thread->handle_.EnsureReaperStarted();
 
   current_thread_ = nullptr;
   current_thread_condition_ = nullptr;
-  return nullptr;
 }
 
 std::unique_ptr<Thread> Thread::Create(CreationParameters params,
@@ -1440,7 +1682,7 @@ Thread* Thread::GetCurrentThread() {
 
 void Thread::Exit(int exit_code) {
   if (current_thread_) {
-    current_thread_->Terminate(exit_code);
+    current_thread_->ExitCurrent(exit_code);
   } else {
     // Should only happen with the main thread
     pthread_exit(reinterpret_cast<void*>(exit_code));

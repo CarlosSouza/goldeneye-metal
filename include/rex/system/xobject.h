@@ -171,8 +171,10 @@ class XObject {
     return memory()->TranslateVirtual<T*>(guest_object_ptr_);
   }
 
-  void RetainHandle();
+  bool RetainHandle();
+  bool RetainHandle(X_HANDLE handle);
   bool ReleaseHandle();
+  bool ReleaseHandle(X_HANDLE handle);
   void Retain();
   void Release();
   X_STATUS Delete();

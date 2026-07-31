@@ -33,9 +33,14 @@ class ObjectTable {
   void Reset();
 
   X_STATUS AddHandle(XObject* object, X_HANDLE* out_handle);
-  X_STATUS DuplicateHandle(X_HANDLE orig, X_HANDLE* out_handle);
+  // When close_source is true, duplication and releasing the source reference
+  // are serialized under the object-table lock. This prevents a concurrently
+  // closed and reused source slot from having the replacement entry released.
+  X_STATUS DuplicateHandle(X_HANDLE orig, X_HANDLE* out_handle, bool close_source = false);
   X_STATUS RetainHandle(X_HANDLE handle);
+  X_STATUS RetainHandle(X_HANDLE handle, const XObject* expected_object);
   X_STATUS ReleaseHandle(X_HANDLE handle);
+  X_STATUS ReleaseHandle(X_HANDLE handle, const XObject* expected_object);
   X_STATUS RemoveHandle(X_HANDLE handle);
 
   bool Save(stream::ByteStream* stream);

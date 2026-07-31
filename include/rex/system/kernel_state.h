@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <list>
@@ -271,9 +272,9 @@ class KernelState {
 
   // Terminates a title: Unloads all modules, and kills all guest threads.
   // This DOES NOT RETURN if called from a guest thread!
-  void TerminateTitle();
+  bool TerminateTitle(std::chrono::milliseconds timeout = std::chrono::seconds(5));
 
-  void RegisterThread(XThread* thread);
+  bool RegisterThread(XThread* thread);
   void UnregisterThread(XThread* thread);
   void OnThreadExecute(XThread* thread);
   void OnThreadExit(XThread* thread);
@@ -322,6 +323,8 @@ class KernelState {
   bool Restore(stream::ByteStream* stream);
 
  private:
+  struct TitleDrainSession;
+
   void LoadKernelModule(object_ref<KernelModule> kernel_module);
   void InitializeProcess(X_KPROCESS* process, uint32_t process_type, uint8_t unk_18, uint8_t unk_19,
                          uint8_t unk_1A);
@@ -342,6 +345,10 @@ class KernelState {
   // Must be guarded by the global critical region.
   util::ObjectTable object_table_;
   std::unordered_map<uint32_t, XThread*> threads_by_id_;
+  // Registration is closed atomically with the title-drain snapshot.
+  bool guest_thread_registration_open_ = true;
+  std::mutex title_drain_mutex_;
+  std::shared_ptr<TitleDrainSession> title_drain_session_;
   std::vector<object_ref<XNotifyListener>> notify_listeners_;
   bool has_notified_startup_ = false;
 

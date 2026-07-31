@@ -94,6 +94,40 @@ bool MetalSharedMemory::SynchronizeBeforeHostResourceMutation() {
   return contexts_synchronized && uploads_synchronized;
 }
 
+bool MetalSharedMemory::InitializeTraceDownload() {
+  if (!buffer_ || !trace_writer_.is_open() || !SynchronizeBeforeHostResourceMutation()) {
+    return false;
+  }
+
+  PrepareForTraceDownload();
+  // Preparing the range list fires invalidation watches. They don't currently
+  // enqueue uploads, but fence again so a future watch implementation can't
+  // leave an upload racing the CPU-visible trace read.
+  if (!WaitForPendingUploads()) {
+    ReleaseTraceDownloadRanges();
+    return false;
+  }
+  id<MTLBuffer> gpu_buffer = (id<MTLBuffer>)buffer_;
+  const uint8_t* buffer_contents =
+      gpu_buffer ? reinterpret_cast<const uint8_t*>([gpu_buffer contents]) : nullptr;
+  bool succeeded = buffer_contents != nullptr;
+  if (succeeded) {
+    for (const auto& range : trace_download_ranges()) {
+      if (range.first >= kBufferSize || range.second > kBufferSize - range.first) {
+        succeeded = false;
+        break;
+      }
+      trace_writer_.WriteMemoryRead(range.first, range.second, buffer_contents + range.first);
+      if (trace_writer_.has_error()) {
+        succeeded = false;
+        break;
+      }
+    }
+  }
+  ReleaseTraceDownloadRanges();
+  return succeeded;
+}
+
 bool MetalSharedMemory::Initialize(void* metal_device) {
   if (!metal_device || !ordered_guest_memory_write_completion_event_) {
     return false;

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -58,6 +59,7 @@
 #include "ge_host_pause.h"
 #include "ge_player_stuck_telemetry.h"
 #include "ge_testing_tools.h"
+#include "ge_watchdog.h"
 
 namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
@@ -118,11 +120,10 @@ bool EnvironmentFlagEnabled(const char* name) {
   return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
 }
 
-// rexglue CP swap counter sampled at the last guest present (sub_821996F8).
-// This is diagnostic state only: XE_SWAP may execute before trailing primary-ring
-// packets retire, so a counter advance is not a completion fence.
-std::atomic<uint32_t> g_present_cpcnt{0};
-std::atomic<uint32_t> g_present_count{0};
+// Guest pointers and progress counters sampled by the lifecycle-owned watchdog.
+// This state is reset before every worker start so an in-process title relaunch
+// cannot expose addresses from the previous guest address space.
+ge::watchdog::SessionState g_watchdog_session_state;
 std::atomic<uint64_t> g_input_poll_count{0};
 std::atomic<uint64_t> g_gpu_wait_blocked_polls{0};
 std::atomic<uint64_t> g_gpu_wait_completed_polls{0};
@@ -643,428 +644,514 @@ void ge_sample_present_main_thread_path(uint32_t present_index) {
 // synchronization state remains owned by the title and command processor.
 // ===========================================================================
 namespace {
-std::atomic<uint32_t> g_ge_device{0};     // device struct (dev) seen by ge_dbg_now
-std::atomic<uint32_t> g_ge_idblk{0};      // id-block (idblk) seen by ge_dbg_now
-std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest polling sub_82198C28)
+struct GeWatchdogWorkerState {
+  std::mutex mutex;
+  std::condition_variable wake;
+  std::thread thread;
+  ge::watchdog::WorkerLifecycle lifecycle;
+};
+
+// Deliberately process-lifetime storage. GeApp::OnShutdown always stops and
+// joins the worker before runtime teardown; leaking the empty state prevents a
+// static std::thread destructor from racing unusual process-exit paths.
+GeWatchdogWorkerState& ge_watchdog_worker_state() {
+  static auto* state = new GeWatchdogWorkerState();
+  return *state;
+}
+
+bool ge_watchdog_wait_for_sample() {
+  auto& worker = ge_watchdog_worker_state();
+  std::unique_lock lock(worker.mutex);
+  return !worker.wake.wait_for(lock, std::chrono::milliseconds(250),
+                               [&worker] { return worker.lifecycle.stop_requested(); });
+}
+
+bool ge_watchdog_observation_suppressed() {
+  const ge::host_pause::Snapshot pause = ge::host_pause::GetSnapshot();
+  ge::watchdog::ObservationContext context{
+      .host_pause_active =
+          pause.requested || !pause.request_applied || pause.gameplay_paused || pause.host_owned,
+  };
+
+  auto* runtime = rex::Runtime::instance();
+  auto* input = runtime && runtime->input_system()
+                    ? static_cast<rex::input::InputSystem*>(runtime->input_system())
+                    : nullptr;
+  rex::input::HostInputSnapshot host_input;
+  context.host_input_available = input && input->GetHostInputSnapshot(&host_input);
+  if (context.host_input_available) {
+    context.focused = host_input.focused;
+    context.input_active = host_input.input_active;
+  }
+  return ge::watchdog::ObservationSuppressed(context);
+}
 
 void ge_watchdog_thread() {
-  uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
-  uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
-  uint32_t present_at_stall_start = 0, dbg_at_stall_start = 0, submit_at_stall_start = 0;
-  uint32_t no_present_at_stall_start = 0, no_present_dbg_at_stall_start = 0,
-           no_present_submit_at_stall_start = 0;
-  uint32_t stall = 0;
-  uint32_t no_present_stall = 0;
-  bool logged = false;
-  bool no_present_logged = false;
-  for (;;) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    auto* cp = ge_cp();
-    if (!cp)
+  auto* initial_kernel_state = rex::system::kernel_state();
+  if (!initial_kernel_state || !initial_kernel_state->memory()) {
+    return;
+  }
+  uint8_t* base = initial_kernel_state->memory()->virtual_membase();
+  ge::watchdog::EpisodeTracker episode_tracker;
+  uint32_t present_at_stall_start = 0, cp_swap_at_stall_start = 0, dbg_at_stall_start = 0,
+           submit_at_stall_start = 0;
+  uint32_t no_present_at_stall_start = 0, no_present_cp_swap_at_stall_start = 0,
+           no_present_dbg_at_stall_start = 0, no_present_submit_at_stall_start = 0;
+  while (ge_watchdog_wait_for_sample()) {
+    if (ge_watchdog_observation_suppressed()) {
+      episode_tracker.Observe({}, true);
       continue;
-    uint32_t wpi = cp->write_ptr_index();
-    uint32_t rpi = cp->read_ptr_index();
-    uint32_t present = g_present_cpcnt.load(std::memory_order_relaxed);
-    uint32_t dbg = g_dbgnow_calls.load(std::memory_order_relaxed);
-    uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
-    uint32_t idblk = g_ge_idblk.load(std::memory_order_relaxed);
+    }
+    auto* cp = ge_cp();
+    if (!cp) {
+      episode_tracker.Reset();
+      continue;
+    }
+    const auto ring = cp->primary_ring_snapshot();
+    uint32_t wpi = ring.write_pointer;
+    uint32_t rpi = ring.read_pointer;
+    const ge::watchdog::SessionSnapshot session = g_watchdog_session_state.Load();
+    uint32_t present = session.guest_present;
+    uint32_t cp_swap = cp->swap_counter();
+    uint32_t dbg = session.debug_poll_count;
+    uint32_t dev = session.guest_device;
+    uint32_t idblk = session.guest_id_block;
     uint32_t submit = dev ? LD32(base, dev + 16544) : 0;
 
-    bool present_alive = (present != last_present);
-    bool ring_moved = (wpi != last_wpi) || (rpi != last_rpi);
-    if (!present_alive && present >= 8) {
-      if (no_present_stall == 0) {
-        no_present_at_stall_start = present;
-        no_present_dbg_at_stall_start = dbg;
-        no_present_submit_at_stall_start = submit;
-      }
-      ++no_present_stall;
-      if (no_present_stall >= 24 && !no_present_logged) {  // ~6s of no presents
-        no_present_logged = true;
-        uint32_t rg = LD32(base, 0x8242043Cu);
-        uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
-        uint32_t target = dev ? LD32(base, dev + 10908) : 0;
-        uint32_t completed = idblk ? LD32(base, idblk + 0) : 0;
+    const bool ring_valid = ring.configured && ring.write_pointer_valid();
+    const char* ring_status = !ring_valid ? "INVALID" : (rpi == wpi ? "DRAINED" : "PENDING");
+    const ge::watchdog::ProgressSample current_progress{
+        true, present, cp_swap,    ring.generation,
+        rpi,  wpi,     ring_valid, ring_valid && ring.has_pending_commands()};
+    const ge::watchdog::EpisodeUpdate episode = episode_tracker.Observe(current_progress);
+
+    if (episode.no_present_started) {
+      no_present_at_stall_start = present;
+      no_present_cp_swap_at_stall_start = cp_swap;
+      no_present_dbg_at_stall_start = dbg;
+      no_present_submit_at_stall_start = submit;
+    }
+    if (episode.log_no_present_stall) {  // ~6s of no guest presents
+      uint32_t rg = LD32(base, 0x8242043Cu);
+      uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
+      uint32_t target = dev ? LD32(base, dev + 10908) : 0;
+      uint32_t completed = idblk ? LD32(base, idblk + 0) : 0;
+      REXKRNL_INFO(
+          "GENOPRESENT STALL: ring rpi={:#x} wpi={:#x} [{}] | guest_present#={} "
+          "(+{}/stall) | cp_swap#={} (+{}/stall) | dbgnow_polls={} (+{}/stall) | "
+          "submit={} (+{}/stall) completed={} target={} presented={} render_gate={:#x} | "
+          "dev={:#x} idblk={:#x}",
+          rpi, wpi, ring_status, present, present - no_present_at_stall_start, cp_swap,
+          cp_swap - no_present_cp_swap_at_stall_start, dbg, dbg - no_present_dbg_at_stall_start,
+          submit, submit - no_present_submit_at_stall_start, completed, target, presented, rg, dev,
+          idblk);
+      std::fprintf(stderr,
+                   "[ge] GENOPRESENT STALL rpi=0x%08x wpi=0x%08x %s "
+                   "guest_present=%u(+%u) cp_swap=%u(+%u) dbg=%u(+%u) submit=%u(+%u) "
+                   "completed=%u target=%u presented=%u render_gate=0x%08x dev=0x%08x "
+                   "idblk=0x%08x\n",
+                   rpi, wpi, ring_status, present, present - no_present_at_stall_start, cp_swap,
+                   cp_swap - no_present_cp_swap_at_stall_start, dbg,
+                   dbg - no_present_dbg_at_stall_start, submit,
+                   submit - no_present_submit_at_stall_start, completed, target, presented, rg, dev,
+                   idblk);
+      if (dev) {
+        uint32_t f21516 = LD32(base, dev + 21516u);
+        uint32_t f22280 = LD32(base, dev + 22280u);
+        uint32_t f22276 = LD32(base, dev + 22276u);
+        uint32_t f21604 = LD32(base, dev + 21604u);
+        uint32_t f21600 = LD32(base, dev + 21600u);
+        uint32_t b10941 = base[dev + 10941u];
+        uint32_t b10943 = base[dev + 10943u];
+        uint32_t vbl = LD32(base, dev + 16532u);
+        uint32_t fr = LD32(base, dev + 16684u);
+        uint32_t fw = LD32(base, dev + 16688u);
         REXKRNL_INFO(
-            "GENOPRESENT STALL: ring rpi={:#x} wpi={:#x} [{}] | present#={} (+{}/stall) | "
-            "dbgnow_polls={} (+{}/stall) | submit={} (+{}/stall) completed={} target={} "
-            "presented={} render_gate={:#x} | dev={:#x} idblk={:#x}",
-            rpi, wpi, (rpi == wpi ? "DRAINED" : "PENDING"), present,
-            present - no_present_at_stall_start, dbg, dbg - no_present_dbg_at_stall_start, submit,
-            submit - no_present_submit_at_stall_start, completed, target, presented, rg, dev,
-            idblk);
+            "GENOPRESENT -> devflags +21516(VdSwap-skip if !=0)={:#x} | +22280&4(gpu-wait)={} | "
+            "+22276={:#x} | +21604={} +21600={} (ring) | +10941={:#x} +10943={:#x}",
+            f21516, (f22280 & 4u), f22276, f21604, f21600, b10941, b10943);
+        REXKRNL_INFO("GENOPRESENT -> vblank ctx[4133]={} | GPU fences read={} write={} [{}]", vbl,
+                     fr, fw, (fr != fw ? "PENDING -- fences NOT retiring" : "drained"));
         std::fprintf(stderr,
-                     "[ge] GENOPRESENT STALL rpi=0x%08x wpi=0x%08x %s present=%u(+%u) "
-                     "dbg=%u(+%u) submit=%u(+%u) completed=%u target=%u presented=%u "
-                     "render_gate=0x%08x dev=0x%08x idblk=0x%08x\n",
-                     rpi, wpi, (rpi == wpi ? "DRAINED" : "PENDING"), present,
-                     present - no_present_at_stall_start, dbg, dbg - no_present_dbg_at_stall_start,
-                     submit, submit - no_present_submit_at_stall_start, completed, target,
-                     presented, rg, dev, idblk);
-        if (dev) {
-          uint32_t f21516 = LD32(base, dev + 21516u);
-          uint32_t f22280 = LD32(base, dev + 22280u);
-          uint32_t f22276 = LD32(base, dev + 22276u);
-          uint32_t f21604 = LD32(base, dev + 21604u);
-          uint32_t f21600 = LD32(base, dev + 21600u);
-          uint32_t b10941 = base[dev + 10941u];
-          uint32_t b10943 = base[dev + 10943u];
-          uint32_t vbl = LD32(base, dev + 16532u);
-          uint32_t fr = LD32(base, dev + 16684u);
-          uint32_t fw = LD32(base, dev + 16688u);
+                     "[ge] GENOPRESENT devflags +21516=0x%08x +22280&4=%u +22276=0x%08x "
+                     "+21604=%u +21600=%u +10941=0x%02x +10943=0x%02x vblank=%u "
+                     "fence_read=%u fence_write=%u %s\n",
+                     f21516, f22280 & 4u, f22276, f21604, f21600, b10941, b10943, vbl, fr, fw,
+                     (fr != fw ? "PENDING" : "drained"));
+      }
+      auto* ks2 = rex::system::kernel_state();
+      if (ks2) {
+        auto threads = ks2->object_table()->GetObjectsByType<rex::system::XThread>();
+        for (auto& th : threads) {
+          if (!th)
+            continue;
+          auto* ts = th->thread_state();
+          if (!ts)
+            continue;
+          auto* c = ts->context();
+          if (!c)
+            continue;
+          uint32_t sa = th->creation_params()->start_address;
+          bool rw = (sa == 0x821A4A68u);
           REXKRNL_INFO(
-              "GENOPRESENT -> devflags +21516(VdSwap-skip if !=0)={:#x} | +22280&4(gpu-wait)={} | "
-              "+22276={:#x} | +21604={} +21600={} (ring) | +10941={:#x} +10943={:#x}",
-              f21516, (f22280 & 4u), f22276, f21604, f21600, b10941, b10943);
-          REXKRNL_INFO("GENOPRESENT -> vblank ctx[4133]={} | GPU fences read={} write={} [{}]", vbl,
-                       fr, fw, (fr != fw ? "PENDING -- fences NOT retiring" : "drained"));
+              "GENOPRESENT THREAD start={:#x}{} lr={:#x} ctr={:#x} lastIndTgt={:#x} msr={:#x} | "
+              "r1={:#x} r3={:#x} r11={:#x} r28={:#x} r29={:#x} r30={:#x} r31={:#x}",
+              sa, rw ? " [RENDER-WORKER]" : "", (uint32_t)c->lr, c->ctr.u32,
+              c->last_indirect_target, c->msr, c->r1.u32, c->r3.u32, c->r11.u32, c->r28.u32,
+              c->r29.u32, c->r30.u32, c->r31.u32);
           std::fprintf(stderr,
-                       "[ge] GENOPRESENT devflags +21516=0x%08x +22280&4=%u +22276=0x%08x "
-                       "+21604=%u +21600=%u +10941=0x%02x +10943=0x%02x vblank=%u "
-                       "fence_read=%u fence_write=%u %s\n",
-                       f21516, f22280 & 4u, f22276, f21604, f21600, b10941, b10943, vbl, fr, fw,
-                       (fr != fw ? "PENDING" : "drained"));
-        }
-        auto* ks2 = rex::system::kernel_state();
-        if (ks2) {
-          auto threads = ks2->object_table()->GetObjectsByType<rex::system::XThread>();
-          for (auto& th : threads) {
-            if (!th)
-              continue;
-            auto* ts = th->thread_state();
-            if (!ts)
-              continue;
-            auto* c = ts->context();
-            if (!c)
-              continue;
-            uint32_t sa = th->creation_params()->start_address;
-            bool rw = (sa == 0x821A4A68u);
+                       "[ge] GENOPRESENT THREAD start=0x%08x%s lr=0x%08x ctr=0x%08x "
+                       "last=0x%08x msr=0x%08x r1=0x%08x r3=0x%08x r11=0x%08x "
+                       "r28=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x\n",
+                       sa, rw ? " [RENDER-WORKER]" : "", (uint32_t)c->lr, c->ctr.u32,
+                       c->last_indirect_target, c->msr, c->r1.u32, c->r3.u32, c->r11.u32,
+                       c->r28.u32, c->r29.u32, c->r30.u32, c->r31.u32);
+          uint32_t sp = c->r1.u32;
+          const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x2400u);
+          if (stack_scan.length != 0) {
+            uint8_t* hsp = stack_scan.host_address;
+            char sbuf[500];
+            int soff = 0;
+            sbuf[0] = 0;
+            for (uint8_t* pp = hsp; pp + 4 <= hsp + stack_scan.length && soff < 460; pp += 4) {
+              uint32_t val;
+              std::memcpy(&val, pp, 4);
+              val = __builtin_bswap32(val);
+              if (val >= 0x82000000u && val < 0x84000000u) {
+                int n = std::snprintf(sbuf + soff, sizeof(sbuf) - soff, "%x ", val);
+                if (n > 0)
+                  soff += n;
+              }
+            }
+            REXKRNL_INFO("GENOPRESENT   STACK start={:#x} sp={:#x}: {}", sa, sp, sbuf);
+          }
+          if (rw) {
+            uint32_t bw = c->r28.u32;
+            auto sLD = [&](uint32_t ga) -> uint32_t {
+              return (ga >= 0x1000u && ga < 0x50000000u) ? LD32(base, ga) : 0xDEADBEEFu;
+            };
+            uint32_t v3 = sLD(bw);
+            uint32_t sig = sLD(bw + 4);
+            uint32_t v3f = sLD(v3 + 368);
+            uint32_t subq = sLD(bw + 0x38);
+            uint32_t procq = sLD(bw + 0x3C);
             REXKRNL_INFO(
-                "GENOPRESENT THREAD start={:#x}{} lr={:#x} ctr={:#x} lastIndTgt={:#x} msr={:#x} | "
-                "r1={:#x} r3={:#x} r11={:#x} r28={:#x} r29={:#x} r30={:#x} r31={:#x}",
-                sa, rw ? " [RENDER-WORKER]" : "", (uint32_t)c->lr, c->ctr.u32,
-                c->last_indirect_target, c->msr, c->r1.u32, c->r3.u32, c->r11.u32, c->r28.u32,
-                c->r29.u32, c->r30.u32, c->r31.u32);
+                "GENOPRESENT   WORKER a1={:#x} queue Flink/submit={} Blink/proc={} [{}] | "
+                "SignalState={} v3={:#x} *(v3+368)={} -> wait={}",
+                bw, subq, procq,
+                (subq == procq ? "EMPTY (producer stopped feeding)" : "PENDING (LOST WAKEUP!)"),
+                sig, v3, v3f, (sig != v3f ? "INFINITE" : "30ms-timeout"));
             std::fprintf(stderr,
-                         "[ge] GENOPRESENT THREAD start=0x%08x%s lr=0x%08x ctr=0x%08x "
-                         "last=0x%08x msr=0x%08x r1=0x%08x r3=0x%08x r11=0x%08x "
-                         "r28=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x\n",
-                         sa, rw ? " [RENDER-WORKER]" : "", (uint32_t)c->lr, c->ctr.u32,
-                         c->last_indirect_target, c->msr, c->r1.u32, c->r3.u32, c->r11.u32,
-                         c->r28.u32, c->r29.u32, c->r30.u32, c->r31.u32);
+                         "[ge] GENOPRESENT WORKER a1=0x%08x queue_submit=%u queue_proc=%u %s "
+                         "SignalState=%u v3=0x%08x v3_368=%u wait=%s\n",
+                         bw, subq, procq, (subq == procq ? "EMPTY" : "PENDING"), sig, v3, v3f,
+                         (sig != v3f ? "INFINITE" : "30ms-timeout"));
+          }
+        }
+      }
+      ge_log_main_critical_section_wait("GENOPRESENT");
+      ge_flush_critical_section_diagnostics();
+    }
+
+    if (episode.visual_stall_started) {
+      present_at_stall_start = present;
+      cp_swap_at_stall_start = cp_swap;
+      dbg_at_stall_start = dbg;
+      submit_at_stall_start = submit;
+    }
+    if (episode.log_visual_stall) {  // ~1.5s of guest presents but no GPU consumer progress
+      uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
+      uint32_t target = dev ? LD32(base, dev + 10908) : 0;
+      uint32_t completed = idblk ? LD32(base, idblk + 0) : 0;
+      uint32_t skip = dev ? (base[dev + 10941] & 2) : 0;
+      REXKRNL_INFO(
+          "GEWATCHDOG STALL: ring rpi={:#x} wpi={:#x} [{}] | guest_present#={} "
+          "(+{}/stall) | cp_swap#={} (+{}/stall) | dbgnow_polls={} (+{}/stall) | "
+          "submit={} completed={} target={} presented={} skipbit={} | dev={:#x} idblk={:#x}",
+          rpi, wpi, ring_status, present, present - present_at_stall_start, cp_swap,
+          cp_swap - cp_swap_at_stall_start, dbg, dbg - dbg_at_stall_start, submit, completed,
+          target, presented, skip, dev, idblk);
+      std::fprintf(stderr,
+                   "[ge] GEWATCHDOG STALL rpi=0x%08x wpi=0x%08x %s guest_present=%u(+%u) "
+                   "cp_swap=%u(+%u) dbg=%u(+%u) submit=%u completed=%u target=%u presented=%u "
+                   "skipbit=%u dev=0x%08x idblk=0x%08x\n",
+                   rpi, wpi, ring_status, present, present - present_at_stall_start, cp_swap,
+                   cp_swap - cp_swap_at_stall_start, dbg, dbg - dbg_at_stall_start, submit,
+                   completed, target, presented, skip, dev, idblk);
+      REXKRNL_INFO(
+          "GEWATCHDOG -> completion={} | presenting={} | producer={} | polling={}",
+          (submit > completed ? "GPU BEHIND (completion not delivered)" : "caught up"),
+          (submit > presented ? "frames NOT presenting" : "caught up"),
+          (submit != submit_at_stall_start ? "ALIVE (submitting)" : "STALLED (not submitting)"),
+          (dbg != dbg_at_stall_start ? "guest spinning in sub_82198C28" : "guest NOT polling"));
+      // Render gate: frame loop runs render+present only when dword_8242043C&2
+      // (sub_8209E1C0). Set by sub_8209E1D0(mode): mode 3 at init (enabled),
+      // mode 1 = bit clear = render skipped every frame = freeze.
+      uint32_t rg = LD32(base, 0x8242043Cu);
+      REXKRNL_INFO("GEWATCHDOG -> render-gate dword_8242043C={} -> render+present {}", rg,
+                   (rg & 2u) ? "ENABLED" : "DISABLED (frame loop skips render = FREEZE)");
+      // Device flags gating the present/submit (a1 = dev). +21516 != 0 => the
+      // present SKIPS VdSwap (no screen update) and sub_821A4D50 takes its alt
+      // path; +22280&4 gates the GPU-completion wait; +10941/+10943 = skip bits.
+      if (dev) {
+        uint32_t f21516 = LD32(base, dev + 21516u);
+        uint32_t f22280 = LD32(base, dev + 22280u);
+        uint32_t f22276 = LD32(base, dev + 22276u);
+        uint32_t f21604 = LD32(base, dev + 21604u);
+        uint32_t f21600 = LD32(base, dev + 21600u);
+        uint32_t b10941 = base[dev + 10941u];
+        uint32_t b10943 = base[dev + 10943u];
+        REXKRNL_INFO(
+            "GEWATCHDOG -> devflags +21516(VdSwap-skip if !=0)={:#x} | +22280&4(gpu-wait)={} | "
+            "+22276={:#x} | +21604={} +21600={} (ring) | +10941={:#x} +10943={:#x}",
+            f21516, (f22280 & 4u), f22276, f21604, f21600, b10941, b10943);
+        uint32_t vbl = LD32(base, dev + 16532u);  // ctx[4133] vblank count
+        uint32_t fr = LD32(base, dev + 16684u);   // ctx[4171] fence read idx
+        uint32_t fw = LD32(base, dev + 16688u);   // ctx[4172] fence write idx
+        REXKRNL_INFO("GEWATCHDOG -> vblank ctx[4133]={} | GPU fences read={} write={} [{}]", vbl,
+                     fr, fw, (fr != fw ? "PENDING -- fences NOT retiring" : "drained"));
+      }
+      // Frame counter dword_8308851C is updated each frame AFTER the frame-
+      // limiter (0x82189e64). Sample it twice: if FROZEN, the main thread never
+      // exits the frame-limiter (clock/timebase not advancing for it); if it
+      // ADVANCES, the main thread cycles and the render is skipped after.
+      uint32_t fc1 = LD32(base, 0x8308851Cu);
+      uint32_t tb1 = (uint32_t)REX_QUERY_TIMEBASE();
+      std::this_thread::sleep_for(std::chrono::milliseconds(120));
+      uint32_t fc2 = LD32(base, 0x8308851Cu);
+      uint32_t tb2 = (uint32_t)REX_QUERY_TIMEBASE();
+      REXKRNL_INFO("GEWATCHDOG -> frameCounter 0x8308851C {}->{} [{}] | guestTimebase {}->{} [{}]",
+                   fc1, fc2,
+                   (fc1 != fc2 ? "ADVANCING (main thread cycles; render skipped after limiter)"
+                               : "FROZEN (main thread STUCK in frame-limiter)"),
+                   tb1, tb2, (tb1 != tb2 ? "advancing" : "FROZEN"));
+      // Dump every guest thread's jump state -- find WHERE the render workers
+      // (guest entry 0x821A4A68) are wedged inside sub_821A4750. lr = return
+      // addr, ctr = next indirect target, lastIndTgt = last REX_CALL_INDIRECT
+      // target, msr bit 0x8000 = interrupts enabled.
+      auto* ks2 = rex::system::kernel_state();
+      if (ks2) {
+        auto threads = ks2->object_table()->GetObjectsByType<rex::system::XThread>();
+        for (auto& th : threads) {
+          if (!th)
+            continue;
+          auto* ts = th->thread_state();
+          if (!ts)
+            continue;
+          auto* c = ts->context();
+          if (!c)
+            continue;
+          uint32_t sa = th->creation_params()->start_address;
+          bool rw = (sa == 0x821A4A68u);
+          REXKRNL_INFO(
+              "GEWATCHDOG THREAD start={:#x}{} lr={:#x} ctr={:#x} lastIndTgt={:#x} msr={:#x} | "
+              "r3={:#x} r11={:#x} r28={:#x} r29={:#x} r30={:#x} r31={:#x}",
+              sa, rw ? " [RENDER-WORKER]" : "", (uint32_t)c->lr, c->ctr.u32,
+              c->last_indirect_target, c->msr, c->r3.u32, c->r11.u32, c->r28.u32, c->r29.u32,
+              c->r30.u32, c->r31.u32);
+          // Guest stack walk: scan [r1, r1+0x2400) for guest code addresses
+          // (0x82xxxxxx return addresses) -> the call chain, directly readable.
+          {
             uint32_t sp = c->r1.u32;
             const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x2400u);
             if (stack_scan.length != 0) {
               uint8_t* hsp = stack_scan.host_address;
-              char sbuf[500];
-              int soff = 0;
-              sbuf[0] = 0;
-              for (uint8_t* pp = hsp; pp + 4 <= hsp + stack_scan.length && soff < 460; pp += 4) {
-                uint32_t val;
-                std::memcpy(&val, pp, 4);
-                val = __builtin_bswap32(val);
-                if (val >= 0x82000000u && val < 0x84000000u) {
-                  int n = std::snprintf(sbuf + soff, sizeof(sbuf) - soff, "%x ", val);
-                  if (n > 0)
-                    soff += n;
+              uint8_t* send = hsp + stack_scan.length;
+#if defined(_WIN32)
+              MEMORY_BASIC_INFORMATION mbi;
+              if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT &&
+                  (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                  PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) {
+                uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+                if (send > rend)
+                  send = rend;  // never read past the committed page
+#endif
+                char sbuf[500];
+                int soff = 0;
+                sbuf[0] = 0;
+                for (uint8_t* pp = hsp; pp + 4 <= send && soff < 460; pp += 4) {
+                  uint32_t val;
+                  std::memcpy(&val, pp, 4);
+                  val = __builtin_bswap32(val);
+                  if (val >= 0x82000000u && val < 0x84000000u) {
+                    int n = std::snprintf(sbuf + soff, sizeof(sbuf) - soff, "%x ", val);
+                    if (n > 0)
+                      soff += n;
+                  }
                 }
+                REXKRNL_INFO("GEWATCHDOG   STACK start={:#x} sp={:#x}: {}", sa, sp, sbuf);
+#if defined(_WIN32)
               }
-              REXKRNL_INFO("GENOPRESENT   STACK start={:#x} sp={:#x}: {}", sa, sp, sbuf);
-            }
-            if (rw) {
-              uint32_t bw = c->r28.u32;
-              auto sLD = [&](uint32_t ga) -> uint32_t {
-                return (ga >= 0x1000u && ga < 0x50000000u) ? LD32(base, ga) : 0xDEADBEEFu;
-              };
-              uint32_t v3 = sLD(bw);
-              uint32_t sig = sLD(bw + 4);
-              uint32_t v3f = sLD(v3 + 368);
-              uint32_t subq = sLD(bw + 0x38);
-              uint32_t procq = sLD(bw + 0x3C);
-              REXKRNL_INFO(
-                  "GENOPRESENT   WORKER a1={:#x} queue Flink/submit={} Blink/proc={} [{}] | "
-                  "SignalState={} v3={:#x} *(v3+368)={} -> wait={}",
-                  bw, subq, procq,
-                  (subq == procq ? "EMPTY (producer stopped feeding)" : "PENDING (LOST WAKEUP!)"),
-                  sig, v3, v3f, (sig != v3f ? "INFINITE" : "30ms-timeout"));
-              std::fprintf(stderr,
-                           "[ge] GENOPRESENT WORKER a1=0x%08x queue_submit=%u queue_proc=%u %s "
-                           "SignalState=%u v3=0x%08x v3_368=%u wait=%s\n",
-                           bw, subq, procq, (subq == procq ? "EMPTY" : "PENDING"), sig, v3, v3f,
-                           (sig != v3f ? "INFINITE" : "30ms-timeout"));
+#endif
             }
           }
-        }
-        ge_log_main_critical_section_wait("GENOPRESENT");
-        ge_flush_critical_section_diagnostics();
-      }
-    } else {
-      no_present_stall = 0;
-      no_present_logged = false;
-    }
-    if (present_alive && !ring_moved) {
-      if (stall == 0) {
-        present_at_stall_start = present;
-        dbg_at_stall_start = dbg;
-        submit_at_stall_start = submit;
-      }
-      ++stall;
-      if (stall >= 6 && !logged) {  // ~1.5s of present-but-no-ring
-        logged = true;
-        uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
-        uint32_t target = dev ? LD32(base, dev + 10908) : 0;
-        uint32_t completed = idblk ? LD32(base, idblk + 0) : 0;
-        uint32_t skip = dev ? (base[dev + 10941] & 2) : 0;
-        REXKRNL_INFO(
-            "GEWATCHDOG STALL: ring rpi={:#x} wpi={:#x} [{}] | present#={} (+{}/stall) | "
-            "dbgnow_polls={} (+{}/stall) | submit={} completed={} target={} presented={} "
-            "skipbit={} "
-            "| dev={:#x} idblk={:#x}",
-            rpi, wpi, (rpi == wpi ? "DRAINED" : "PENDING"), present,
-            present - present_at_stall_start, dbg, dbg - dbg_at_stall_start, submit, completed,
-            target, presented, skip, dev, idblk);
-        REXKRNL_INFO(
-            "GEWATCHDOG -> completion={} | presenting={} | producer={} | polling={}",
-            (submit > completed ? "GPU BEHIND (completion not delivered)" : "caught up"),
-            (submit > presented ? "frames NOT presenting" : "caught up"),
-            (submit != submit_at_stall_start ? "ALIVE (submitting)" : "STALLED (not submitting)"),
-            (dbg != dbg_at_stall_start ? "guest spinning in sub_82198C28" : "guest NOT polling"));
-        // Render gate: frame loop runs render+present only when dword_8242043C&2
-        // (sub_8209E1C0). Set by sub_8209E1D0(mode): mode 3 at init (enabled),
-        // mode 1 = bit clear = render skipped every frame = freeze.
-        uint32_t rg = LD32(base, 0x8242043Cu);
-        REXKRNL_INFO("GEWATCHDOG -> render-gate dword_8242043C={} -> render+present {}", rg,
-                     (rg & 2u) ? "ENABLED" : "DISABLED (frame loop skips render = FREEZE)");
-        // Device flags gating the present/submit (a1 = dev). +21516 != 0 => the
-        // present SKIPS VdSwap (no screen update) and sub_821A4D50 takes its alt
-        // path; +22280&4 gates the GPU-completion wait; +10941/+10943 = skip bits.
-        if (dev) {
-          uint32_t f21516 = LD32(base, dev + 21516u);
-          uint32_t f22280 = LD32(base, dev + 22280u);
-          uint32_t f22276 = LD32(base, dev + 22276u);
-          uint32_t f21604 = LD32(base, dev + 21604u);
-          uint32_t f21600 = LD32(base, dev + 21600u);
-          uint32_t b10941 = base[dev + 10941u];
-          uint32_t b10943 = base[dev + 10943u];
-          REXKRNL_INFO(
-              "GEWATCHDOG -> devflags +21516(VdSwap-skip if !=0)={:#x} | +22280&4(gpu-wait)={} | "
-              "+22276={:#x} | +21604={} +21600={} (ring) | +10941={:#x} +10943={:#x}",
-              f21516, (f22280 & 4u), f22276, f21604, f21600, b10941, b10943);
-          uint32_t vbl = LD32(base, dev + 16532u);  // ctx[4133] vblank count
-          uint32_t fr = LD32(base, dev + 16684u);   // ctx[4171] fence read idx
-          uint32_t fw = LD32(base, dev + 16688u);   // ctx[4172] fence write idx
-          REXKRNL_INFO("GEWATCHDOG -> vblank ctx[4133]={} | GPU fences read={} write={} [{}]", vbl,
-                       fr, fw, (fr != fw ? "PENDING -- fences NOT retiring" : "drained"));
-        }
-        // Frame counter dword_8308851C is updated each frame AFTER the frame-
-        // limiter (0x82189e64). Sample it twice: if FROZEN, the main thread never
-        // exits the frame-limiter (clock/timebase not advancing for it); if it
-        // ADVANCES, the main thread cycles and the render is skipped after.
-        uint32_t fc1 = LD32(base, 0x8308851Cu);
-        uint32_t tb1 = (uint32_t)REX_QUERY_TIMEBASE();
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
-        uint32_t fc2 = LD32(base, 0x8308851Cu);
-        uint32_t tb2 = (uint32_t)REX_QUERY_TIMEBASE();
-        REXKRNL_INFO(
-            "GEWATCHDOG -> frameCounter 0x8308851C {}->{} [{}] | guestTimebase {}->{} [{}]", fc1,
-            fc2,
-            (fc1 != fc2 ? "ADVANCING (main thread cycles; render skipped after limiter)"
-                        : "FROZEN (main thread STUCK in frame-limiter)"),
-            tb1, tb2, (tb1 != tb2 ? "advancing" : "FROZEN"));
-        // Dump every guest thread's jump state -- find WHERE the render workers
-        // (guest entry 0x821A4A68) are wedged inside sub_821A4750. lr = return
-        // addr, ctr = next indirect target, lastIndTgt = last REX_CALL_INDIRECT
-        // target, msr bit 0x8000 = interrupts enabled.
-        auto* ks2 = rex::system::kernel_state();
-        if (ks2) {
-          auto threads = ks2->object_table()->GetObjectsByType<rex::system::XThread>();
-          for (auto& th : threads) {
-            if (!th)
-              continue;
-            auto* ts = th->thread_state();
-            if (!ts)
-              continue;
-            auto* c = ts->context();
-            if (!c)
-              continue;
-            uint32_t sa = th->creation_params()->start_address;
-            bool rw = (sa == 0x821A4A68u);
+          if (rw) {
+            // a1 (worker struct) = r28; event = a1[2] = a1+0x20 (= r29);
+            // queue = a1[3]: Flink/submit = a1+0x38, Blink/processed = a1+0x3C.
+            // wait is INFINITE when a1->SignalState(a1+4) != *(v3+368), v3 = *a1.
+            uint32_t bw = c->r28.u32;
+            auto sLD = [&](uint32_t ga) -> uint32_t {
+              return (ga >= 0x1000u && ga < 0x50000000u) ? LD32(base, ga) : 0xDEADBEEFu;
+            };
+            uint32_t v3 = sLD(bw);
+            uint32_t sig = sLD(bw + 4);
+            uint32_t v3f = sLD(v3 + 368);
+            uint32_t subq = sLD(bw + 0x38);
+            uint32_t procq = sLD(bw + 0x3C);
             REXKRNL_INFO(
-                "GEWATCHDOG THREAD start={:#x}{} lr={:#x} ctr={:#x} lastIndTgt={:#x} msr={:#x} | "
-                "r3={:#x} r11={:#x} r28={:#x} r29={:#x} r30={:#x} r31={:#x}",
-                sa, rw ? " [RENDER-WORKER]" : "", (uint32_t)c->lr, c->ctr.u32,
-                c->last_indirect_target, c->msr, c->r3.u32, c->r11.u32, c->r28.u32, c->r29.u32,
-                c->r30.u32, c->r31.u32);
-            // Guest stack walk: scan [r1, r1+0x2400) for guest code addresses
-            // (0x82xxxxxx return addresses) -> the call chain, directly readable.
-            {
-              uint32_t sp = c->r1.u32;
-              const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x2400u);
-              if (stack_scan.length != 0) {
-                uint8_t* hsp = stack_scan.host_address;
-                uint8_t* send = hsp + stack_scan.length;
-#if defined(_WIN32)
-                MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                    mbi.State == MEM_COMMIT &&
-                    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) {
-                  uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-                  if (send > rend)
-                    send = rend;  // never read past the committed page
-#endif
-                  char sbuf[500];
-                  int soff = 0;
-                  sbuf[0] = 0;
-                  for (uint8_t* pp = hsp; pp + 4 <= send && soff < 460; pp += 4) {
-                    uint32_t val;
-                    std::memcpy(&val, pp, 4);
-                    val = __builtin_bswap32(val);
-                    if (val >= 0x82000000u && val < 0x84000000u) {
-                      int n = std::snprintf(sbuf + soff, sizeof(sbuf) - soff, "%x ", val);
-                      if (n > 0)
-                        soff += n;
-                    }
-                  }
-                  REXKRNL_INFO("GEWATCHDOG   STACK start={:#x} sp={:#x}: {}", sa, sp, sbuf);
-#if defined(_WIN32)
-                }
-#endif
-              }
-            }
-            if (rw) {
-              // a1 (worker struct) = r28; event = a1[2] = a1+0x20 (= r29);
-              // queue = a1[3]: Flink/submit = a1+0x38, Blink/processed = a1+0x3C.
-              // wait is INFINITE when a1->SignalState(a1+4) != *(v3+368), v3 = *a1.
-              uint32_t bw = c->r28.u32;
-              auto sLD = [&](uint32_t ga) -> uint32_t {
-                return (ga >= 0x1000u && ga < 0x50000000u) ? LD32(base, ga) : 0xDEADBEEFu;
-              };
-              uint32_t v3 = sLD(bw);
-              uint32_t sig = sLD(bw + 4);
-              uint32_t v3f = sLD(v3 + 368);
-              uint32_t subq = sLD(bw + 0x38);
-              uint32_t procq = sLD(bw + 0x3C);
-              REXKRNL_INFO(
-                  "GEWATCHDOG   WORKER a1={:#x} queue Flink/submit={} Blink/proc={} [{}] | "
-                  "SignalState={} v3={:#x} *(v3+368)={} -> wait={}",
-                  bw, subq, procq,
-                  (subq == procq ? "EMPTY (producer stopped feeding)" : "PENDING (LOST WAKEUP!)"),
-                  sig, v3, v3f, (sig != v3f ? "INFINITE" : "30ms-timeout"));
-            }
-          }
-          // Rapid-sample the main game thread (start 0x8235e4a8): it spends most
-          // time in the frame-limiter, so one snapshot misses the render path.
-          // Sample lr many times (yielding so it keeps running) -> the set of
-          // unique guest PCs = its per-frame code path, revealing which render
-          // subsystem call it reaches/skips.
-          for (auto& th : threads) {
-            if (!th)
-              continue;
-            if (th->creation_params()->start_address != 0x8235E4A8u)
-              continue;
-            auto* ts = th->thread_state();
-            if (!ts)
-              continue;
-            auto* mc = ts->context();
-            if (!mc)
-              continue;
-            uint32_t seen[96];
-            int ns = 0;
-            for (int it = 0; it < 8000 && ns < 94; it++) {
-              uint32_t pc = static_cast<uint32_t>(mc->lr);
-              if (pc >= 0x82000000u && pc < 0x84000000u) {
-                bool dup = false;
-                for (int j = 0; j < ns; j++)
-                  if (seen[j] == pc) {
-                    dup = true;
-                    break;
-                  }
-                if (!dup)
-                  seen[ns++] = pc;
-              }
-              std::this_thread::yield();
-            }
-            char mb[760];
-            int mo = 0;
-            mb[0] = 0;
-            for (int j = 0; j < ns && mo < 720; j++) {
-              int n = std::snprintf(mb + mo, sizeof(mb) - mo, "%x ", seen[j]);
-              if (n > 0)
-                mo += n;
-            }
-            REXKRNL_INFO("GEWATCHDOG MAINPATH (unique lr x{}): {}", ns, mb);
-            // Snapshot the main thread's full stack repeatedly with SLEEPS (no
-            // spinning -> doesn't starve it, it keeps cycling). Log only snapshots
-            // where it is OUTSIDE the frame-limiter -> in the per-frame render
-            // path -> the render call chain + the skipped 3D-submit branch.
-            {
-              int logged = 0;
-              for (int snap = 0; snap < 160 && logged < 12; snap++) {
-                uint32_t pc = static_cast<uint32_t>(mc->lr);
-                bool in_lim = (pc >= 0x823B3040u && pc <= 0x823B3540u) ||
-                              (pc >= 0x82189DC0u && pc <= 0x82189E14u);
-                if (!in_lim && pc >= 0x82000000u && pc < 0x84000000u) {
-                  uint32_t sp = mc->r1.u32;
-                  char fb[620];
-                  int fo = std::snprintf(fb, sizeof(fb), "lr=%x | ", pc);
-                  const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x2800u);
-                  if (stack_scan.length != 0) {
-                    uint8_t* hsp = stack_scan.host_address;
-                    uint8_t* send = hsp + stack_scan.length;
-#if defined(_WIN32)
-                    MEMORY_BASIC_INFORMATION mbi;
-                    if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                        mbi.State == MEM_COMMIT) {
-                      uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-                      if (send > rend)
-                        send = rend;
-#endif
-                      for (uint8_t* pp = hsp; pp + 4 <= send && fo < 580; pp += 4) {
-                        uint32_t v;
-                        std::memcpy(&v, pp, 4);
-                        v = __builtin_bswap32(v);
-                        if (v >= 0x82000000u && v < 0x84000000u) {
-                          int n = std::snprintf(fb + fo, sizeof(fb) - fo, "%x ", v);
-                          if (n > 0)
-                            fo += n;
-                        }
-                      }
-#if defined(_WIN32)
-                    }
-#endif
-                  }
-                  REXKRNL_INFO("GEWATCHDOG FRAMEWORK[{}] {}", logged, fb);
-                  logged++;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-              }
-            }
-            break;
+                "GEWATCHDOG   WORKER a1={:#x} queue Flink/submit={} Blink/proc={} [{}] | "
+                "SignalState={} v3={:#x} *(v3+368)={} -> wait={}",
+                bw, subq, procq,
+                (subq == procq ? "EMPTY (producer stopped feeding)" : "PENDING (LOST WAKEUP!)"),
+                sig, v3, v3f, (sig != v3f ? "INFINITE" : "30ms-timeout"));
           }
         }
-        ge_log_main_critical_section_wait("GEWATCHDOG");
-        ge_flush_critical_section_diagnostics();
+        // Rapid-sample the main game thread (start 0x8235e4a8): it spends most
+        // time in the frame-limiter, so one snapshot misses the render path.
+        // Sample lr many times (yielding so it keeps running) -> the set of
+        // unique guest PCs = its per-frame code path, revealing which render
+        // subsystem call it reaches/skips.
+        for (auto& th : threads) {
+          if (!th)
+            continue;
+          if (th->creation_params()->start_address != 0x8235E4A8u)
+            continue;
+          auto* ts = th->thread_state();
+          if (!ts)
+            continue;
+          auto* mc = ts->context();
+          if (!mc)
+            continue;
+          uint32_t seen[96];
+          int ns = 0;
+          for (int it = 0; it < 8000 && ns < 94; it++) {
+            uint32_t pc = static_cast<uint32_t>(mc->lr);
+            if (pc >= 0x82000000u && pc < 0x84000000u) {
+              bool dup = false;
+              for (int j = 0; j < ns; j++)
+                if (seen[j] == pc) {
+                  dup = true;
+                  break;
+                }
+              if (!dup)
+                seen[ns++] = pc;
+            }
+            std::this_thread::yield();
+          }
+          char mb[760];
+          int mo = 0;
+          mb[0] = 0;
+          for (int j = 0; j < ns && mo < 720; j++) {
+            int n = std::snprintf(mb + mo, sizeof(mb) - mo, "%x ", seen[j]);
+            if (n > 0)
+              mo += n;
+          }
+          REXKRNL_INFO("GEWATCHDOG MAINPATH (unique lr x{}): {}", ns, mb);
+          // Snapshot the main thread's full stack repeatedly with SLEEPS (no
+          // spinning -> doesn't starve it, it keeps cycling). Log only snapshots
+          // where it is OUTSIDE the frame-limiter -> in the per-frame render
+          // path -> the render call chain + the skipped 3D-submit branch.
+          {
+            int logged = 0;
+            for (int snap = 0; snap < 160 && logged < 12; snap++) {
+              uint32_t pc = static_cast<uint32_t>(mc->lr);
+              bool in_lim = (pc >= 0x823B3040u && pc <= 0x823B3540u) ||
+                            (pc >= 0x82189DC0u && pc <= 0x82189E14u);
+              if (!in_lim && pc >= 0x82000000u && pc < 0x84000000u) {
+                uint32_t sp = mc->r1.u32;
+                char fb[620];
+                int fo = std::snprintf(fb, sizeof(fb), "lr=%x | ", pc);
+                const GeGuestStackScan stack_scan = ge_guest_stack_scan(th.get(), sp, 0x2800u);
+                if (stack_scan.length != 0) {
+                  uint8_t* hsp = stack_scan.host_address;
+                  uint8_t* send = hsp + stack_scan.length;
+#if defined(_WIN32)
+                  MEMORY_BASIC_INFORMATION mbi;
+                  if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+                      mbi.State == MEM_COMMIT) {
+                    uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+                    if (send > rend)
+                      send = rend;
+#endif
+                    for (uint8_t* pp = hsp; pp + 4 <= send && fo < 580; pp += 4) {
+                      uint32_t v;
+                      std::memcpy(&v, pp, 4);
+                      v = __builtin_bswap32(v);
+                      if (v >= 0x82000000u && v < 0x84000000u) {
+                        int n = std::snprintf(fb + fo, sizeof(fb) - fo, "%x ", v);
+                        if (n > 0)
+                          fo += n;
+                      }
+                    }
+#if defined(_WIN32)
+                  }
+#endif
+                }
+                REXKRNL_INFO("GEWATCHDOG FRAMEWORK[{}] {}", logged, fb);
+                logged++;
+              }
+              std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+          }
+          break;
+        }
       }
-    } else {
-      stall = 0;
-      logged = false;
+      ge_log_main_critical_section_wait("GEWATCHDOG");
+      ge_flush_critical_section_diagnostics();
     }
-    last_wpi = wpi;
-    last_rpi = rpi;
-    last_present = present;
-    last_submit = submit;
   }
 }
 
-inline void ge_start_watchdog_once() {
-  static std::atomic<bool> started{false};
-  bool expected = false;
-  if (started.compare_exchange_strong(expected, true)) {
-    std::thread(ge_watchdog_thread).detach();
+}  // namespace
+
+namespace ge {
+void StartWatchdog() {
+  auto& worker = ge_watchdog_worker_state();
+  std::lock_guard lock(worker.mutex);
+  if (!worker.lifecycle.TryStart()) {
+    return;
+  }
+  // Do this while the worker mutex is held and before thread construction:
+  // no worker from this session can observe stale guest addresses or counters.
+  g_watchdog_session_state.Reset();
+  try {
+    worker.thread = std::thread(ge_watchdog_thread);
+  } catch (...) {
+    worker.lifecycle.AbortStart();
+    worker.wake.notify_all();
+    throw;
   }
 }
-}  // namespace
+
+void ShutdownWatchdog() {
+  auto& worker = ge_watchdog_worker_state();
+  std::thread thread;
+  {
+    std::unique_lock lock(worker.mutex);
+    switch (worker.lifecycle.BeginShutdown()) {
+      case watchdog::ShutdownOwnership::kWaitForOwner:
+        worker.wake.wait(lock, [&worker] { return !worker.lifecycle.stopping(); });
+        return;
+      case watchdog::ShutdownOwnership::kNotStarted:
+        return;
+      case watchdog::ShutdownOwnership::kOwnShutdown:
+        break;
+    }
+    worker.wake.notify_all();
+    if (worker.thread.joinable()) {
+      thread = std::move(worker.thread);
+    }
+  }
+  if (thread.joinable()) {
+    thread.join();
+  }
+  {
+    std::lock_guard lock(worker.mutex);
+    worker.lifecycle.FinishShutdown();
+    worker.wake.notify_all();
+  }
+}
+}  // namespace ge
 
 // NOTE: no frame-limiter / intro-wait hook. The post-intro freeze is a
 // SYMPTOM of the rexglue GPU command-processor not consuming the ring (GPU
@@ -1094,13 +1181,18 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   uint32_t idblk = ctx->r11.u32;
   uint32_t ws = ctx->r31.u32;
 
-  // Feed the freeze watchdog (stash device pointers, count polls, start thread).
-  g_ge_device.store(dev, std::memory_order_relaxed);
-  g_ge_idblk.store(idblk, std::memory_order_relaxed);
-  g_dbgnow_calls.fetch_add(1, std::memory_order_relaxed);
-  ge_start_watchdog_once();
+  // Feed the lifecycle-owned freeze watchdog with diagnostic guest pointers
+  // and an independent poll count.
+  g_watchdog_session_state.PublishDebugPoll(dev, idblk);
   auto* cpp = ge_cp();
-  bool primary_ring_drained = cpp && cpp->primary_ring_drained();
+  uint32_t primary_ring_read_pointer = 0;
+  bool primary_ring_drained = false;
+  if (cpp) {
+    const auto ring = cpp->primary_ring_snapshot();
+    primary_ring_read_pointer = ring.read_pointer;
+    primary_ring_drained =
+        ring.configured && ring.write_pointer_valid() && !ring.has_pending_commands();
+  }
   uint32_t heartbeat_token = ws ? LD32(base, ws + 8u) : 0;
   auto host_now = std::chrono::steady_clock::now();
   thread_local GpuWatchdogDrainGraceState drain_grace;
@@ -1112,16 +1204,15 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   } else if (!primary_ring_drained) {
     // Any pending sample breaks continuity. A later drained sample must earn a
     // fresh grace period before the accumulated guest time is made visible.
-    uint32_t read_pointer = cpp->read_ptr_index();
     bool pending_progressed = !drain_grace.observing_pending || drain_grace.wait_context != ws ||
                               drain_grace.heartbeat_token != heartbeat_token ||
-                              drain_grace.pending_read_pointer != read_pointer;
+                              drain_grace.pending_read_pointer != primary_ring_read_pointer;
     drain_grace.wait_context = ws;
     drain_grace.heartbeat_token = heartbeat_token;
     drain_grace.observing_drain = false;
     drain_grace.drain_release_recorded = false;
     if (pending_progressed) {
-      drain_grace.pending_read_pointer = read_pointer;
+      drain_grace.pending_read_pointer = primary_ring_read_pointer;
       drain_grace.pending_progress_at = host_now;
       drain_grace.observing_pending = true;
       drain_grace.pending_release_recorded = false;
@@ -1222,10 +1313,9 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   uint32_t a1 = r31.u32;
   auto* cpp = ge_cp();
   uint32_t cpc = cpp ? cpp->swap_counter() : 0;
-  g_present_cpcnt.store(cpc, std::memory_order_relaxed);
-  ge_start_watchdog_once();
+  g_watchdog_session_state.PublishPresentCpSwap(cpc);
 
-  uint32_t present_index = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  uint32_t present_index = g_watchdog_session_state.AdvanceGuestPresent();
   static const bool force_presented_on_vdswap =
       std::getenv("GOLDENEYE_FORCE_PRESENTED_ON_VDSWAP") != nullptr;
   if (force_presented_on_vdswap && a1) {
@@ -1258,24 +1348,27 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
         g_gpu_wait_pending_progress_resets.load(std::memory_order_relaxed);
     uint64_t pending_stall_releases =
         g_gpu_wait_pending_stall_releases.load(std::memory_order_relaxed);
-    uint32_t read_pointer = cpp ? cpp->read_ptr_index() : 0;
-    uint32_t write_pointer = cpp ? cpp->write_ptr_index() : 0;
-    std::fprintf(stderr,
-                 "[ge] VdSwap hook present#%u dev=0x%08x cpcnt=%u ring=%u/%u drained=%u "
-                 "gpu_wait_polls(blocked=%llu/+%llu complete=%llu/+%llu "
-                 "drain_grace=%llu starts=%llu stable_releases=%llu "
-                 "pending_progress=%llu stall_releases=%llu)\n",
-                 present_index, a1, cpc, read_pointer, write_pointer,
-                 cpp && cpp->primary_ring_drained() ? 1u : 0u,
-                 static_cast<unsigned long long>(blocked_polls),
-                 static_cast<unsigned long long>(blocked_polls - previous_blocked_polls),
-                 static_cast<unsigned long long>(completed_polls),
-                 static_cast<unsigned long long>(completed_polls - previous_completed_polls),
-                 static_cast<unsigned long long>(drain_grace_polls),
-                 static_cast<unsigned long long>(drain_grace_starts),
-                 static_cast<unsigned long long>(stable_drain_releases),
-                 static_cast<unsigned long long>(pending_progress_resets),
-                 static_cast<unsigned long long>(pending_stall_releases));
+    const auto ring =
+        cpp ? cpp->primary_ring_snapshot() : rex::graphics::CommandRingState::Snapshot{};
+    uint32_t read_pointer = ring.read_pointer;
+    uint32_t write_pointer = ring.write_pointer;
+    std::fprintf(
+        stderr,
+        "[ge] VdSwap hook present#%u dev=0x%08x cpcnt=%u ring=%u/%u drained=%u "
+        "gpu_wait_polls(blocked=%llu/+%llu complete=%llu/+%llu "
+        "drain_grace=%llu starts=%llu stable_releases=%llu "
+        "pending_progress=%llu stall_releases=%llu)\n",
+        present_index, a1, cpc, read_pointer, write_pointer,
+        ring.configured && ring.write_pointer_valid() && !ring.has_pending_commands() ? 1u : 0u,
+        static_cast<unsigned long long>(blocked_polls),
+        static_cast<unsigned long long>(blocked_polls - previous_blocked_polls),
+        static_cast<unsigned long long>(completed_polls),
+        static_cast<unsigned long long>(completed_polls - previous_completed_polls),
+        static_cast<unsigned long long>(drain_grace_polls),
+        static_cast<unsigned long long>(drain_grace_starts),
+        static_cast<unsigned long long>(stable_drain_releases),
+        static_cast<unsigned long long>(pending_progress_resets),
+        static_cast<unsigned long long>(pending_stall_releases));
     previous_blocked_polls = blocked_polls;
     previous_completed_polls = completed_polls;
     if (a1) {
@@ -2454,7 +2547,7 @@ void ge_log_player_stuck_report(uint8_t* base, const ge::player_stuck::Report& r
       "[GE-PLAYER-STUCK-v1] pipeline ring={}/{} drained={} swap={} dbgnow={} "
       "render_gate=0x{:08X}",
       ring_read, ring_write, ring_drained ? 1 : 0, swap_count,
-      g_dbgnow_calls.load(std::memory_order_relaxed), LD32(base, 0x8242043Cu));
+      g_watchdog_session_state.Load().debug_poll_count, LD32(base, 0x8242043Cu));
 
   for (size_t index = 0; index < report.sample_count; ++index) {
     const auto& sample = report.samples[index];
@@ -2491,7 +2584,7 @@ void ge_observe_player_stuck(uint8_t* base, uint64_t input_poll) {
   sample.monotonic_ms = now_ms;
   sample.input_poll = input_poll;
   sample.guest_frame = LD32(base, 0x8308851Cu);
-  sample.present = g_present_count.load(std::memory_order_relaxed);
+  sample.present = g_watchdog_session_state.Load().guest_present;
 
   auto* runtime = rex::Runtime::instance();
   auto* input = runtime && runtime->input_system()

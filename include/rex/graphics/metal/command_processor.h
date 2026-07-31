@@ -15,6 +15,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/metal/draw_renderer.h>
+#include <rex/graphics/metal/edram_snapshot.h>
 #include <rex/graphics/metal/goldeneye_postprocess_alias.h>
 #include <rex/graphics/metal/graphics_system.h>
 #include <rex/graphics/metal/msl_compiler.h>
@@ -71,7 +72,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
-  void RestoreEdramSnapshot(const void* snapshot) override;
+  bool RestoreEdramSnapshot(const void* snapshot) override;
   void NotifyWaitRegMemMemoryWrite(uint32_t address, uint32_t length) override;
 
  protected:
@@ -94,6 +95,7 @@ class MetalCommandProcessor final : public CommandProcessor {
                             uint32_t mask, uint32_t operation, uint32_t wait, uint32_t last_value,
                             uint32_t first_value, uint64_t poll_count, uint64_t duration_ns,
                             bool matched, bool timed_out) override;
+  void InitializeTrace() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -162,6 +164,28 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool RefreshPipelineProbeBacking(uint32_t width, uint32_t height);
   bool RefreshHostRenderTargetBacking(uint32_t width, uint32_t height);
   bool EnsureEdramBgraBacking();
+  CanonicalEdramSurfaceLayout GetCanonicalColorLayout(const HostRenderTarget& target) const;
+  CanonicalEdramSurfaceLayout GetCanonicalDepthLayout(
+      const HostDepthStencilTarget& target) const;
+  bool CaptureCanonicalEdramSnapshot(std::vector<uint8_t>& snapshot_out,
+                                     std::string* error_out);
+  void RecordCanonicalColorRequirement(xenos::ColorRenderTargetFormat format,
+                                       xenos::MsaaSamples msaa_samples);
+  void RecordCanonicalDepthRequirement(xenos::DepthRenderTargetFormat format,
+                                       xenos::MsaaSamples msaa_samples);
+  bool RestoreCanonicalColorTarget(HostRenderTarget& target, uint64_t target_key,
+                                   std::string* error_out);
+  bool RestoreCanonicalDepthTarget(HostDepthStencilTarget& target, uint64_t target_key,
+                                   std::string* error_out);
+  bool PrepareCanonicalContextForUse(void* context, uint32_t width, uint32_t height,
+                                     std::string* error_out);
+  bool PrepareCanonicalDepthTargetForUse(HostDepthStencilTarget& target, uint64_t target_key,
+                                         uint32_t width, uint32_t height,
+                                         std::string* error_out);
+  void MarkCanonicalColorTargetWritten(HostRenderTarget& target, uint64_t target_key);
+  void MarkCanonicalDepthTargetWritten(HostDepthStencilTarget& target, uint64_t target_key);
+  void MarkCanonicalWritesForContext(void* context, uint32_t shader_color_target_mask,
+                                     const ProbeDepthStencilState* depth_state);
   bool DumpHostRenderTargetToEdram(const HostRenderTarget& target);
   bool ResolveEdramToBgra(const draw_util::ResolveInfo& resolve_info, uint32_t width,
                           uint32_t height, std::vector<uint8_t>& bgra_out);
@@ -408,6 +432,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::vector<uint8_t> latest_texture_candidate_bgra_;
   std::vector<uint8_t> resolved_color_bgra_;
   std::vector<uint8_t> edram_bgra_;
+  CanonicalEdramTileOwnership canonical_edram_ownership_;
+  bool canonical_edram_valid_ = false;
+  bool canonical_edram_transfer_active_ = false;
+  // Unsupported private formats keep live rendering on the compatibility
+  // path, but permanently disqualify the current state from exact capture.
+  bool canonical_edram_unsupported_state_ = false;
   std::vector<uint8_t> pending_texture_resolve_bgra_;
   std::vector<uint8_t> pending_host_texture_rgba_;
   struct RetainedResolvedFrame {
@@ -454,11 +484,19 @@ class MetalCommandProcessor final : public CommandProcessor {
     uint32_t depth_info = 0;
     uint32_t surface_info = 0;
     uint64_t depth_stencil_key = 0;
+    uint32_t canonical_width = 0;
+    uint32_t canonical_height = 0;
+    uint64_t canonical_hydrated_sequence = 0;
+    bool canonical_hydrated = false;
   };
   struct HostDepthStencilTarget {
     void* context = nullptr;
     uint32_t depth_info = 0;
     uint32_t surface_info = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint64_t canonical_hydrated_sequence = 0;
+    bool canonical_hydrated = false;
   };
   struct ResolvedDepthSnapshot {
     void* metal_texture = nullptr;

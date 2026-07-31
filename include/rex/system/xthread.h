@@ -10,6 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -324,7 +326,7 @@ class XThread : public XObject {
   // True if the thread is created by the guest app.
   bool is_guest_thread() const { return guest_thread_; }
   bool main_thread() const { return main_thread_; }
-  bool is_running() const { return running_; }
+  bool is_running() const { return running_.load(std::memory_order_acquire); }
 
   uint32_t thread_id() const { return thread_id_; }
   uint32_t last_error();
@@ -334,6 +336,9 @@ class XThread : public XObject {
   X_STATUS Create();
   X_STATUS Exit(int exit_code);
   X_STATUS Terminate(int exit_code);
+  void PrepareForTitleDrain();
+  bool WaitForExitUntil(std::chrono::steady_clock::time_point deadline);
+  std::string thread_name_snapshot() const;
 
   virtual void Execute();
 
@@ -391,13 +396,27 @@ class XThread : public XObject {
   }
 
  protected:
+  enum class HostThreadState {
+    kNotStarted,
+    kCreating,
+    kHostPublished,
+    kNoHost,
+    kJoined,
+  };
+
   bool AllocateStack(uint32_t size);
   void FreeStack();
   void InitializeGuestObject();
 
   void RundownAPCs();
 
+  void WaitCallback() override;
   rex::thread::WaitHandle* GetWaitHandle() override { return thread_.get(); }
+
+  bool TryBeginTermination();
+  void RetainSelfHandle();
+  void AdoptSelfHandle();
+  void ReleaseSelfHandleOnce();
 
   CreationParams creation_params_ = {0, 0, 0, 0, 0, 0};
 
@@ -416,7 +435,12 @@ class XThread : public XObject {
   uint32_t stack_limit_ = 0;       // Low address
   bool guest_thread_ = false;
   bool main_thread_ = false;  // Entry-point thread
-  bool running_ = false;
+  std::atomic<bool> running_{false};
+  std::atomic<bool> termination_started_{false};
+  std::atomic<bool> self_handle_retained_{false};
+  std::atomic<X_HANDLE> self_handle_{0};
+  std::atomic<bool> drain_wait_expected_{false};
+  bool registered_with_kernel_ = false;
 
   std::string thread_name_;
   std::unique_ptr<runtime::ThreadState> thread_state_;
@@ -429,7 +453,11 @@ class XThread : public XObject {
   std::condition_variable suspend_cv_;
 #endif
 
-  std::mutex thread_lock_;
+  mutable std::mutex thread_lock_;
+  mutable std::mutex host_thread_state_mutex_;
+  std::condition_variable thread_state_cv_;
+  HostThreadState host_thread_state_ = HostThreadState::kNotStarted;
+  std::atomic<rex::thread::Thread*> published_host_thread_{nullptr};
 
   rex::thread::global_critical_region global_critical_region_;
   uint32_t apc_lock_old_irql_ = 0;

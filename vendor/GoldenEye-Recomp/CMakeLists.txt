@@ -144,6 +144,20 @@ if(NOT MSVC)
     )
 endif()
 
+# Deterministic regression for the independent guest-present, command-
+# processor swap, and ring-progress classifier used by the freeze watchdog.
+add_executable(goldeneye_watchdog_test EXCLUDE_FROM_ALL
+    tests/watchdog_test.cpp
+)
+target_include_directories(goldeneye_watchdog_test PRIVATE src)
+rexglue_apply_target_settings(goldeneye_watchdog_test)
+if(NOT MSVC)
+    target_compile_options(goldeneye_watchdog_test PRIVATE
+        "-ffile-prefix-map=${REXSDK_DIR}=."
+        "-fmacro-prefix-map=${REXSDK_DIR}=."
+    )
+endif()
+
 # Local-only importer smoke tool. It is excluded from normal builds and never
 # packaged; developers may invoke it explicitly with their own package to test
 # the same validation/extraction backend used by the launcher.
@@ -209,9 +223,9 @@ endif()
 # metadata, and the source notices.  Game data is deliberately never copied.
 # ---------------------------------------------------------------------------
 if(APPLE)
-    set(GOLDENEYE_VERSION "0.3.0" CACHE STRING
+    set(GOLDENEYE_VERSION "0.4.0" CACHE STRING
         "GoldenEye Metal CFBundleShortVersionString")
-    set(GOLDENEYE_BUILD_NUMBER "6" CACHE STRING
+    set(GOLDENEYE_BUILD_NUMBER "8" CACHE STRING
         "GoldenEye Metal numeric CFBundleVersion")
     set(GOLDENEYE_BUNDLE_IDENTIFIER "io.github.ysrdevs.goldeneye-metal" CACHE STRING
         "GoldenEye Metal reverse-DNS bundle identifier")
@@ -225,7 +239,7 @@ if(APPLE)
     if(NOT GOLDENEYE_VERSION MATCHES "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$")
         message(FATAL_ERROR
             "GOLDENEYE_VERSION must contain two or three numeric components "
-            "(for example, 0.3.0)")
+            "(for example, 0.4.0)")
     endif()
     if(NOT GOLDENEYE_BUILD_NUMBER MATCHES "^[0-9]+(\\.[0-9]+)?(\\.[0-9]+)?$")
         message(FATAL_ERROR
@@ -304,6 +318,7 @@ if(APPLE)
     add_custom_target(goldeneye_macos_app_verify
         COMMAND "$<TARGET_FILE:goldeneye_crash_guard_test>"
         COMMAND "$<TARGET_FILE:goldeneye_player_stuck_telemetry_test>"
+        COMMAND "$<TARGET_FILE:goldeneye_watchdog_test>"
         COMMAND "$<TARGET_FILE:goldeneye_host_pause_test>"
         COMMAND "$<TARGET_FILE:goldeneye_testing_tools_test>"
         COMMAND "$<TARGET_FILE:goldeneye_launch_recovery_test>"
@@ -321,6 +336,7 @@ if(APPLE)
             goldeneye_crash_guard_test
             goldeneye_crash_guard_codegen_verify
             goldeneye_player_stuck_telemetry_test
+            goldeneye_watchdog_test
             goldeneye_host_pause_test
             goldeneye_testing_tools_test
             goldeneye_launch_recovery_test
@@ -367,4 +383,27 @@ if(GOLDENEYE_BUILD_VULKAN_TRACE_DUMP)
     # Apply platform settings without injecting the windowed-app entry point;
     # this console tool provides its own main().
     rexglue_apply_target_settings(trace_dump_vulkan)
+endif()
+
+option(GOLDENEYE_BUILD_METAL_TRACE_DUMP
+    "Build the source-tree-only native Metal trace dump utility" OFF)
+if(GOLDENEYE_BUILD_METAL_TRACE_DUMP)
+    if(NOT APPLE OR NOT REXGLUE_USE_METAL)
+        message(FATAL_ERROR
+            "GOLDENEYE_BUILD_METAL_TRACE_DUMP requires Apple Metal "
+            "(APPLE=TRUE and REXGLUE_USE_METAL=ON)")
+    endif()
+    add_executable(trace_dump_metal
+        ${REXSDK_DIR}/src/graphics/metal/trace_dump_main.mm
+    )
+    target_link_libraries(trace_dump_metal PRIVATE
+        rex::runtime
+        "-framework Foundation"
+        "-framework Metal"
+    )
+    if(TARGET rexcore)
+        target_include_directories(trace_dump_metal PRIVATE
+            $<TARGET_PROPERTY:rexcore,INTERFACE_INCLUDE_DIRECTORIES>)
+    endif()
+    rexglue_apply_target_settings(trace_dump_metal)
 endif()

@@ -42,6 +42,12 @@ void InitMouseLook();
 // Suppress mouse-look while the pause menu is open (cursor is needed for the
 // menu, and motion shouldn't turn into look). Implemented in ge_hooks.cpp.
 void SetMouselookSuppressed(bool suppressed);
+// Own the observation-only freeze watchdog for exactly the guest title
+// lifetime. Both operations are idempotent.
+void StartWatchdog();
+// Stop and join the observation-only freeze watchdog before the runtime and
+// guest contexts begin shutting down.
+void ShutdownWatchdog();
 }  // namespace ge
 
 class GeApp : public rex::ReXApp {
@@ -275,8 +281,21 @@ class GeApp : public rex::ReXApp {
 #endif
   }
 
+  void OnPostLaunchModule(rex::system::XThread* thread) override {
+    (void)thread;
+    ge::StartWatchdog();
+  }
+
+  void OnGuestThreadExit(rex::system::XThread* thread) override {
+    (void)thread;
+    ge::ShutdownWatchdog();
+  }
+
+  void OnPreTerminateTitle() override { ge::ShutdownWatchdog(); }
+
   // Tear down the menu, overlay and keybind before the drawer is destroyed.
   void OnShutdown() override {
+    ge::ShutdownWatchdog();
     controller_shortcut_ui_state_->alive.store(false, std::memory_order_release);
     ge::controller_shortcut::ClearToggleHandler();
     input_suppressed_.store(true, std::memory_order_release);
