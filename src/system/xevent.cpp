@@ -23,6 +23,7 @@ void XEvent::Initialize(bool manual_reset, bool initial_state) {
   assert_false(event_);
 
   this->CreateNative<X_KEVENT>();
+  manual_reset_ = manual_reset;
 
   if (manual_reset) {
     event_ = rex::thread::Event::CreateManualResetEvent(initial_state);

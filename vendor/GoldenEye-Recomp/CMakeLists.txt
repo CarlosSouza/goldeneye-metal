@@ -223,9 +223,9 @@ endif()
 # metadata, and the source notices.  Game data is deliberately never copied.
 # ---------------------------------------------------------------------------
 if(APPLE)
-    set(GOLDENEYE_VERSION "0.4.1" CACHE STRING
+    set(GOLDENEYE_VERSION "0.4.2" CACHE STRING
         "GoldenEye Metal CFBundleShortVersionString")
-    set(GOLDENEYE_BUILD_NUMBER "9" CACHE STRING
+    set(GOLDENEYE_BUILD_NUMBER "10" CACHE STRING
         "GoldenEye Metal numeric CFBundleVersion")
     set(GOLDENEYE_BUNDLE_IDENTIFIER "io.github.ysrdevs.goldeneye-metal" CACHE STRING
         "GoldenEye Metal reverse-DNS bundle identifier")

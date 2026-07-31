@@ -7,6 +7,7 @@ add_executable(unit_tests
     graphics/trace_reader_test.cpp
     graphics/metal_profile_test.cpp
     kernel/critical_section_ledger_test.cpp
+    kernel/critical_section_policy_test.cpp
     kernel/object_table_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
