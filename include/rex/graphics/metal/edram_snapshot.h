@@ -69,6 +69,28 @@ struct CanonicalEdramTileOwner {
   bool operator==(const CanonicalEdramTileOwner&) const = default;
 };
 
+// Separates having a complete canonical image from being allowed to import it
+// into private Metal targets. Live captures are serialization-only: the
+// full-surface ownership model may wrap and overlap physical EDRAM tiles, so
+// promoting a live capture would make color and depth targets repeatedly
+// overwrite each other. Only an explicit trace restore establishes hydration
+// authority.
+class CanonicalEdramAuthorityState {
+ public:
+  void Reset();
+  void RecordCapture();
+  void RecordRestore();
+
+  bool has_snapshot() const { return has_snapshot_; }
+  bool target_hydration_enabled() const {
+    return has_snapshot_ && target_hydration_enabled_;
+  }
+
+ private:
+  bool has_snapshot_ = false;
+  bool target_hydration_enabled_ = false;
+};
+
 // Tracks which private Metal target contains the authoritative value of each
 // physical EDRAM tile. This prevents stale aliased target caches from
 // overwriting newer contents when a canonical trace snapshot is exported.

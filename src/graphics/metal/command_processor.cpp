@@ -2676,7 +2676,7 @@ bool MetalCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
   host_depth_stencil_targets_.clear();
   std::memcpy(edram_bgra_.data(), snapshot, xenos::kEdramSizeBytes);
   canonical_edram_ownership_.Reset();
-  canonical_edram_valid_ = true;
+  canonical_edram_state_.RecordRestore();
   canonical_edram_transfer_active_ = false;
   canonical_edram_unsupported_state_ = false;
   latest_host_render_target_bgra_.clear();
@@ -2818,17 +2818,34 @@ void MetalCommandProcessor::ClearCaches() {
   if (shared_memory_) {
     shared_memory_->ClearCache();
   }
-  std::vector<uint8_t> canonical_edram;
-  std::string canonical_error;
-  if (!canonical_edram_unsupported_state_ &&
-      !CaptureCanonicalEdramSnapshot(canonical_edram, &canonical_error)) {
-    canonical_edram_unsupported_state_ = true;
-    REXGPU_WARN("Metal cache clear could not preserve canonical EDRAM: {}",
-                canonical_error);
+  // A cache clear may preserve authority established by trace restore, but it
+  // must not promote ordinary live target contents into a hydration source.
+  // The live full-surface layouts may wrap physical EDRAM and alias each other.
+  const bool preserve_restored_edram =
+      !canonical_edram_unsupported_state_ &&
+      canonical_edram_state_.target_hydration_enabled();
+  if (preserve_restored_edram) {
+    std::vector<uint8_t> canonical_edram;
+    std::string canonical_error;
+    if (!CaptureCanonicalEdramSnapshot(canonical_edram, &canonical_error)) {
+      canonical_edram_unsupported_state_ = true;
+      canonical_edram_state_.Reset();
+      if (trace_writer_.is_open()) {
+        trace_writer_.InvalidateEdramRequirementsTracking();
+      }
+      REXGPU_WARN("Metal cache clear could not preserve restored canonical EDRAM: {}",
+                  canonical_error);
+    }
+  } else {
+    if (trace_writer_.is_open()) {
+      // The compatibility reset below discards private target contents without
+      // a safe canonical import path, so the capture cannot claim deterministic
+      // EDRAM replay.
+      trace_writer_.InvalidateEdramRequirementsTracking();
+    }
+    canonical_edram_state_.Reset();
   }
-  if (!canonical_edram_unsupported_state_) {
-    canonical_edram_ownership_.Reset();
-  }
+  canonical_edram_ownership_.Reset();
   for (auto& rt_entry : host_render_targets_) {
     if (rt_entry.second.context) {
       ResetPipelineProbeContext(rt_entry.second.context);
@@ -2934,7 +2951,7 @@ void MetalCommandProcessor::ShutdownContext() {
   host_depth_stencil_targets_.clear();
   canonical_edram_ownership_.Reset();
   edram_bgra_.clear();
-  canonical_edram_valid_ = false;
+  canonical_edram_state_.Reset();
   canonical_edram_transfer_active_ = false;
   canonical_edram_unsupported_state_ = false;
   ReleasePipelineProbeContext(host_render_target_context_);
@@ -8166,8 +8183,6 @@ bool MetalCommandProcessor::EnsureEdramBgraBacking() {
     return true;
   }
   edram_bgra_.assign(xenos::kEdramSizeBytes, 0);
-  canonical_edram_valid_ = true;
-  canonical_edram_unsupported_state_ = false;
   static std::atomic<uint32_t> edram_backing_logs{0};
   uint32_t edram_backing_index = edram_backing_logs.fetch_add(1, std::memory_order_relaxed) + 1;
   if (edram_backing_index <= 4 || (edram_backing_index & 0x3F) == 0) {
@@ -8321,7 +8336,7 @@ bool MetalCommandProcessor::CaptureCanonicalEdramSnapshot(std::vector<uint8_t>& 
     }
   }
   edram_bgra_ = snapshot_out;
-  canonical_edram_valid_ = true;
+  canonical_edram_state_.RecordCapture();
   return true;
 }
 
@@ -8336,7 +8351,8 @@ bool MetalCommandProcessor::RestoreCanonicalColorTarget(HostRenderTarget& target
     canonical_edram_unsupported_state_ = true;
     return true;
   }
-  if (canonical_edram_unsupported_state_ || !canonical_edram_valid_) {
+  if (canonical_edram_unsupported_state_ ||
+      !canonical_edram_state_.target_hydration_enabled()) {
     return true;
   }
   const uint32_t width = target.canonical_width;
@@ -8382,7 +8398,8 @@ bool MetalCommandProcessor::RestoreCanonicalDepthTarget(HostDepthStencilTarget& 
     canonical_edram_unsupported_state_ = true;
     return true;
   }
-  if (canonical_edram_unsupported_state_ || !canonical_edram_valid_) {
+  if (canonical_edram_unsupported_state_ ||
+      !canonical_edram_state_.target_hydration_enabled()) {
     return true;
   }
   const uint32_t width = target.width;

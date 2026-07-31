@@ -8,6 +8,7 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -30,6 +31,57 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
+
+namespace rex::graphics::metal {
+
+struct MetalCommandProcessorTestPeer {
+  static bool EnsureEdramBacking(MetalCommandProcessor& command_processor) {
+    return command_processor.EnsureEdramBgraBacking();
+  }
+
+  static const std::vector<uint8_t>& EdramBacking(
+      const MetalCommandProcessor& command_processor) {
+    return command_processor.edram_bgra_;
+  }
+
+  static const CanonicalEdramAuthorityState& AuthorityState(
+      const MetalCommandProcessor& command_processor) {
+    return command_processor.canonical_edram_state_;
+  }
+
+  static bool UnsupportedState(const MetalCommandProcessor& command_processor) {
+    return command_processor.canonical_edram_unsupported_state_;
+  }
+
+  static void SetUnsupportedState(MetalCommandProcessor& command_processor, bool unsupported) {
+    command_processor.canonical_edram_unsupported_state_ = unsupported;
+  }
+
+  static bool FreshStartupTargetsSkipHydration(MetalCommandProcessor& command_processor) {
+    MetalCommandProcessor::HostRenderTarget color_target;
+    color_target.color_info = 0x00000000;
+    color_target.surface_info = 0x14020500;
+    color_target.canonical_width = 1280;
+    color_target.canonical_height = 720;
+
+    MetalCommandProcessor::HostDepthStencilTarget depth_target;
+    depth_target.depth_info = 0x00000400;
+    depth_target.surface_info = 0x14020500;
+    depth_target.width = 1280;
+    depth_target.height = 720;
+
+    std::string error;
+    const bool color_ok =
+        command_processor.RestoreCanonicalColorTarget(color_target, 1, &error);
+    const bool depth_ok =
+        command_processor.RestoreCanonicalDepthTarget(depth_target, 2, &error);
+    return color_ok && depth_ok && error.empty() && !color_target.canonical_hydrated &&
+           !depth_target.canonical_hydrated &&
+           command_processor.canonical_edram_ownership_.sequence() == 0;
+  }
+};
+
+}  // namespace rex::graphics::metal
 
 namespace {
 
@@ -820,4 +872,42 @@ TEST_CASE("Metal packet writes remain guest-visible without an initialized Metal
   std::array<uint8_t, 12> ext_actual;
   std::memcpy(ext_actual.data(), ext_target, ext_actual.size());
   CHECK(ext_actual == kExpectedExtents);
+}
+
+TEST_CASE("Metal fresh canonical EDRAM backing remains non-authoritative",
+          "[graphics][metal][edram]") {
+  rex::InitLogging();
+  rex::memory::Memory memory;
+  REQUIRE(memory.Initialize());
+
+  TestGraphicsSystem graphics_system(memory);
+  rex::graphics::metal::MetalCommandProcessor command_processor(&graphics_system, nullptr);
+  using TestPeer = rex::graphics::metal::MetalCommandProcessorTestPeer;
+
+  // Allocation is storage-only. It must not authorize zero-filled bytes for
+  // target hydration or erase a previously detected unsupported state.
+  TestPeer::SetUnsupportedState(command_processor, true);
+  REQUIRE(TestPeer::EnsureEdramBacking(command_processor));
+  const auto& fresh_backing = TestPeer::EdramBacking(command_processor);
+  REQUIRE(fresh_backing.size() == rex::graphics::xenos::kEdramSizeBytes);
+  CHECK(std::all_of(fresh_backing.begin(), fresh_backing.end(),
+                    [](uint8_t value) { return value == 0; }));
+  CHECK_FALSE(TestPeer::AuthorityState(command_processor).has_snapshot());
+  CHECK_FALSE(TestPeer::AuthorityState(command_processor).target_hydration_enabled());
+  CHECK(TestPeer::UnsupportedState(command_processor));
+
+  // These are the exact dimensions and 4x surface configuration used at
+  // GoldenEye startup. With fresh backing they must return before any Metal
+  // import is attempted.
+  TestPeer::SetUnsupportedState(command_processor, false);
+  CHECK(TestPeer::FreshStartupTargetsSkipHydration(command_processor));
+
+  // A real replay restore is the transition that makes canonical bytes
+  // authoritative for future private Metal targets.
+  std::vector<uint8_t> restored(rex::graphics::xenos::kEdramSizeBytes, 0x5A);
+  REQUIRE(command_processor.RestoreEdramSnapshot(restored.data()));
+  CHECK(TestPeer::AuthorityState(command_processor).has_snapshot());
+  CHECK(TestPeer::AuthorityState(command_processor).target_hydration_enabled());
+  CHECK_FALSE(TestPeer::UnsupportedState(command_processor));
+  CHECK(TestPeer::EdramBacking(command_processor) == restored);
 }

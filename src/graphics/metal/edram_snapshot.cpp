@@ -287,6 +287,20 @@ void CanonicalEdramTileOwnership::Reset() {
   sequence_ = 0;
 }
 
+void CanonicalEdramAuthorityState::Reset() {
+  has_snapshot_ = false;
+  target_hydration_enabled_ = false;
+}
+
+void CanonicalEdramAuthorityState::RecordCapture() {
+  has_snapshot_ = true;
+}
+
+void CanonicalEdramAuthorityState::RecordRestore() {
+  has_snapshot_ = true;
+  target_hydration_enabled_ = true;
+}
+
 uint64_t CanonicalEdramTileOwnership::MarkSurface(const CanonicalEdramSurfaceLayout& layout,
                                                   uint32_t width, uint32_t height,
                                                   CanonicalEdramOwnerKind kind,

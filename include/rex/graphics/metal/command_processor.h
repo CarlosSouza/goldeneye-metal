@@ -105,6 +105,8 @@ class MetalCommandProcessor final : public CommandProcessor {
   void ClearCaches() override;
 
  private:
+  friend struct MetalCommandProcessorTestPeer;
+
   // Phase 0.5: per-frame lifecycle tracking. Set on the first draw of a frame so
   // texture_cache_->BeginSubmission()/BeginFrame() run once; cleared at swap.
   bool frame_open_ = false;
@@ -433,7 +435,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::vector<uint8_t> resolved_color_bgra_;
   std::vector<uint8_t> edram_bgra_;
   CanonicalEdramTileOwnership canonical_edram_ownership_;
-  bool canonical_edram_valid_ = false;
+  CanonicalEdramAuthorityState canonical_edram_state_;
   bool canonical_edram_transfer_active_ = false;
   // Unsupported private formats keep live rendering on the compatibility
   // path, but permanently disqualify the current state from exact capture.

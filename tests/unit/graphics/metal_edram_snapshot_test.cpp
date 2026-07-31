@@ -14,6 +14,61 @@
 namespace rex::graphics::metal {
 namespace {
 
+TEST_CASE("Metal canonical EDRAM capture does not authorize live target hydration",
+          "[graphics][metal][edram]") {
+  CanonicalEdramAuthorityState state;
+  CHECK_FALSE(state.has_snapshot());
+  CHECK_FALSE(state.target_hydration_enabled());
+
+  state.RecordCapture();
+  CHECK(state.has_snapshot());
+  CHECK_FALSE(state.target_hydration_enabled());
+
+  // Repeated live captures, including captures made while clearing caches,
+  // must never promote the backing to a hydration source.
+  state.RecordCapture();
+  CHECK(state.has_snapshot());
+  CHECK_FALSE(state.target_hydration_enabled());
+
+  state.Reset();
+  CHECK_FALSE(state.has_snapshot());
+  CHECK_FALSE(state.target_hydration_enabled());
+
+  state.RecordRestore();
+  CHECK(state.has_snapshot());
+  CHECK(state.target_hydration_enabled());
+
+  // Capturing a restored state refreshes its canonical image without
+  // revoking the authority established by the restore.
+  state.RecordCapture();
+  CHECK(state.target_hydration_enabled());
+}
+
+TEST_CASE("Metal wrapped 4x frame ownership spans every physical EDRAM tile",
+          "[graphics][metal][edram]") {
+  CanonicalEdramTileOwnership ownership;
+  CanonicalEdramSurfaceLayout color_layout;
+  color_layout.base_tiles = 0;
+  color_layout.pitch_tiles = 32;
+  color_layout.msaa_samples = xenos::MsaaSamples::k4X;
+  REQUIRE(ownership.MarkSurface(color_layout, 1280, 720,
+                                CanonicalEdramOwnerKind::kColorTarget, 1) == 1);
+  for (uint32_t tile = 0; tile < xenos::kEdramTileCount; ++tile) {
+    CHECK(ownership.owner(tile).kind == CanonicalEdramOwnerKind::kColorTarget);
+    CHECK(ownership.owner(tile).target_key == 1);
+  }
+
+  CanonicalEdramSurfaceLayout depth_layout = color_layout;
+  depth_layout.base_tiles = 1024;
+  depth_layout.is_depth = true;
+  REQUIRE(ownership.MarkSurface(depth_layout, 1280, 720,
+                                CanonicalEdramOwnerKind::kDepthStencilTarget, 2) == 2);
+  for (uint32_t tile = 0; tile < xenos::kEdramTileCount; ++tile) {
+    CHECK(ownership.owner(tile).kind == CanonicalEdramOwnerKind::kDepthStencilTarget);
+    CHECK(ownership.owner(tile).target_key == 2);
+  }
+}
+
 TEST_CASE("Metal canonical EDRAM addressing preserves samples and wraps tiles",
           "[graphics][metal][edram]") {
   CanonicalEdramSurfaceLayout layout;
