@@ -15,8 +15,12 @@ set(REXGLUE_INSTALL_TARGETS
     disruptorplus renderdoc simde tomlplusplus
     aes128 mspack o1heap disasm xxhash
     libavcodec libavutil
-    rexglue
 )
+
+# Host-only CLI; absent when cross-compiling to iOS.
+if(TARGET rexglue)
+    list(APPEND REXGLUE_INSTALL_TARGETS rexglue)
+endif()
 
 if(REXGLUE_USE_VULKAN)
     list(APPEND REXGLUE_INSTALL_TARGETS
