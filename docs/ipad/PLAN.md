@@ -132,13 +132,23 @@ planejamento (2026-08-03).
 
 ## Problemas conhecidos
 
-- **Stall GENOPRESENT perto do fim da Dam** (2026-08-03, iPad): pipeline de
-  apresentação trava com critical section guest em owner-mismatch
-  (`leave_mismatches`, `guest-owner-mismatch` no ledger). É a classe de bug
-  que o upstream instrumentou com o dump GENOPRESENT — provável instabilidade
-  do port experimental, não específica do iPad. Discriminador pendente:
-  reproduzir o mesmo trecho no macOS. Log completo salvo pelo Carlos
-  (`goldeneye 2.log`).
+- **Stall GENOPRESENT** (2026-08-03/04, iPad; 2 ocorrências): pipeline de
+  apresentação trava com `completed=4` congelado enquanto `target` cresce —
+  mesma assinatura nas duas (fim da Dam com owner-mismatch de critical
+  section; e level=33 precedido ~2 min antes por
+  `Failed to make 1 Metal vertex fetch range(s) resident`, i.e. falha de
+  alocação Metal sob pressão de memória — plausível agravante do
+  LiveContainer, que compartilha o orçamento de RAM). É a classe de bug que
+  o upstream instrumentou com o dump GENOPRESENT. Sintoma: mundo congelado,
+  menu/áudio vivos (threads de host e áudio não dependem do render guest).
+  Workaround: reabrir o app (saves persistem). Mitigação candidata:
+  instalação nativa via SideStore (entitlement increased-memory-limit já
+  embutido no ipa + sem overhead do LiveContainer). Discriminadores
+  pendentes: reproduzir no macOS; testar instalação nativa. Dados bons para
+  reportar ao upstream (logs `goldeneye 2.log` e `goldeneye.log` de
+  2026-08-04 no Downloads do Carlos).
+- Áudio continua tocando durante o stall e na janela antes da suspensão —
+  esperado (thread de áudio independe do render); não é bug separado.
 
 ## Riscos
 
