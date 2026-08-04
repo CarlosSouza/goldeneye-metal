@@ -206,6 +206,11 @@ int main(int argc, char** argv) {
     SDL_SetMainReady();
     // iPad defaults; explicit arguments and environment still win.
     setenv("REX_INPUT_BACKEND", "sdl", /*overwrite=*/0);
+    // Deeper audio queue than the desktop default (8 frames / ~43 ms): frame
+    // pacing on the tablet is less even, and each empty callback is an
+    // audible dropout. 16 frames = ~85 ms, still imperceptible for
+    // single-player latency.
+    setenv("REX_AUDIO_MAXQFRAMES", "16", /*overwrite=*/0);
 
     // Keep the runtime log next to the game data, readable from the Files
     // app; the default per-user Logs dir is invisible on device.
