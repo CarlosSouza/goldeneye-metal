@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <filesystem>
 #include <limits>
@@ -51,6 +52,12 @@ REXCVAR_DEFINE_STRING(controller_button_map, "", "Input/Controller",
       rex::input::controller::ButtonBindings bindings;
       return rex::input::controller::ParseButtonBindings(value, &bindings);
     });
+REXCVAR_DEFINE_BOOL(controller_gyro_aim, true, "Input/Controller",
+                    "Gyro aiming while the left trigger is held, on controllers with a gyro "
+                    "(DualShock 4, DualSense, Switch Pro)");
+REXCVAR_DEFINE_DOUBLE(controller_gyro_sensitivity, 1.0, "Input/Controller",
+                      "Gyro aim sensitivity (1.0 = 2 rad/s of rotation for full stick deflection)")
+    .range(0.1, 10.0);
 
 namespace rex::input::sdl {
 
@@ -385,6 +392,7 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   X_INPUT_GAMEPAD configured_gamepad = {};
   if (is_active) {
     configured_gamepad = ApplyControllerTuning(controller->state.gamepad);
+    ApplyGyroAim(*controller, configured_gamepad);
   }
 
   // Count changes in the guest-visible state, including hot-reloaded layouts
@@ -865,6 +873,16 @@ bool SDLInputDriver::OpenControllerLocked(SDL_JoystickID instance_id) {
       static_cast<int>(SDL_GetGamepadType(controller)), SDL_GetGamepadVendor(controller),
       SDL_GetGamepadProduct(controller));
 
+  if (SDL_GamepadHasSensor(controller, SDL_SENSOR_GYRO)) {
+    if (SDL_SetGamepadSensorEnabled(controller, SDL_SENSOR_GYRO, true)) {
+      REXLOG_INFO("SDL: gyro available on \"{}\" - gyro aim ready",
+                  SDL_GetGamepadName(controller));
+    } else {
+      REXLOG_WARN("SDL: could not enable gyro on \"{}\": {}", SDL_GetGamepadName(controller),
+                  SDL_GetError());
+    }
+  }
+
   int user_id = -1;
   // GoldenEye consumes player 1. Always fill slots from zero instead of
   // trusting a remembered host player index that may start at another slot.
@@ -977,6 +995,32 @@ void SDLInputDriver::RefreshControllerStateLocked(ControllerState& controller) {
     }
   }
   controller.state_changed = true;
+}
+
+void SDLInputDriver::ApplyGyroAim(const ControllerState& controller,
+                                  X_INPUT_GAMEPAD& gamepad) const {
+  if (!REXCVAR_GET(controller_gyro_aim) || !controller.sdl) {
+    return;
+  }
+  // Aim gate: the left trigger must be meaningfully held.
+  if (gamepad.left_trigger < 32) {
+    return;
+  }
+  float rate[3];  // rad/s, right-hand rule, controller held level (SDL convention)
+  if (!SDL_GetGamepadSensorData(controller.sdl, SDL_SENSOR_GYRO, rate, 3)) {
+    return;
+  }
+  // At sensitivity 1.0, 2 rad/s of controller rotation equals full stick
+  // deflection. Yaw (rotate left, +Y) looks left; pitch (tilt up, +X) looks up.
+  const double scale = REXCVAR_GET(controller_gyro_sensitivity) * (32767.0 / 2.0);
+  const double invert = REXCVAR_GET(controller_invert_y) ? -1.0 : 1.0;
+  auto inject = [](int32_t current, double add) {
+    return static_cast<int16_t>(
+        std::clamp<int32_t>(current + static_cast<int32_t>(std::lround(add)), INT16_MIN,
+                            INT16_MAX));
+  };
+  gamepad.thumb_rx = inject(int16_t(gamepad.thumb_rx), -double(rate[1]) * scale);
+  gamepad.thumb_ry = inject(int16_t(gamepad.thumb_ry), invert * double(rate[0]) * scale);
 }
 
 X_INPUT_GAMEPAD SDLInputDriver::ApplyControllerTuning(const X_INPUT_GAMEPAD& gamepad) const {

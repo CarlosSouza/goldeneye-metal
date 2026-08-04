@@ -97,6 +97,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OpenUnassignedControllersLocked();
   void RefreshControllerStateLocked(ControllerState& controller);
   X_INPUT_GAMEPAD ApplyControllerTuning(const X_INPUT_GAMEPAD& gamepad) const;
+  void ApplyGyroAim(const ControllerState& controller, X_INPUT_GAMEPAD& gamepad) const;
   X_RESULT SetRumbleLocked(ControllerState& controller, uint16_t left, uint16_t right,
                            uint32_t duration_ms, bool host_test);
   bool PumpControllerTopologyFromUIThread();
