@@ -1074,8 +1074,13 @@ void SDLInputDriver::ApplyGyroAim(ControllerState& controller, X_INPUT_GAMEPAD& 
   if (!REXCVAR_GET(controller_gyro_aim) || !controller.sdl) {
     return;
   }
-  // Aim gate: the left trigger must be meaningfully held.
-  if (gamepad.left_trigger < 32) {
+  // Aim gate: GoldenEye's modern layout aims with the left trigger or the
+  // left shoulder - either engages the gyro. Checked post-tuning, so custom
+  // remaps see the guest-visible controls.
+  const bool aiming =
+      gamepad.left_trigger >= 32 ||
+      (static_cast<uint16_t>(gamepad.buttons) & X_INPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+  if (!aiming) {
     controller.gyro_aiming = false;
     controller.gyro_yaw_angle = 0.0;
     controller.gyro_pitch_angle = 0.0;
