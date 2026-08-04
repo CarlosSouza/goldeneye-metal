@@ -30,6 +30,7 @@
 #include <vector>
 
 #include <rex/audio/sdl/sdl_audio_driver.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/input/ios_touch_gamepad.h>
 #include <rex/logging.h>
@@ -136,6 +137,18 @@ std::vector<std::string> g_positional_arguments;
   if (app_) {
     app_->OnEnterBackground();
   }
+}
+
+- (void)applicationDidEnterBackground:(UIApplication*)application {
+  (void)application;
+  // The process is about to be frozen while host clocks keep running; stop
+  // guest-visible time so the game's hang watchdogs never see the gap.
+  rex::chrono::Clock::BeginHostSuspend();
+}
+
+- (void)applicationWillEnterForeground:(UIApplication*)application {
+  (void)application;
+  rex::chrono::Clock::EndHostSuspend();
 }
 
 - (void)applicationDidBecomeActive:(UIApplication*)application {

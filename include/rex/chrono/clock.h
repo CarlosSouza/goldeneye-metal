@@ -51,6 +51,15 @@ class Clock {
   // Queries the milliseconds since the host began.
   static uint64_t QueryHostUptimeMillis();
 
+  // Mobile process suspension: host clocks keep advancing while every thread
+  // is frozen, so on resume the guest would observe a huge time jump with no
+  // GPU/CPU progress and its hang watchdogs fire (GoldenEye enters an
+  // unrecoverable GPU-reset loop). Freezing the guest-visible clock across
+  // the suspension makes it invisible: time stops at Begin and continues
+  // from the same value after End - continuous and monotonic.
+  static void BeginHostSuspend();
+  static void EndHostSuspend();
+
   // Guest time scalar.
   static double guest_time_scalar();
   // Sets the guest time scalar, adjusting tick and wall clock speed.

@@ -79,8 +79,28 @@ void RecomputeGuestTickScalar() {
 // on other threads; worse at higher fps because the spin hammers harder). Removing
 // the lock removes the failure mode entirely -- there is no holder to stall.
 // 128-bit intermediate avoids overflow and integer-division truncation.
+// Guest-visible time freezing across mobile process suspension (see
+// Clock::BeginHostSuspend). While frozen_at is nonzero the guest clock reads
+// a constant; the accumulated offset keeps it continuous afterwards.
+std::atomic<uint64_t> suspend_frozen_at_ticks_{0};
+std::atomic<uint64_t> suspend_offset_ticks_{0};
+std::atomic<uint64_t> suspend_frozen_at_system_time_{0};
+std::atomic<uint64_t> suspend_offset_system_time_{0};
+
+uint64_t EffectiveHostTickCount() {
+  const uint64_t frozen_at = suspend_frozen_at_ticks_.load(std::memory_order_acquire);
+  const uint64_t now = frozen_at ? frozen_at : Clock::QueryHostTickCount();
+  return now - suspend_offset_ticks_.load(std::memory_order_relaxed);
+}
+
+uint64_t EffectiveHostSystemTime() {
+  const uint64_t frozen_at = suspend_frozen_at_system_time_.load(std::memory_order_acquire);
+  const uint64_t now = frozen_at ? frozen_at : Clock::QueryHostSystemTime();
+  return now - suspend_offset_system_time_.load(std::memory_order_relaxed);
+}
+
 uint64_t UpdateGuestClock() {
-  uint64_t host_tick_count = Clock::QueryHostTickCount();
+  uint64_t host_tick_count = EffectiveHostTickCount();
   // guest_tick_ratio_ is (re)computed at startup / on a scalar change; a racy copy
   // here is benign (worst case: one tick read straddles a rare ratio change). The
   // ratio is reduced (small numerator), so host_tick_count * first does not
@@ -92,7 +112,7 @@ uint64_t UpdateGuestClock() {
 // Offset of the current guest system file time relative to the guest base time.
 inline uint64_t QueryGuestSystemTimeOffset() {
   if (REXCVAR_GET(clock_no_scaling)) {
-    return Clock::QueryHostSystemTime() - guest_system_time_base_;
+    return EffectiveHostSystemTime() - guest_system_time_base_;
   }
 
   auto guest_tick_count = UpdateGuestClock();
@@ -161,9 +181,31 @@ uint64_t Clock::QueryGuestTickCount() {
   return guest_tick_count;
 }
 
+void Clock::BeginHostSuspend() {
+  // Freeze order: system time first, ticks last - readers between the two
+  // stores see at worst one source frozen a moment earlier.
+  suspend_frozen_at_system_time_.store(QueryHostSystemTime(), std::memory_order_release);
+  suspend_frozen_at_ticks_.store(QueryHostTickCount(), std::memory_order_release);
+}
+
+void Clock::EndHostSuspend() {
+  const uint64_t frozen_ticks = suspend_frozen_at_ticks_.load(std::memory_order_acquire);
+  if (frozen_ticks) {
+    suspend_offset_ticks_.fetch_add(QueryHostTickCount() - frozen_ticks,
+                                    std::memory_order_relaxed);
+    suspend_frozen_at_ticks_.store(0, std::memory_order_release);
+  }
+  const uint64_t frozen_time = suspend_frozen_at_system_time_.load(std::memory_order_acquire);
+  if (frozen_time) {
+    suspend_offset_system_time_.fetch_add(QueryHostSystemTime() - frozen_time,
+                                          std::memory_order_relaxed);
+    suspend_frozen_at_system_time_.store(0, std::memory_order_release);
+  }
+}
+
 uint64_t Clock::QueryGuestSystemTime() {
   if (REXCVAR_GET(clock_no_scaling)) {
-    return Clock::QueryHostSystemTime();
+    return EffectiveHostSystemTime();
   }
 
   auto guest_system_time_offset = QueryGuestSystemTimeOffset();
