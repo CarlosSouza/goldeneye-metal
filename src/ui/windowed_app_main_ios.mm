@@ -165,6 +165,16 @@ int main(int argc, char** argv) {
     // iPad defaults; explicit arguments and environment still win.
     setenv("REX_INPUT_BACKEND", "sdl", /*overwrite=*/0);
 
+    // Keep the runtime log next to the game data, readable from the Files
+    // app; the default per-user Logs dir is invisible on device.
+    NSArray<NSString*>* doc_paths =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString* documents = [doc_paths firstObject];
+    if (documents) {
+      NSString* log_path = [documents stringByAppendingPathComponent:@"goldeneye.log"];
+      setenv("REX_LOG_FILE", [log_path fileSystemRepresentation], /*overwrite=*/0);
+    }
+
     std::vector<char*> args(argv, argv + argc);
     std::string game_data_flag = "--game_data_root";
     bool has_game_data_root = false;
