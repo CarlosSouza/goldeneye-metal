@@ -31,6 +31,25 @@
 
 namespace {
 
+// Boot breadcrumbs into Documents/goldeneye-boot.txt: cheap, file-based and
+// readable from the Files app, so early aborts can be located on-device even
+// where stderr is invisible (LiveContainer, detached launches).
+void BootMark(const char* stage) {
+  NSArray<NSString*>* paths =
+      NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+  NSString* documents = [paths firstObject];
+  if (!documents) {
+    return;
+  }
+  NSString* path = [documents stringByAppendingPathComponent:@"goldeneye-boot.txt"];
+  FILE* f = fopen([path fileSystemRepresentation], "a");
+  if (f) {
+    fprintf(f, "%s\n", stage);
+    fclose(f);
+  }
+  NSLog(@"[goldeneye-boot] %s", stage);
+}
+
 class IOSWindowedAppContext final : public rex::ui::WindowedAppContext {
  private:
   void NotifyUILoopOfPendingFunctions() override {
@@ -66,8 +85,10 @@ std::vector<std::string> g_positional_arguments;
   (void)application;
   (void)launchOptions;
 
+  BootMark("didFinishLaunching");
   app_context_ = std::make_unique<IOSWindowedAppContext>();
   app_ = rex::ui::GetWindowedAppCreator()(*app_context_);
+  BootMark("app created");
 
   const auto& option_names = app_->GetPositionalOptions();
   std::map<std::string, std::string> parsed;
@@ -78,8 +99,10 @@ std::vector<std::string> g_positional_arguments;
   app_->SetParsedArguments(std::move(parsed));
 
   if (!app_->OnInitialize()) {
+    BootMark("OnInitialize FAILED");
     std::_Exit(EXIT_FAILURE);
   }
+  BootMark("OnInitialize ok");
 
   // Safety net alongside NotifyUILoopOfPendingFunctions: matches the 1 ms
   // cadence of the macOS manual loop.
@@ -138,6 +161,7 @@ std::string DefaultGameDataRoot() {
 
 int main(int argc, char** argv) {
   @autoreleasepool {
+    BootMark("main");
     // iPad defaults; explicit arguments and environment still win.
     setenv("REX_INPUT_BACKEND", "sdl", /*overwrite=*/0);
 
@@ -165,6 +189,7 @@ int main(int argc, char** argv) {
     rex::InitLoggingEarly();
     g_positional_arguments.assign(remaining.begin(), remaining.end());
 
+    BootMark("pre UIApplicationMain");
     return UIApplicationMain(argc, argv, nil, @"RexIOSAppDelegate");
   }
 }

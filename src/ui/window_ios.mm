@@ -91,6 +91,16 @@ class IOSWindow final : public Window {
     UIScreen* screen = [UIScreen mainScreen];
     ui_window_ = [[UIWindow alloc] initWithFrame:[screen bounds]];
 
+    // Inside a scene-based host process (e.g. LiveContainer) a window that is
+    // not attached to a UIWindowScene never becomes visible. Standalone, this
+    // app uses the delegate lifecycle and has no connected scenes - harmless.
+    for (UIScene* scene in [[UIApplication sharedApplication] connectedScenes]) {
+      if ([scene isKindOfClass:[UIWindowScene class]]) {
+        [ui_window_ setWindowScene:(UIWindowScene*)scene];
+        break;
+      }
+    }
+
     RexIOSMetalView* view = [[RexIOSMetalView alloc] initWithFrame:[screen bounds] owner:this];
     metal_layer_ = (CAMetalLayer*)[view layer];
     [metal_layer_ retain];
