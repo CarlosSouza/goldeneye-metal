@@ -83,6 +83,34 @@ planejamento (2026-08-03).
      SideStore, AirDropar a pasta `Game Data` (de
      `~/Library/Application Support/GoldenEye Metal/`) para "On My iPad →
      GoldenEye" via Files, e abrir o app.
+   - Rota alternativa (2026-08-03, slots do SideStore lotados): instalar
+     dentro do **LiveContainer** — viável neste port (AOT sem JIT, ~0,5–1 GB,
+     um único dylib embutido; os motivos de evitá-lo no GeneralsX não se
+     aplicam). Game data vai em `LiveContainer → Data/Application/GoldenEye/
+     Documents/Game Data`. Riscos a observar: conflito de handlers de
+     SIGSEGV (MMIO) e resolução de `@executable_path/Frameworks` pelo
+     LiveContainer. Plano B: liberar um slot do SideStore.
+   - ✅ **2026-08-03: JOGO RODANDO NO IPAD** (A17 Pro, via LiveContainer).
+     Cadeia de correções do bring-up, na ordem em que o device revelou:
+     1. `UIWindow` sem `windowScene` é invisível em host scene-based →
+        attach à scene conectada (tela preta);
+     2. shm de 4,5 GB não existe no iOS → Mach named memory entry +
+        `vm_map` views (o SDK do iOS esconde `mach_vm_*`; usar `vm_*`);
+     3. bases potência-de-dois todas ocupadas no VA do LiveContainer →
+        fallback com bloco escolhido pelo kernel (tradução é aritmética
+        de base, funciona em base arbitrária);
+     4. SDL no iOS exige `SDL_SetMainReady()` com main() próprio (áudio
+        e gamepad falhavam com "Application didn't initialize properly").
+     Ferramentas de debug no device: `Documents/goldeneye-boot.txt`
+     (breadcrumbs) e `Documents/goldeneye.log` (`REX_LOG_FILE`).
+6. **Qualidade de vida** (pós-bring-up):
+   - ✅ Gyro aim segurando LT (controles com giroscópio): cvars
+     `controller_gyro_aim` (default on) e `controller_gyro_sensitivity`
+     (1.0 = 2 rad/s para deflexão máxima); vertical segue
+     `controller_invert_y`. Sinais dos eixos não testados no device ainda.
+   - Host Settings no iPad: **segurar L3+R3 por ~0,75 s** (já upstream),
+     navegável por controle. Config persiste no `ge.toml` (editável via
+     Files, dentro do container do app no LiveContainer).
 
 ## Riscos
 
