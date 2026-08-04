@@ -10,7 +10,9 @@
  */
 
 #include <rex/platform.h>
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+// Apple platforms use fiber_asm.cpp (ucontext is deprecated on macOS and
+// absent from the iOS SDK).
+#if REX_PLATFORM_LINUX
 
 #include <rex/thread/fiber.h>
 
@@ -75,4 +77,4 @@ void Fiber::Destroy() {
 
 }  // namespace rex::thread
 
-#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#endif  // REX_PLATFORM_LINUX

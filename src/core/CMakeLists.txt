@@ -46,6 +46,17 @@ if(WIN32)
         threading_win.cpp
     )
 elseif(UNIX)
+    if(APPLE)
+        # ucontext is deprecated on macOS and absent from the iOS SDK; Apple
+        # builds switch fibers via an arm64 asm swap (docs/ipad/adr/0001).
+        enable_language(ASM)
+        target_sources(rexcore PRIVATE
+            fiber_asm.cpp
+            fiber_asm_arm64.S
+        )
+    else()
+        target_sources(rexcore PRIVATE fiber_posix.cpp)
+    endif()
     target_sources(rexcore PRIVATE
         atomic_posix.cpp
         clock_posix.cpp
@@ -53,7 +64,6 @@ elseif(UNIX)
         dynlib_posix.cpp
         exception_handler_posix.cpp
         filesystem_posix.cpp
-        fiber_posix.cpp
         mapped_memory_posix.cpp
         math_gcc.cpp
         memory_posix.cpp

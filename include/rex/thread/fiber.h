@@ -14,10 +14,12 @@
 #include <rex/platform.h>
 #include <cstddef>
 
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
-#if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
-#define _XOPEN_SOURCE 700
-#endif
+#if REX_PLATFORM_MAC
+// Apple: hand-rolled arm64 context switch (fiber_asm_arm64.S). ucontext is
+// deprecated on macOS and absent from the iOS SDK — see docs/ipad/adr/0001.
+#include <cstdint>
+#include <vector>
+#elif REX_PLATFORM_LINUX
 #include <ucontext.h>
 #include <cstdint>
 #include <vector>
@@ -54,7 +56,15 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#elif REX_PLATFORM_MAC
+  // Saved stack pointer of the suspended fiber; the register frame lives on
+  // the fiber's own stack (see rex_fiber_swap in fiber_asm_arm64.S).
+  void* sp_ = nullptr;
+  std::vector<uint8_t> stack_;
+  void (*entry_)(void*) = nullptr;
+  void* arg_ = nullptr;
+  bool is_thread_fiber_ = false;
+#elif REX_PLATFORM_LINUX
   ucontext_t context_{};
   std::vector<uint8_t> stack_;
   void (*entry_)(void*) = nullptr;
