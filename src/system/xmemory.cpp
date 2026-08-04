@@ -161,6 +161,31 @@ bool Memory::Initialize() {
     }
   }
   if (!mapping_base_) {
+    // Every power-of-two base was occupied. A fragmented or size-limited
+    // address space (e.g. running inside a host process on iOS) may still
+    // have a contiguous run somewhere - let the kernel pick one and map the
+    // views inside it. Translation is pure base +/- offset, so any
+    // granularity-aligned base works.
+    constexpr uint64_t kMappingLength = 0x11FFFFFFFull;
+    const uintptr_t alignment = std::max<uintptr_t>(system_allocation_granularity_, 0x10000);
+    void* anywhere =
+        rex::memory::AllocFixed(nullptr, kMappingLength + alignment,
+                                rex::memory::AllocationType::kReserve,
+                                rex::memory::PageAccess::kNoAccess);
+    if (anywhere) {
+      auto aligned = reinterpret_cast<uint8_t*>(
+          (reinterpret_cast<uintptr_t>(anywhere) + alignment - 1) & ~(alignment - 1));
+      if (!MapViews(aligned)) {
+        mapping_base_ = aligned;
+        REXSYS_INFO("Guest address space mapped at kernel-chosen base {}",
+                    static_cast<void*>(aligned));
+      } else {
+        rex::memory::DeallocFixed(anywhere, kMappingLength + alignment,
+                                  rex::memory::DeallocationType::kRelease);
+      }
+    }
+  }
+  if (!mapping_base_) {
     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
     assert_always();
     return false;
