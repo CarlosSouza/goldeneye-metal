@@ -57,6 +57,10 @@ function(rexglue_configure_target target_name)
             target_sources(${target_name} PRIVATE
                 ${REXGLUE_SHARE_DIR}/windowed_app_main_ios.mm)
             target_link_libraries(${target_name} PRIVATE "-framework UIKit")
+            if(TARGET SDL3-static)
+                # The entry point calls SDL_SetMainReady (SDL_main.h).
+                target_link_libraries(${target_name} PRIVATE SDL3-static)
+            endif()
         else()
             target_sources(${target_name} PRIVATE
                 ${REXGLUE_SHARE_DIR}/windowed_app_main_macos.mm)

@@ -18,6 +18,11 @@
 
 #import <UIKit/UIKit.h>
 
+// SDL on iOS refuses SDL_Init unless the app either uses SDL_main or declares
+// its own entry point as ready (audio/gamepad drivers depend on this).
+#define SDL_MAIN_HANDLED
+#include <SDL3/SDL_main.h>
+
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -162,6 +167,7 @@ std::string DefaultGameDataRoot() {
 int main(int argc, char** argv) {
   @autoreleasepool {
     BootMark("main");
+    SDL_SetMainReady();
     // iPad defaults; explicit arguments and environment still win.
     setenv("REX_INPUT_BACKEND", "sdl", /*overwrite=*/0);
 
