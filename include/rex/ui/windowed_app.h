@@ -83,6 +83,11 @@ class WindowedApp {
   // invoking OnDestroy or C++ object destructors.
   virtual bool RequiresImmediateProcessExit() const { return false; }
 
+  // The platform is about to stop scheduling the app (mobile background /
+  // app switcher). Called on the UI thread; apps should reach a safe paused
+  // state, since the process may be suspended right after.
+  virtual void OnEnterBackground() {}
+
   // See OnDestroy for more info.
   void InvokeOnDestroy() {
     // For safety and convenience of referencing objects owned by the app in

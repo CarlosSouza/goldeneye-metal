@@ -123,6 +123,15 @@ std::vector<std::string> g_positional_arguments;
   return YES;
 }
 
+- (void)applicationWillResignActive:(UIApplication*)application {
+  (void)application;
+  // The process may be suspended right after backgrounding; park the game in
+  // its real paused state so it survives (and resumes from) the freeze.
+  if (app_) {
+    app_->OnEnterBackground();
+  }
+}
+
 - (void)applicationWillTerminate:(UIApplication*)application {
   (void)application;
   if (pending_functions_timer_) {

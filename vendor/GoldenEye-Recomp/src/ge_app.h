@@ -339,6 +339,15 @@ class GeApp : public rex::ReXApp {
 
   bool IsInputActive() const override { return !input_suppressed_.load(std::memory_order_acquire); }
 
+  // Mobile background/app-switcher: the process may be suspended right after
+  // this returns, so reach the real paused state (same one Host Settings
+  // uses) before that happens. No-op when the menu is already open.
+  void OnEnterBackground() override {
+    if (!menu_) {
+      TogglePauseMenu("Background");
+    }
+  }
+
   // ESC handler: open or close the menu. Active offline local gameplay uses
   // the retail title's own pause state while the host UI remains responsive.
   void TogglePauseMenu(const char* source) {

@@ -65,6 +65,12 @@ REXCVAR_DEFINE_DOUBLE(controller_gyro_sensitivity, 1.0, "Input/Controller",
                       "Gyro aim sensitivity. hold: 1.0 = ~14 degrees of tilt for full stick "
                       "deflection; rate: 1.0 = 2 rad/s for full deflection")
     .range(0.1, 10.0);
+REXCVAR_DEFINE_DOUBLE(controller_gyro_deadzone, 0.02, "Input/Controller",
+                      "Rotation rates below this (rad/s) are ignored, absorbing hand tremor "
+                      "and sensor drift while holding an aim")
+    .range(0.0, 0.5);
+REXCVAR_DEFINE_BOOL(controller_gyro_recenter_r3, true, "Input/Controller",
+                    "Clicking R3 while aiming re-centers the gyro hold offset");
 
 namespace rex::input::sdl {
 
@@ -1028,6 +1034,15 @@ void SDLInputDriver::ApplyGyroAim(ControllerState& controller, X_INPUT_GAMEPAD& 
     return;
   }
 
+  // Absorb hand tremor and sensor drift.
+  const float rate_deadzone = static_cast<float>(REXCVAR_GET(controller_gyro_deadzone));
+  if (std::abs(yaw_left) < rate_deadzone) {
+    yaw_left = 0.0f;
+  }
+  if (std::abs(pitch_up) < rate_deadzone) {
+    pitch_up = 0.0f;
+  }
+
   const double sensitivity = REXCVAR_GET(controller_gyro_sensitivity);
   const double invert = REXCVAR_GET(controller_invert_y) ? -1.0 : 1.0;
   auto inject = [](int32_t current, double add) {
@@ -1048,7 +1063,10 @@ void SDLInputDriver::ApplyGyroAim(ControllerState& controller, X_INPUT_GAMEPAD& 
     // aim mode maps stick deflection to crosshair position, so a held tilt
     // must produce a held deflection. ~14 degrees = full deflection at 1.0.
     const uint64_t now_ns = SDL_GetTicksNS();
-    if (!controller.gyro_aiming) {
+    const bool recenter =
+        REXCVAR_GET(controller_gyro_recenter_r3) &&
+        (static_cast<uint16_t>(gamepad.buttons) & X_INPUT_GAMEPAD_RIGHT_THUMB) != 0;
+    if (!controller.gyro_aiming || recenter) {
       controller.gyro_aiming = true;
       controller.gyro_yaw_angle = 0.0;
       controller.gyro_pitch_angle = 0.0;

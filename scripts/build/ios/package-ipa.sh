@@ -29,6 +29,8 @@ mkdir -p "$APP/Frameworks"
 
 cp "$BUILD_DIR/GoldenEye.app/GoldenEye" "$APP/GoldenEye"
 cp "$RUNTIME_DYLIB" "$APP/Frameworks/librexruntime.dylib"
+cp "$REPO_ROOT/resources/ios-icon/AppIcon60x60@2x.png" \
+   "$REPO_ROOT/resources/ios-icon/AppIcon76x76@2x.png" "$APP/"
 
 # The build-tree LC_RPATH points at the developer Mac; the bundle resolves
 # the runtime from Frameworks/ instead.
@@ -52,6 +54,22 @@ cat > "$APP/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>${APP_VERSION}</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>MinimumOSVersion</key><string>${MIN_OS}</string>
+    <key>CFBundleIcons</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array><string>AppIcon60x60</string><string>AppIcon76x76</string></array>
+        </dict>
+    </dict>
+    <key>CFBundleIcons~ipad</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array><string>AppIcon60x60</string><string>AppIcon76x76</string></array>
+        </dict>
+    </dict>
     <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
     <key>UILaunchScreen</key><dict/>
     <key>UIRequiresFullScreen</key><true/>
