@@ -12,6 +12,7 @@
 #include <rex/rex_app.h>
 
 #include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
 #include <rex/filesystem.h>
@@ -330,8 +331,16 @@ bool ReXApp::SetupEnvironment() {
     cache_dir = user_dir / "cache";
   }
 
+  std::filesystem::path config_dir = exe_dir;
+#if REX_PLATFORM_IOS
+  // The native app bundle is sealed read-only on iOS; keep the config with
+  // the rest of the per-user state so settings persist across launches.
+  if (!user_dir.empty()) {
+    config_dir = user_dir;
+  }
+#endif
   PathConfig path_config{game_dir, user_dir, update_dir, cache_dir,
-                         exe_dir / (std::string(GetName()) + ".toml")};
+                         config_dir / (std::string(GetName()) + ".toml")};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
