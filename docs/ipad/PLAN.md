@@ -116,6 +116,19 @@ planejamento (2026-08-03).
      `controller_gyro_mode=hold` (default): inclinação acumulada desde o
      início da mira vira offset do crosshair (o aim do GoldenEye mapeia
      deflexão→posição); `rate` mantém o estilo velocidade.
+   - ✅ Gyro polish: `controller_gyro_deadzone` (anti-tremor) e
+     `controller_gyro_recenter_r3` (R3 recentra durante a mira).
+   - ✅ Auto-pausa em background: `OnEnterBackground` (WindowedApp) →
+     GeApp abre a pausa real antes do iOS suspender o processo.
+   - ✅ Ícone do app (gerado por `scripts/build/ios/generate-icon.swift`,
+     PNGs em `resources/ios-icon/`).
+   - ✅ Gamepad touch (estilo MelonX): overlay UIKit → SDL virtual gamepad;
+     esconde quando controle físico conecta (GCController); o driver mantém
+     físicos nos slots baixos (`EnforceVirtualSlotOrderLocked` — virtual
+     nunca sombreia o P1). Toques fora dos controles viram mouse para o
+     ImGui (Host Settings navegável por toque). Não testado no device
+     ainda: posições dos controles são constantes em `ios_touch_gamepad.mm`,
+     fáceis de ajustar.
 
 ## Problemas conhecidos
 
