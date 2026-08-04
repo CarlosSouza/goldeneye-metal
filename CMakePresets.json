@@ -152,6 +152,7 @@
             "binaryDir": "${sourceDir}/out/build/${presetName}",
             "cacheVariables": {
                 "CMAKE_SYSTEM_NAME": "iOS",
+                "CMAKE_SYSTEM_PROCESSOR": "arm64",
                 "CMAKE_OSX_SYSROOT": "iphoneos",
                 "CMAKE_OSX_ARCHITECTURES": "arm64",
                 "CMAKE_OSX_DEPLOYMENT_TARGET": "16.0",

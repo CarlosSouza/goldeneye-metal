@@ -1,0 +1,172 @@
+/**
+ ******************************************************************************
+ * ReXGlue iOS/iPadOS windowed app entry point                                 *
+ ******************************************************************************
+ *
+ * UIApplicationMain owns the run loop on iOS, so unlike the macOS entry point
+ * there is no custom C++ main loop: the app delegate initializes the
+ * WindowedApp after launch and a repeating main-queue timer executes the
+ * context's pending cross-thread functions each tick.
+ *
+ * There is no native launcher on the iPad. Game data imported by the macOS
+ * launcher is dropped into the app's Documents folder (UIFileSharingEnabled)
+ * and --game_data_root defaults to it unless given explicitly.
+ */
+
+#include <rex/platform.h>
+#if REX_PLATFORM_IOS
+
+#import <UIKit/UIKit.h>
+
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+#include <rex/ui/windowed_app.h>
+#include <rex/ui/windowed_app_context.h>
+
+namespace {
+
+class IOSWindowedAppContext final : public rex::ui::WindowedAppContext {
+ private:
+  void NotifyUILoopOfPendingFunctions() override {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      ExecutePendingFunctionsFromUIThread();
+    });
+  }
+
+  void PlatformQuitFromUIThread() override {
+    // iOS apps have no orderly programmatic exit; the guest teardown path on
+    // Apple already ends at the process boundary (see the macOS entry point).
+    std::_Exit(EXIT_SUCCESS);
+  }
+};
+
+// Command-line remainder captured in main() before UIApplicationMain.
+std::vector<std::string> g_positional_arguments;
+
+}  // namespace
+
+@interface RexIOSAppDelegate : UIResponder <UIApplicationDelegate> {
+ @private
+  std::unique_ptr<IOSWindowedAppContext> app_context_;
+  std::unique_ptr<rex::ui::WindowedApp> app_;
+  NSTimer* pending_functions_timer_;
+}
+@end
+
+@implementation RexIOSAppDelegate
+
+- (BOOL)application:(UIApplication*)application
+    didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
+  (void)application;
+  (void)launchOptions;
+
+  app_context_ = std::make_unique<IOSWindowedAppContext>();
+  app_ = rex::ui::GetWindowedAppCreator()(*app_context_);
+
+  const auto& option_names = app_->GetPositionalOptions();
+  std::map<std::string, std::string> parsed;
+  size_t count = std::min(g_positional_arguments.size(), option_names.size());
+  for (size_t i = 0; i < count; ++i) {
+    parsed[option_names[i]] = g_positional_arguments[i];
+  }
+  app_->SetParsedArguments(std::move(parsed));
+
+  if (!app_->OnInitialize()) {
+    std::_Exit(EXIT_FAILURE);
+  }
+
+  // Safety net alongside NotifyUILoopOfPendingFunctions: matches the 1 ms
+  // cadence of the macOS manual loop.
+  pending_functions_timer_ =
+      [NSTimer scheduledTimerWithTimeInterval:0.001
+                                      repeats:YES
+                                        block:^(NSTimer* timer) {
+                                          (void)timer;
+                                          if (app_context_) {
+                                            app_context_->ExecutePendingFunctionsFromUIThread();
+                                          }
+                                        }];
+  return YES;
+}
+
+- (void)applicationWillTerminate:(UIApplication*)application {
+  (void)application;
+  if (pending_functions_timer_) {
+    [pending_functions_timer_ invalidate];
+    pending_functions_timer_ = nil;
+  }
+  if (app_) {
+    app_->InvokeOnDestroy();
+    app_.reset();
+  }
+  rex::ShutdownLogging();
+}
+
+@end
+
+namespace {
+
+std::string DefaultGameDataRoot() {
+  NSArray<NSString*>* paths =
+      NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+  NSString* documents = [paths firstObject];
+  if (!documents) {
+    return {};
+  }
+  // Accept both the macOS launcher's folder name and a space-less variant.
+  NSFileManager* fm = [NSFileManager defaultManager];
+  for (NSString* candidate in @[ @"Game Data", @"GameData" ]) {
+    NSString* path = [documents stringByAppendingPathComponent:candidate];
+    BOOL is_directory = NO;
+    if ([fm fileExistsAtPath:path isDirectory:&is_directory] && is_directory) {
+      return std::string([path UTF8String]);
+    }
+  }
+  // Nothing imported yet: report the canonical location so the runtime's
+  // error mentions where to drop the data.
+  return std::string(
+      [[documents stringByAppendingPathComponent:@"Game Data"] UTF8String]);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  @autoreleasepool {
+    // iPad defaults; explicit arguments and environment still win.
+    setenv("REX_INPUT_BACKEND", "sdl", /*overwrite=*/0);
+
+    std::vector<char*> args(argv, argv + argc);
+    std::string game_data_flag = "--game_data_root";
+    bool has_game_data_root = false;
+    for (int i = 1; i < argc; ++i) {
+      if (game_data_flag == argv[i] ||
+          std::string(argv[i]).rfind(game_data_flag + "=", 0) == 0) {
+        has_game_data_root = true;
+        break;
+      }
+    }
+    std::string default_root;
+    if (!has_game_data_root) {
+      default_root = DefaultGameDataRoot();
+      if (!default_root.empty()) {
+        args.push_back(game_data_flag.data());
+        args.push_back(default_root.data());
+      }
+    }
+
+    auto remaining = rex::cvar::Init(static_cast<int>(args.size()), args.data());
+    rex::cvar::ApplyEnvironment();
+    rex::InitLoggingEarly();
+    g_positional_arguments.assign(remaining.begin(), remaining.end());
+
+    return UIApplicationMain(argc, argv, nil, @"RexIOSAppDelegate");
+  }
+}
+
+#endif  // REX_PLATFORM_IOS

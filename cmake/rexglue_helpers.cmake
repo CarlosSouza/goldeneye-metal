@@ -53,8 +53,13 @@ function(rexglue_configure_target target_name)
             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
     elseif(APPLE)
         enable_language(OBJCXX)
-        target_sources(${target_name} PRIVATE
-            ${REXGLUE_SHARE_DIR}/windowed_app_main_macos.mm)
+        if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+            target_sources(${target_name} PRIVATE
+                ${REXGLUE_SHARE_DIR}/windowed_app_main_ios.mm)
+        else()
+            target_sources(${target_name} PRIVATE
+                ${REXGLUE_SHARE_DIR}/windowed_app_main_macos.mm)
+        endif()
     else()
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_posix.cpp)

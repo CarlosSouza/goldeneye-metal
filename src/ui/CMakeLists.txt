@@ -72,10 +72,19 @@ if(WIN32)
         windowed_app_context_win.cpp
     )
 elseif(APPLE)
-    set(REXUI_PLATFORM_SOURCES
-        surface_macos.mm
-        window_macos.mm
-    )
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        # The CAMetalLayer surface is platform-neutral across Apple targets;
+        # only the window/event layer differs (UIKit vs AppKit).
+        set(REXUI_PLATFORM_SOURCES
+            surface_macos.mm
+            window_ios.mm
+        )
+    else()
+        set(REXUI_PLATFORM_SOURCES
+            surface_macos.mm
+            window_macos.mm
+        )
+    endif()
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
@@ -156,12 +165,21 @@ if(WIN32)
         Shcore
     )
 elseif(APPLE)
-    target_link_libraries(rexui PUBLIC
-        "-framework Cocoa"
-        "-framework CoreGraphics"
-        "-framework Metal"
-        "-framework QuartzCore"
-    )
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        target_link_libraries(rexui PUBLIC
+            "-framework UIKit"
+            "-framework CoreGraphics"
+            "-framework Metal"
+            "-framework QuartzCore"
+        )
+    else()
+        target_link_libraries(rexui PUBLIC
+            "-framework Cocoa"
+            "-framework CoreGraphics"
+            "-framework Metal"
+            "-framework QuartzCore"
+        )
+    endif()
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
@@ -182,7 +200,10 @@ if(REXGLUE_USE_METAL)
     target_link_libraries(rexui PUBLIC
         "-framework MetalFX"
     )
+endif()
 
+# Host-only shader verification executables (not buildable as iOS bundles).
+if(REXGLUE_USE_METAL AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # MetalPresenter compiles its final presentation shader at runtime. Build
     # a small executable that compiles the exact same source so CI and release
     # verification catch FXAA / color-grade shader errors before launch.

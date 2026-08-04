@@ -276,6 +276,11 @@ endif()
 
 add_subdirectory(sdl3)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # SDL.c references UIKit helpers that live in the (disabled) video driver.
+    target_sources(SDL3-static PRIVATE sdl3-ios-shim/SDL_uikit_stubs.m)
+endif()
+
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
 #=============================================================================

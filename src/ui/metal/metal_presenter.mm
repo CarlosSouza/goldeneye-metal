@@ -6,6 +6,7 @@
 
 #include <rex/cvar.h>
 #include <rex/chrono/clock.h>
+#include <rex/platform.h>
 #include <rex/graphics/flags.h>
 #include <rex/logging.h>
 #include <rex/perf/metal_performance.h>
@@ -898,8 +899,14 @@ MetalPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
   // Match the cross-backend GPU vsync setting. CAMetalLayer defaults to
   // display-synchronized presentation, which silently quantized a 35-55 FPS
   // native Metal workload down to 30 FPS even when GPU vsync was disabled.
+#if REX_PLATFORM_IOS
+  // displaySyncEnabled is macOS-only; iOS presentation is always
+  // display-synchronized.
+  const bool vsync_enabled = true;
+#else
   const bool vsync_enabled = REXCVAR_GET(vsync);
   [layer setDisplaySyncEnabled:vsync_enabled ? YES : NO];
+#endif
   REXLOG_INFO("MetalPresenter: display synchronization {}",
               vsync_enabled ? "enabled" : "disabled");
 
