@@ -142,6 +142,31 @@
             "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
         },
         {
+            "name": "ios-arm64-release",
+            "displayName": "iOS/iPadOS arm64 Release",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_SYSTEM_NAME": "iOS",
+                "CMAKE_SYSTEM_PROCESSOR": "arm64",
+                "CMAKE_OSX_SYSROOT": "iphoneos",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "16.0",
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_FIND_ROOT_PATH": "${sourceDir}/../../out/ios-deps/spirv-cross",
+                "REXGLUE_BUILD_TESTS": "OFF",
+                "REXGLUE_ENABLE_TRACY": "OFF",
+                "REXGLUE_USE_METAL": "ON",
+                "REXGLUE_USE_VULKAN": "OFF",
+                "REXSDK_DIR": "${sourceDir}/../.."
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
             "name": "win-arm64-debug",
             "displayName": "Windows ARM64 Debug",
             "inherits": "windows-arm64-base",

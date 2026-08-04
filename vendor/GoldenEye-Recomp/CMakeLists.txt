@@ -39,12 +39,14 @@ set(GE_SOURCES
     src/ge_ce_patches.cpp
 )
 
-if(APPLE)
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(APPEND GE_SOURCES
         src/ge_launch_recovery.cpp
         src/ge_launcher_macos.mm
     )
 else()
+    # iOS is launcherless: game data is imported on the Mac and dropped into
+    # the app's Documents folder (see windowed_app_main_ios.mm).
     list(APPEND GE_SOURCES src/ge_launcher_stub.cpp)
 endif()
 
