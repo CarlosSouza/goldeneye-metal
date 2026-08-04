@@ -1300,14 +1300,15 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
 
       ImGui::Spacing();
       bool gyro_aim = GetCvarB("controller_gyro_aim");
-      if (ImGui::Checkbox("Gyro Aim (hold LT)", &gyro_aim)) {
+      if (ImGui::Checkbox("Gyro Aim (hold LT or LB)", &gyro_aim)) {
         SetCvarB("controller_gyro_aim", gyro_aim);
         if (callbacks_.persist_config)
           callbacks_.persist_config();
       }
       TextWrappedColored(kInkDim,
                          "Aims with the controller's gyro - or the device's own motion sensor "
-                         "on grip controllers - while the left trigger is held. R3 re-centers.");
+                         "on grip controllers - while aiming (left trigger or left shoulder "
+                         "held). R3 re-centers.");
       ImGui::BeginDisabled(!gyro_aim);
       float gyro_sensitivity = GetCvarF("controller_gyro_sensitivity");
       if (ImGui::SliderFloat("Gyro Sensitivity", &gyro_sensitivity, 0.1f, 10.0f, "%.2f",
