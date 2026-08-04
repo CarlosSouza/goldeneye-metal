@@ -76,6 +76,46 @@ class IOSWindowedAppContext final : public rex::ui::WindowedAppContext {
 // Command-line remainder captured in main() before UIApplicationMain.
 std::vector<std::string> g_positional_arguments;
 
+std::string DefaultGameDataRoot() {
+  NSArray<NSString*>* paths =
+      NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+  NSString* documents = [paths firstObject];
+  if (!documents) {
+    return {};
+  }
+  // Accept both the macOS launcher's folder name and a space-less variant.
+  NSFileManager* fm = [NSFileManager defaultManager];
+  for (NSString* candidate in @[ @"Game Data", @"GameData" ]) {
+    NSString* path = [documents stringByAppendingPathComponent:candidate];
+    BOOL is_directory = NO;
+    if ([fm fileExistsAtPath:path isDirectory:&is_directory] && is_directory) {
+      return std::string([path UTF8String]);
+    }
+  }
+  // Nothing imported yet: report the canonical location so the setup screen
+  // and the runtime's error mention where to drop the data.
+  return std::string(
+      [[documents stringByAppendingPathComponent:@"Game Data"] UTF8String]);
+}
+
+// The boot is gated on this instead of letting the runtime abort: a fresh
+// native install has no game data yet, and exiting at launch looks like a
+// crash. default.xex is enough of a fingerprint for the gate; full
+// validation still happens in the runtime.
+bool GameDataPresent() {
+  const std::string root = DefaultGameDataRoot();
+  if (root.empty()) {
+    return false;
+  }
+  NSString* path = [NSString stringWithUTF8String:root.c_str()];
+  NSFileManager* fm = [NSFileManager defaultManager];
+  BOOL is_directory = NO;
+  if (![fm fileExistsAtPath:path isDirectory:&is_directory] || !is_directory) {
+    return false;
+  }
+  return [fm fileExistsAtPath:[path stringByAppendingPathComponent:@"default.xex"]];
+}
+
 }  // namespace
 
 @interface RexIOSAppDelegate : UIResponder <UIApplicationDelegate> {
@@ -83,6 +123,8 @@ std::vector<std::string> g_positional_arguments;
   std::unique_ptr<IOSWindowedAppContext> app_context_;
   std::unique_ptr<rex::ui::WindowedApp> app_;
   NSTimer* pending_functions_timer_;
+  UIWindow* setup_window_;
+  UILabel* setup_status_label_;
 }
 @end
 
@@ -94,6 +136,16 @@ std::vector<std::string> g_positional_arguments;
   (void)launchOptions;
 
   BootMark("didFinishLaunching");
+  if (GameDataPresent()) {
+    [self bootGame];
+  } else {
+    BootMark("game data missing - setup screen");
+    [self showSetupScreen];
+  }
+  return YES;
+}
+
+- (void)bootGame {
   app_context_ = std::make_unique<IOSWindowedAppContext>();
   app_ = rex::ui::GetWindowedAppCreator()(*app_context_);
   BootMark("app created");
@@ -129,7 +181,95 @@ std::vector<std::string> g_positional_arguments;
                                             app_context_->ExecutePendingFunctionsFromUIThread();
                                           }
                                         }];
-  return YES;
+}
+
+// First-run screen shown instead of aborting when no game data has been
+// dropped into Documents yet. "Rescan" re-checks and boots in place, so the
+// folder can be copied in via Files split view without relaunching.
+- (void)showSetupScreen {
+  setup_window_ = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
+  for (UIScene* scene in [[UIApplication sharedApplication] connectedScenes]) {
+    if ([scene isKindOfClass:[UIWindowScene class]]) {
+      [setup_window_ setWindowScene:(UIWindowScene*)scene];
+      break;
+    }
+  }
+
+  UIViewController* controller = [[UIViewController alloc] init];
+  UIView* root = controller.view;
+  root.backgroundColor = [UIColor colorWithWhite:0.07 alpha:1.0];
+
+  UILabel* title = [[UILabel alloc] init];
+  title.text = @"Game data not found";
+  title.font = [UIFont boldSystemFontOfSize:28];
+  title.textColor = [UIColor whiteColor];
+  title.textAlignment = NSTextAlignmentCenter;
+
+  UILabel* body = [[UILabel alloc] init];
+  body.text = [NSString
+      stringWithFormat:
+          @"Import your legally owned game backup with the GoldenEye Metal launcher on a Mac, "
+          @"then copy the resulting “Game Data” folder (default.xex, files, music.xwb, "
+          @"sfx.xwb) into this app's Documents folder using the Files app:\n\n"
+          @"On My iPad ▸ GoldenEye ▸ Game Data\n\n"
+          @"You can keep this screen open, copy the folder in split view, and tap Rescan."];
+  body.font = [UIFont systemFontOfSize:17];
+  body.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
+  body.textAlignment = NSTextAlignmentCenter;
+  body.numberOfLines = 0;
+
+  setup_status_label_ = [[UILabel alloc] init];
+  setup_status_label_.text = @"";
+  setup_status_label_.font = [UIFont systemFontOfSize:15];
+  setup_status_label_.textColor = [UIColor colorWithRed:0.9 green:0.6 blue:0.3 alpha:1.0];
+  setup_status_label_.textAlignment = NSTextAlignmentCenter;
+  setup_status_label_.numberOfLines = 0;
+
+  UIButton* rescan = [UIButton buttonWithType:UIButtonTypeSystem];
+  [rescan setTitle:@"Rescan" forState:UIControlStateNormal];
+  rescan.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+  rescan.backgroundColor = [UIColor colorWithRed:0.83 green:0.68 blue:0.28 alpha:1.0];
+  [rescan setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+  rescan.layer.cornerRadius = 12;
+  [rescan addTarget:self
+                action:@selector(rescanTapped)
+      forControlEvents:UIControlEventTouchUpInside];
+
+  UIStackView* stack = [[UIStackView alloc]
+      initWithArrangedSubviews:@[ title, body, rescan, setup_status_label_ ]];
+  stack.axis = UILayoutConstraintAxisVertical;
+  stack.spacing = 24;
+  stack.alignment = UIStackViewAlignmentCenter;
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
+  [root addSubview:stack];
+  [NSLayoutConstraint activateConstraints:@[
+    [stack.centerXAnchor constraintEqualToAnchor:root.centerXAnchor],
+    [stack.centerYAnchor constraintEqualToAnchor:root.centerYAnchor],
+    [stack.widthAnchor constraintLessThanOrEqualToAnchor:root.widthAnchor multiplier:0.7],
+    [body.widthAnchor constraintLessThanOrEqualToConstant:560],
+    [rescan.widthAnchor constraintEqualToConstant:220],
+    [rescan.heightAnchor constraintEqualToConstant:52],
+  ]];
+
+  setup_window_.rootViewController = controller;
+  [controller release];
+  [title release];
+  [body release];
+  [setup_window_ makeKeyAndVisible];
+}
+
+- (void)rescanTapped {
+  if (!GameDataPresent()) {
+    setup_status_label_.text = [NSString
+        stringWithFormat:@"Still not found at:\n%s", DefaultGameDataRoot().c_str()];
+    return;
+  }
+  BootMark("rescan found game data");
+  [setup_window_ setHidden:YES];
+  [setup_window_ release];
+  setup_window_ = nil;
+  setup_status_label_ = nil;
+  [self bootGame];
 }
 
 - (void)applicationWillResignActive:(UIApplication*)application {
@@ -175,32 +315,6 @@ std::vector<std::string> g_positional_arguments;
 }
 
 @end
-
-namespace {
-
-std::string DefaultGameDataRoot() {
-  NSArray<NSString*>* paths =
-      NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-  NSString* documents = [paths firstObject];
-  if (!documents) {
-    return {};
-  }
-  // Accept both the macOS launcher's folder name and a space-less variant.
-  NSFileManager* fm = [NSFileManager defaultManager];
-  for (NSString* candidate in @[ @"Game Data", @"GameData" ]) {
-    NSString* path = [documents stringByAppendingPathComponent:candidate];
-    BOOL is_directory = NO;
-    if ([fm fileExistsAtPath:path isDirectory:&is_directory] && is_directory) {
-      return std::string([path UTF8String]);
-    }
-  }
-  // Nothing imported yet: report the canonical location so the runtime's
-  // error mentions where to drop the data.
-  return std::string(
-      [[documents stringByAppendingPathComponent:@"Game Data"] UTF8String]);
-}
-
-}  // namespace
 
 int main(int argc, char** argv) {
   @autoreleasepool {
