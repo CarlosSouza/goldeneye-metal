@@ -113,8 +113,10 @@ std::vector<std::string> g_positional_arguments;
   BootMark("OnInitialize ok");
 
   // On-screen controls when no physical controller is connected; the game
-  // window exists once OnInitialize returns.
-  rex::input::ios::InstallTouchGamepad();
+  // window exists once OnInitialize returns. The app pointer outlives the
+  // overlay (both live until process exit).
+  rex::ui::WindowedApp* app = app_.get();
+  rex::input::ios::InstallTouchGamepad([app] { app->OnHostMenuRequested(); });
 
   // Safety net alongside NotifyUILoopOfPendingFunctions: matches the 1 ms
   // cadence of the macOS manual loop.

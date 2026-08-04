@@ -88,6 +88,11 @@ class WindowedApp {
   // state, since the process may be suspended right after.
   virtual void OnEnterBackground() {}
 
+  // A platform affordance asked for the host settings/pause UI (touch
+  // overlay MENU button). Called on the UI thread, same as the Escape
+  // keybind path.
+  virtual void OnHostMenuRequested() {}
+
   // See OnDestroy for more info.
   void InvokeOnDestroy() {
     // For safety and convenience of referencing objects owned by the app in

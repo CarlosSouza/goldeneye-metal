@@ -87,19 +87,23 @@ UIBezierPath* TrianglePath(Icon icon, CGPoint c, CGFloat s) {
   SDL_Joystick* joystick_;
   std::vector<Control> controls_;
   NSMapTable<UITouch*, NSNumber*>* touch_to_control_;
+  std::function<void()> menu_callback_;
 }
-- (instancetype)initWithJoystick:(SDL_Joystick*)joystick;
+- (instancetype)initWithJoystick:(SDL_Joystick*)joystick
+                    menuCallback:(std::function<void()>)menuCallback;
 - (void)releaseAllInputs;
 @end
 
 @implementation RexTouchGamepadView
 
-- (instancetype)initWithJoystick:(SDL_Joystick*)joystick {
+- (instancetype)initWithJoystick:(SDL_Joystick*)joystick
+                    menuCallback:(std::function<void()>)menuCallback {
   self = [super initWithFrame:CGRectZero];
   if (!self) {
     return nil;
   }
   joystick_ = joystick;
+  menu_callback_ = std::move(menuCallback);
   // Manual retain: this codebase builds Objective-C++ without ARC.
   touch_to_control_ = [[NSMapTable weakToStrongObjectsMapTable] retain];
   self.multipleTouchEnabled = YES;
@@ -330,10 +334,11 @@ UIBezierPath* TrianglePath(Icon icon, CGPoint c, CGFloat s) {
           [UIColor colorWithWhite:1.0 alpha:down ? kFillPressedAlpha : kFillAlpha].CGColor;
       break;
     case ControlKind::kMenuChord:
-      // Host Settings opens after the runtime sees L3+R3 held ~0.75 s; keep
-      // both pressed for as long as the finger stays on the button.
-      SDL_SetJoystickVirtualButton(joystick_, SDL_GAMEPAD_BUTTON_LEFT_STICK, down);
-      SDL_SetJoystickVirtualButton(joystick_, SDL_GAMEPAD_BUTTON_RIGHT_STICK, down);
+      // Opens Host Settings immediately through the app hook - no L3+R3
+      // hold delay. Fires on press; release only restores the visual.
+      if (down && menu_callback_) {
+        menu_callback_();
+      }
       control.base.fillColor =
           [UIColor colorWithWhite:1.0 alpha:down ? kFillPressedAlpha : kFillAlpha].CGColor;
       break;
@@ -411,7 +416,7 @@ void UpdateOverlayVisibility() {
 
 }  // namespace
 
-void InstallTouchGamepad() {
+void InstallTouchGamepad(std::function<void()> menu_callback) {
   if (g_overlay) {
     return;
   }
@@ -453,7 +458,8 @@ void InstallTouchGamepad() {
   SDL_SetJoystickVirtualAxis(g_virtual_joystick, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_MIN_SINT16);
   SDL_SetJoystickVirtualAxis(g_virtual_joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, SDL_MIN_SINT16);
 
-  g_overlay = [[RexTouchGamepadView alloc] initWithJoystick:g_virtual_joystick];
+  g_overlay = [[RexTouchGamepadView alloc] initWithJoystick:g_virtual_joystick
+                                               menuCallback:std::move(menu_callback)];
   g_overlay.frame = window.bounds;
   g_overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
   [window addSubview:g_overlay];

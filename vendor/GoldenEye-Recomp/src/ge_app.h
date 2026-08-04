@@ -348,6 +348,8 @@ class GeApp : public rex::ReXApp {
     }
   }
 
+  void OnHostMenuRequested() override { TogglePauseMenu("Touch"); }
+
   // ESC handler: open or close the menu. Active offline local gameplay uses
   // the retail title's own pause state while the host UI remains responsive.
   void TogglePauseMenu(const char* source) {

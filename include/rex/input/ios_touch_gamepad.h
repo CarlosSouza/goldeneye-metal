@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include <rex/platform.h>
 
 namespace rex::input::ios {
@@ -18,9 +20,11 @@ namespace rex::input::ios {
 #if REX_PLATFORM_IOS
 /// Installs the overlay into the key window and attaches the SDL virtual
 /// gamepad. Must be called on the main thread after the game window exists.
-void InstallTouchGamepad();
+/// menu_callback runs on the main thread when the overlay's MENU button is
+/// tapped (opens the host settings UI without the L3+R3 hold delay).
+void InstallTouchGamepad(std::function<void()> menu_callback);
 #else
-inline void InstallTouchGamepad() {}
+inline void InstallTouchGamepad(std::function<void()>) {}
 #endif
 
 }  // namespace rex::input::ios
