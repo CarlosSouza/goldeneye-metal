@@ -46,12 +46,43 @@ planejamento (2026-08-03).
      `DYLD_LIBRARY_PATH="$PWD/out/macos-arm64" REX_INPUT_BACKEND=sdl REX_MNK_MODE=true ./vendor/GoldenEye-Recomp/out/build/macos-arm64-release/GoldenEye --game_data_root "$HOME/Library/Application Support/GoldenEye Metal/Game Data" --gpu metal`
 2. **Toolchain iOS** — preset CMake para iOS device arm64; fazer thirdparty
    (FFmpeg, SDL3, etc.) compilar; stub da camada de janela.
+   - ✅ 2026-08-03: SDK completo compilado e linkado para iOS
+     (`out/ios-arm64/`). Correções necessárias: gate do CLI rexglue (host
+     tool), `CMAKE_SYSTEM_PROCESSOR=arm64` no preset (senão FFmpeg NEON fica
+     de fora e o link falha — e o valor congela no primeiro configure, exige
+     build dir limpo), shim UIKit p/ SDL3 sem vídeo (`SDL_IsIPad`),
+     `displaySyncEnabled` é macOS-only, `REX_PLATFORM=ios-arm64` (senão
+     artefatos iOS sobrescrevem `out/macos-arm64` — aconteceu; restaurar com
+     rebuild macOS).
 3. **Portes de código** — fibers asm arm64 (ADR 0001); `window_ios.mm` +
    `windowed_app_main_ios.mm` (CAMetalLayer/UIKit); bootstrap sem launcher.
+   - ✅ Fibers asm: testes [fiber] passam; jogo macOS validado 3 min no mesmo
+     backend. Falhas pré-existentes de testes de memória neste macOS 26
+     (baseline sem mudanças falha igual).
+   - ✅ UIKit: window_ios.mm (CADisplayLink pump) + entry point
+     UIApplicationMain com game_data_root → Documents. Compilam e linkam;
+     validação real só no device.
 4. **Empacotamento** — ipa dev assetless via pipeline GeneralsX (`xattr -cr` +
    `zip -X`), instalar via SideStore.
+   - ✅ 2026-08-03: `GoldenEye-iPad.ipa` (11 MB) gerado por
+     `scripts/build/ios/package-ipa.sh` — dylib do runtime embutido em
+     Frameworks/, Info.plist com UIFileSharingEnabled + UILaunchScreen +
+     landscape-only, assinatura ad-hoc (SideStore re-assina na instalação).
+   - Rebuild completo iOS (referência):
+     `cmake --preset ios-arm64-release && cmake --build out/build/ios-arm64-release --parallel 4`,
+     depois `cmake -S vendor/GoldenEye-Recomp --preset ios-arm64-release &&
+     cmake --build vendor/GoldenEye-Recomp/out/build/ios-arm64-release --target ge --parallel 4`,
+     e `./scripts/build/ios/package-ipa.sh`.
+   - Atenção: `vendor/GoldenEye-Recomp/generated/rexglue.cmake` é regenerado
+     pelo codegen e carrega um guard local (`if(TARGET rex::rexglue)`); o
+     template do SDK já foi corrigido, mas se o codegen upstream rodar sem o
+     template novo, reaplicar o guard.
 5. **Dados + primeiro boot** — importar no Mac, AirDrop para Documents, bootar
    a Dam no iPad. Medir memória e FPS; decidir entitlement.
+   - Pendente (única fase que exige o iPad físico): instalar o ipa via
+     SideStore, AirDropar a pasta `Game Data` (de
+     `~/Library/Application Support/GoldenEye Metal/`) para "On My iPad →
+     GoldenEye" via Files, e abrir o app.
 
 ## Riscos
 
