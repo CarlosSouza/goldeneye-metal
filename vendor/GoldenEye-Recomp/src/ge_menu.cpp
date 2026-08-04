@@ -1298,6 +1298,38 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
           callbacks_.persist_config();
       }
 
+      ImGui::Spacing();
+      bool gyro_aim = GetCvarB("controller_gyro_aim");
+      if (ImGui::Checkbox("Gyro Aim (hold LT)", &gyro_aim)) {
+        SetCvarB("controller_gyro_aim", gyro_aim);
+        if (callbacks_.persist_config)
+          callbacks_.persist_config();
+      }
+      TextWrappedColored(kInkDim,
+                         "Aims with the controller's gyro - or the device's own motion sensor "
+                         "on grip controllers - while the left trigger is held. R3 re-centers.");
+      ImGui::BeginDisabled(!gyro_aim);
+      float gyro_sensitivity = GetCvarF("controller_gyro_sensitivity");
+      if (ImGui::SliderFloat("Gyro Sensitivity", &gyro_sensitivity, 0.1f, 10.0f, "%.2f",
+                             ImGuiSliderFlags_Logarithmic)) {
+        SetCvarF("controller_gyro_sensitivity", gyro_sensitivity);
+      }
+      if (ImGui::IsItemDeactivatedAfterEdit() && callbacks_.persist_config)
+        callbacks_.persist_config();
+      {
+        const bool gyro_hold = GetCvarS("controller_gyro_mode") != "rate";
+        int gyro_mode_index = gyro_hold ? 0 : 1;
+        static const char* kGyroModes[] = {"Hold (tilt = crosshair offset)",
+                                           "Rate (rotation = stick speed)"};
+        if (ImGui::Combo("Gyro Response", &gyro_mode_index, kGyroModes, 2)) {
+          SetCvarS("controller_gyro_mode", gyro_mode_index == 0 ? "hold" : "rate");
+          if (callbacks_.persist_config)
+            callbacks_.persist_config();
+        }
+      }
+      ImGui::EndDisabled();
+      ImGui::Spacing();
+
       bool rumble_enabled = GetCvarB(rex::input::kControllerRumbleEnabledCvar);
       if (ImGui::Checkbox("Controller Rumble", &rumble_enabled)) {
         SetCvarB(rex::input::kControllerRumbleEnabledCvar, rumble_enabled);
