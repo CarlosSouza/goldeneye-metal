@@ -100,6 +100,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
   bool OpenControllerLocked(SDL_JoystickID instance_id);
   void OpenUnassignedControllersLocked();
+  void SwapSlotsLocked(uint32_t first_user_index, uint32_t second_user_index);
+  void EnforceVirtualSlotOrderLocked();
   void RefreshControllerStateLocked(ControllerState& controller);
   X_INPUT_GAMEPAD ApplyControllerTuning(const X_INPUT_GAMEPAD& gamepad) const;
   void ApplyGyroAim(ControllerState& controller, X_INPUT_GAMEPAD& gamepad) const;

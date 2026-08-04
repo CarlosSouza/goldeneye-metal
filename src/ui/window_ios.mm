@@ -81,6 +81,34 @@ class IOSWindow final : public Window {
     }
   }
 
+  // Touches drive the host ImGui UI (Host Settings) as a left-button mouse.
+  // Coordinates arrive in drawable pixels. Guest input stays on SDL, so this
+  // never fights the game for control.
+  void HandleTouchDown(int32_t x, int32_t y) {
+    WindowDestructionReceiver destruction_receiver(this);
+    // Position first so the widget under the finger is hovered when the
+    // press arrives (ImGui processes queued events in order).
+    MouseEvent move_event(this, MouseEvent::Button::kNone, x, y);
+    OnMouseMove(move_event, destruction_receiver);
+    if (destruction_receiver.IsWindowDestroyedOrClosed()) {
+      return;
+    }
+    MouseEvent down_event(this, MouseEvent::Button::kLeft, x, y);
+    OnMouseDown(down_event, destruction_receiver);
+  }
+
+  void HandleTouchMove(int32_t x, int32_t y) {
+    WindowDestructionReceiver destruction_receiver(this);
+    MouseEvent move_event(this, MouseEvent::Button::kNone, x, y);
+    OnMouseMove(move_event, destruction_receiver);
+  }
+
+  void HandleTouchUp(int32_t x, int32_t y) {
+    WindowDestructionReceiver destruction_receiver(this);
+    MouseEvent up_event(this, MouseEvent::Button::kLeft, x, y);
+    OnMouseUp(up_event, destruction_receiver);
+  }
+
  protected:
   bool OpenImpl() override {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -235,6 +263,7 @@ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context, std::str
   if (self) {
     owner_ = owner;
     [self setContentScaleFactor:[[UIScreen mainScreen] scale]];
+    [self setMultipleTouchEnabled:NO];
   }
   return self;
 }
@@ -248,6 +277,37 @@ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context, std::str
   if (owner_) {
     owner_->HandleResize();
   }
+}
+
+- (CGPoint)pixelPositionOfTouch:(UITouch*)touch {
+  const CGPoint p = [touch locationInView:self];
+  const CGFloat scale = [self contentScaleFactor];
+  return CGPointMake(p.x * scale, p.y * scale);
+}
+
+- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+  if (owner_) {
+    const CGPoint p = [self pixelPositionOfTouch:[touches anyObject]];
+    owner_->HandleTouchDown(int32_t(p.x), int32_t(p.y));
+  }
+}
+
+- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+  if (owner_) {
+    const CGPoint p = [self pixelPositionOfTouch:[touches anyObject]];
+    owner_->HandleTouchMove(int32_t(p.x), int32_t(p.y));
+  }
+}
+
+- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+  if (owner_) {
+    const CGPoint p = [self pixelPositionOfTouch:[touches anyObject]];
+    owner_->HandleTouchUp(int32_t(p.x), int32_t(p.y));
+  }
+}
+
+- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
+  [self touchesEnded:touches withEvent:event];
 }
 
 @end

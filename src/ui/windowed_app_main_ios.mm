@@ -30,6 +30,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/input/ios_touch_gamepad.h>
 #include <rex/logging.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context.h>
@@ -108,6 +109,10 @@ std::vector<std::string> g_positional_arguments;
     std::_Exit(EXIT_FAILURE);
   }
   BootMark("OnInitialize ok");
+
+  // On-screen controls when no physical controller is connected; the game
+  // window exists once OnInitialize returns.
+  rex::input::ios::InstallTouchGamepad();
 
   // Safety net alongside NotifyUILoopOfPendingFunctions: matches the 1 ms
   // cadence of the macOS manual loop.

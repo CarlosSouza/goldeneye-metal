@@ -551,6 +551,57 @@ bool SDLInputDriver::PumpControllerTopologyFromUIThread() {
   return true;
 }
 
+void SDLInputDriver::SwapSlotsLocked(uint32_t first_user_index, uint32_t second_user_index) {
+  auto& first = controllers_.at(first_user_index);
+  auto& second = controllers_.at(second_user_index);
+  const uint32_t first_packet = static_cast<uint32_t>(first.state.packet_number);
+  const uint32_t second_packet = static_cast<uint32_t>(second.state.packet_number);
+  std::swap(first, second);
+  // Packet numbers belong to guest ports, not physical devices (see
+  // SwapControllerSlots).
+  first.state.packet_number = first_packet;
+  second.state.packet_number = second_packet;
+  first.configured_state_valid = false;
+  second.configured_state_valid = false;
+  for (uint32_t user_index : {first_user_index, second_user_index}) {
+    auto& keystroke = keystroke_states_.at(user_index);
+    keystroke.repeat_state = RepeatState::Idle;
+    keystroke.repeat_butt_idx = 0;
+    keystroke.repeat_time = 0;
+  }
+  if (first.sdl) {
+    SDL_SetGamepadPlayerIndex(first.sdl, static_cast<int>(first_user_index));
+  }
+  if (second.sdl) {
+    SDL_SetGamepadPlayerIndex(second.sdl, static_cast<int>(second_user_index));
+  }
+}
+
+void SDLInputDriver::EnforceVirtualSlotOrderLocked() {
+  // A virtual (touch overlay) gamepad must never shadow a physical
+  // controller's port: the guest consumes player 1 first. Stable-partition
+  // physical controllers into the lower slots; virtual ones follow.
+  auto is_virtual = [](const ControllerState& c) {
+    return c.sdl && SDL_IsJoystickVirtual(SDL_GetGamepadID(c.sdl));
+  };
+  bool swapped = true;
+  while (swapped) {
+    swapped = false;
+    for (uint32_t i = 0; i + 1 < controllers_.size(); ++i) {
+      auto& low = controllers_.at(i);
+      auto& high = controllers_.at(i + 1);
+      const bool low_yields = !low.sdl || is_virtual(low);
+      const bool high_physical = high.sdl && !is_virtual(high);
+      if (low_yields && high_physical) {
+        SwapSlotsLocked(i, i + 1);
+        REXLOG_INFO("SDL: physical controller promoted to player {} over virtual/empty slot",
+                    i + 1);
+        swapped = true;
+      }
+    }
+  }
+}
+
 X_RESULT SDLInputDriver::SwapControllerSlots(uint32_t first_user_index, uint32_t second_user_index,
                                              uint64_t expected_device_id) {
   if (first_user_index >= HID_SDL_USER_COUNT || second_user_index >= HID_SDL_USER_COUNT) {
@@ -861,6 +912,7 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
 
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   OpenControllerLocked(event.gdevice.which);
+  EnforceVirtualSlotOrderLocked();
 }
 
 bool SDLInputDriver::OpenControllerLocked(SDL_JoystickID instance_id) {
@@ -952,6 +1004,9 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
     // mid-match makes physical players take control of different characters.
     // A waiting or newly reconnected pad may claim only the vacated slot.
     OpenUnassignedControllersLocked();
+    // Exception: virtual (touch) pads yield to physical ones and may slide
+    // down into a vacated lower slot - they have no player identity to keep.
+    EnforceVirtualSlotOrderLocked();
   } else {
     REXLOG_DEBUG("SDL OnControllerDeviceRemoved: Ignored unused device.");
   }

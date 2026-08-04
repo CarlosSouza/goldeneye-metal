@@ -18,9 +18,14 @@ else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    # Device gyro for gyro aim with grip controllers (see ios_device_motion.h).
-    target_sources(rexinput PRIVATE ios_device_motion.mm)
-    target_link_libraries(rexinput PUBLIC "-framework CoreMotion")
+    # Device gyro for gyro aim with grip controllers (see ios_device_motion.h)
+    # and the on-screen touch gamepad overlay (see ios_touch_gamepad.h).
+    target_sources(rexinput PRIVATE ios_device_motion.mm ios_touch_gamepad.mm)
+    target_link_libraries(rexinput PUBLIC
+        "-framework CoreMotion"
+        "-framework GameController"
+        "-framework UIKit"
+    )
 endif()
 if(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
     target_sources(rexinput PRIVATE sdl/sdl_virtual_gamepad_harness.cpp)
