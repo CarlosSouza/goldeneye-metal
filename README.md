@@ -3,6 +3,71 @@
 GoldenEye 007 gameplay on macOS, recompiled for Apple Silicon and rendered directly with Apple
 Metal.
 
+> [!NOTE]
+> **This fork adds an experimental iPadOS port** — see [iPadOS Port](#ipados-port-this-fork)
+> below. The macOS version is unchanged and both targets build from the same source tree.
+
+## iPadOS Port (this fork)
+
+The `ipad-port` branch runs GoldenEye natively on iPad (tested on an A17 Pro iPad via
+LiveContainer). It is the same runtime as the macOS version — the ahead-of-time recompiled
+game code, Xenos-to-Metal graphics path, kernel and audio are all shared; only the platform
+layer differs, selected at build time by CMake:
+
+| Layer | macOS | iPadOS |
+| --- | --- | --- |
+| Window/presentation | AppKit (`window_macos.mm`) | UIKit + CAMetalLayer (`window_ios.mm`) |
+| Entry point | custom AppKit event loop | `UIApplicationMain` + CADisplayLink |
+| Guest memory (4.5 GB) | POSIX `shm_open` | Mach named memory entry + `vm_map` views |
+| Fibers | arm64 asm context switch (this fork, both platforms) | same |
+| Launcher / game import | native launcher app | none — import on a Mac, drop `Game Data` into the app's Documents |
+| Input | keyboard/mouse + controllers | controllers, on-screen touch gamepad, gyro aim |
+
+Extras added for handheld play:
+
+- **Gyro aiming** while the left trigger is held — uses the controller's gyro when it has one
+  (DualShock 4/DualSense/Switch Pro) or the iPad's own motion sensor for grip controllers
+  (GameSir G8 and similar). Default *hold* mode maps sustained tilt to crosshair offset,
+  matching GoldenEye's positional aim; clicking R3 re-centers.
+  Cvars: `controller_gyro_aim`, `controller_gyro_mode`, `controller_gyro_sensitivity`,
+  `controller_gyro_deadzone`.
+- **On-screen touch controls** (MeloNX-style layout) that appear only while no physical
+  controller is connected, feeding an SDL virtual gamepad.
+- **Host Settings by touch or controller** — hold L3+R3 for ~0.75 s (upstream feature) and
+  navigate by touch or gamepad.
+- **Suspend-safe lifecycle** — backgrounding auto-pauses the game and freezes guest-visible
+  time so the title's GPU-hang watchdog never trips across an iOS process suspension.
+
+### Building for iPad
+
+Everything cross-compiles from a Mac (the recompiler itself always runs on the host):
+
+```sh
+# one-time host tooling + codegen (see "Generate and build GoldenEye" below)
+cmake --preset macos-arm64-release
+cmake --build out/build/macos-arm64-release --target rexglue --parallel
+./out/macos-arm64/rexglue codegen vendor/GoldenEye-Recomp/ge_manifest.toml
+
+# iOS SDK + game
+cmake --preset ios-arm64-release
+cmake --build out/build/ios-arm64-release --parallel
+cmake -S vendor/GoldenEye-Recomp --preset ios-arm64-release
+cmake --build vendor/GoldenEye-Recomp/out/build/ios-arm64-release --target ge --parallel
+
+# SideStore/LiveContainer-installable ipa (out/ios-arm64/GoldenEye-iPad.ipa)
+./scripts/build/ios/package-ipa.sh
+```
+
+The iOS build additionally needs a static SPIRV-Cross for iOS installed under
+`out/ios-deps/spirv-cross` (same tag the launcher uses; see `docs/ipad/PLAN.md` for the
+exact commands, the full bring-up notes and known issues).
+
+To install: sideload the ipa with SideStore (the signature already declares the
+extended-virtual-addressing and increased-memory-limit entitlements) or import it into
+LiveContainer, then import your legally owned game backup with the macOS launcher once and
+copy the resulting `Game Data` folder into the app's Documents via the Files app. As with
+the macOS version, no game data is included or downloaded.
+
 **[Download v0.4.1 for macOS (.dmg)](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.4.1/GoldenEye-Metal-0.4.1-macos-arm64.dmg)** ·
 [Release notes](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.4.1) ·
 [Watch gameplay](https://youtu.be/VkbwbXw2tPw) ·
