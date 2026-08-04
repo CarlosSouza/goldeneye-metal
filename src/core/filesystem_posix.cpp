@@ -89,6 +89,15 @@ std::filesystem::path GetUserFolder() {
     return std::string(home);
   }
 
+#if REX_PLATFORM_IOS
+  // The XDG-style <home>/.local below is not creatable on iOS: the sandbox
+  // only allows writing inside Documents/, Library/ and tmp/. Use the
+  // canonical per-app data location.
+  if (const char* ios_home = std::getenv("HOME")) {
+    return std::filesystem::path(ios_home) / "Library" / "Application Support";
+  }
+#endif
+
   // if XDG_DATA_HOME not set, fallback to HOME directory
   home = std::getenv("HOME");
 
