@@ -72,8 +72,24 @@ cat > "$APP/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# The 4.5 GB guest address-space reservation needs extended virtual
+# addressing; SideStore reads these from the signature and requests them in
+# the personal provisioning profile on install (same mechanism Dolphin uses).
+ENTITLEMENTS="$STAGE/entitlements.plist"
+cat > "$ENTITLEMENTS" <<'EPLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
+    <key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+</dict>
+</plist>
+EPLIST
+
 codesign --force --sign - "$APP/Frameworks/librexruntime.dylib"
-codesign --force --sign - "$APP"
+codesign --force --sign - --entitlements "$ENTITLEMENTS" "$APP"
 
 xattr -cr "$STAGE/Payload"
 

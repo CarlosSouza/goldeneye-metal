@@ -33,6 +33,12 @@
 #define mmap64 mmap
 #endif
 
+#if REX_PLATFORM_IOS
+// The iOS SDK does not declare the mach_vm_* MIG routines; the vm_*
+// equivalents in <mach/vm_map.h> take 64-bit vm_address_t on arm64.
+#include <mach/mach.h>
+#endif
+
 #if REX_PLATFORM_ANDROID
 #include <string.h>
 
@@ -369,9 +375,48 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #endif
 }
 
+#if REX_PLATFORM_IOS
+namespace {
+vm_prot_t ToMachProtectFlags(PageAccess access) {
+  switch (access) {
+    case PageAccess::kNoAccess:
+      return VM_PROT_NONE;
+    case PageAccess::kReadOnly:
+    case PageAccess::kExecuteReadOnly:
+      return VM_PROT_READ;
+    case PageAccess::kReadWrite:
+    case PageAccess::kExecuteReadWrite:
+    default:
+      return VM_PROT_READ | VM_PROT_WRITE;
+  }
+}
+}  // namespace
+#endif  // REX_PLATFORM_IOS
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_IOS
+  // POSIX shared memory on iOS cannot back multi-gigabyte segments; the
+  // guest address space is a Mach named memory entry instead, mapped into
+  // multiple views with mach_vm_map (the standard emulator technique).
+  (void)path;
+  (void)access;
+  (void)commit;
+  memory_object_size_t size = length;
+  mach_port_t named_entry = MACH_PORT_NULL;
+  kern_return_t kr = mach_make_memory_entry_64(
+      mach_task_self(), &size, 0,
+      MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &named_entry, MACH_PORT_NULL);
+  if (kr != KERN_SUCCESS || size < length) {
+    REXLOG_ERROR("mach_make_memory_entry_64 failed: kr={} size={}/{}", kr,
+                 static_cast<uint64_t>(size), static_cast<uint64_t>(length));
+    if (kr == KERN_SUCCESS) {
+      mach_port_deallocate(mach_task_self(), named_entry);
+    }
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(named_entry);
+#elif REX_PLATFORM_ANDROID
   // TODO(Triang3l): Check if memfd can be used instead on API 30+.
   if (android_ASharedMemory_create_) {
     int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
@@ -428,15 +473,40 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 }
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+#if REX_PLATFORM_IOS
+  (void)path;
+  mach_port_deallocate(mach_task_self(), static_cast<mach_port_t>(handle));
+#else
   close(static_cast<int>(handle));
 #if !REX_PLATFORM_ANDROID
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
 #endif
+#endif
 }
 
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
                   size_t file_offset) {
+#if REX_PLATFORM_IOS
+  vm_address_t address = reinterpret_cast<vm_address_t>(base_address);
+  // The runtime reserves the range first and maps views into it, so an
+  // explicit base must replace the reservation (mmap MAP_FIXED semantics).
+  int flags = base_address ? (VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) : VM_FLAGS_ANYWHERE;
+  vm_prot_t prot = ToMachProtectFlags(access);
+  kern_return_t kr = vm_map(mach_task_self(), &address, length, /*mask=*/0, flags,
+                            static_cast<mach_port_t>(handle),
+                            static_cast<vm_offset_t>(file_offset),
+                            /*copy=*/FALSE, prot, VM_PROT_READ | VM_PROT_WRITE,
+                            VM_INHERIT_NONE);
+  if (kr != KERN_SUCCESS) {
+    return nullptr;
+  }
+  if (base_address && address != reinterpret_cast<vm_address_t>(base_address)) {
+    vm_deallocate(mach_task_self(), address, length);
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(address);
+#else
   // file_offset must be page-aligned
   const size_t page = page_size();
   if (file_offset % page != 0) {
@@ -466,10 +536,16 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
   }
 
   return result;
+#endif  // REX_PLATFORM_IOS
 }
 
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
+#if REX_PLATFORM_IOS
+  return vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(base_address), length) ==
+         KERN_SUCCESS;
+#else
   return munmap(base_address, length) == 0;
+#endif
 }
 
 }  // namespace memory
