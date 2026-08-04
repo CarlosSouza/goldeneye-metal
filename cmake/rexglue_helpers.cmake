@@ -56,6 +56,7 @@ function(rexglue_configure_target target_name)
         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
             target_sources(${target_name} PRIVATE
                 ${REXGLUE_SHARE_DIR}/windowed_app_main_ios.mm)
+            target_link_libraries(${target_name} PRIVATE "-framework UIKit")
         else()
             target_sources(${target_name} PRIVATE
                 ${REXGLUE_SHARE_DIR}/windowed_app_main_macos.mm)

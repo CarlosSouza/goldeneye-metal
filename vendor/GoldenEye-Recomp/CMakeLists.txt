@@ -224,7 +224,9 @@ endif()
 # staged product contains only the host executable, its native runtime dylib,
 # metadata, and the source notices.  Game data is deliberately never copied.
 # ---------------------------------------------------------------------------
-if(APPLE)
+# The staged .app, its verification suite and the launcher are macOS-only;
+# iOS packaging is a separate flow (docs/ipad/PLAN.md).
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(GOLDENEYE_VERSION "0.4.1" CACHE STRING
         "GoldenEye Metal CFBundleShortVersionString")
     set(GOLDENEYE_BUILD_NUMBER "9" CACHE STRING
