@@ -111,6 +111,21 @@ planejamento (2026-08-03).
    - Host Settings no iPad: **segurar L3+R3 por ~0,75 s** (já upstream),
      navegável por controle. Config persiste no `ge.toml` (editável via
      Files, dentro do container do app no LiveContainer).
+   - Gyro do device (CoreMotion) como fallback para grips sem gyro
+     (GameSir G8): orientação landscape resolvida por gravidade. Modo
+     `controller_gyro_mode=hold` (default): inclinação acumulada desde o
+     início da mira vira offset do crosshair (o aim do GoldenEye mapeia
+     deflexão→posição); `rate` mantém o estilo velocidade.
+
+## Problemas conhecidos
+
+- **Stall GENOPRESENT perto do fim da Dam** (2026-08-03, iPad): pipeline de
+  apresentação trava com critical section guest em owner-mismatch
+  (`leave_mismatches`, `guest-owner-mismatch` no ledger). É a classe de bug
+  que o upstream instrumentou com o dump GENOPRESENT — provável instabilidade
+  do port experimental, não específica do iPad. Discriminador pendente:
+  reproduzir o mesmo trecho no macOS. Log completo salvo pelo Carlos
+  (`goldeneye 2.log`).
 
 ## Riscos
 
