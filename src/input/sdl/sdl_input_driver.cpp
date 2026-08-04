@@ -579,8 +579,11 @@ void SDLInputDriver::SwapSlotsLocked(uint32_t first_user_index, uint32_t second_
 
 void SDLInputDriver::EnforceVirtualSlotOrderLocked() {
   // A virtual (touch overlay) gamepad must never shadow a physical
-  // controller's port: the guest consumes player 1 first. Stable-partition
-  // physical controllers into the lower slots; virtual ones follow.
+  // controller's port - the guest consumes player 1 first - but it must also
+  // slide down into vacated slots (the guest treats an empty player 1 as a
+  // disconnected controller and waits for it). Slot priority: physical, then
+  // virtual, then empty. Physical pads never move down relative to each
+  // other (player identity, see OnControllerDeviceRemovedLocked).
   auto is_virtual = [](const ControllerState& c) {
     return c.sdl && SDL_IsJoystickVirtual(SDL_GetGamepadID(c.sdl));
   };
@@ -590,12 +593,14 @@ void SDLInputDriver::EnforceVirtualSlotOrderLocked() {
     for (uint32_t i = 0; i + 1 < controllers_.size(); ++i) {
       auto& low = controllers_.at(i);
       auto& high = controllers_.at(i + 1);
-      const bool low_yields = !low.sdl || is_virtual(low);
+      const bool low_empty = !low.sdl;
+      const bool low_yields_to_physical = low_empty || is_virtual(low);
       const bool high_physical = high.sdl && !is_virtual(high);
-      if (low_yields && high_physical) {
+      const bool high_virtual = high.sdl && is_virtual(high);
+      if ((low_yields_to_physical && high_physical) || (low_empty && high_virtual)) {
         SwapSlotsLocked(i, i + 1);
-        REXLOG_INFO("SDL: physical controller promoted to player {} over virtual/empty slot",
-                    i + 1);
+        REXLOG_INFO("SDL: {} controller promoted to player {}",
+                    high_physical ? "physical" : "virtual", i + 1);
         swapped = true;
       }
     }

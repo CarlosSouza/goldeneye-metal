@@ -32,7 +32,7 @@ constexpr float kStrokeAlpha = 0.42f;
 constexpr float kFillAlpha = 0.10f;
 constexpr float kFillPressedAlpha = 0.32f;
 
-enum class ControlKind { kStick, kButton, kTrigger };
+enum class ControlKind { kStick, kButton, kTrigger, kMenuChord };
 enum class Icon { kNone, kUp, kDown, kLeft, kRight };
 
 struct Control {
@@ -120,6 +120,9 @@ UIBezierPath* TrianglePath(Icon icon, CGPoint c, CGFloat s) {
       {ControlKind::kButton, SDL_GAMEPAD_BUTTON_NORTH, "Y", Icon::kNone, {54, 54}},
       {ControlKind::kButton, SDL_GAMEPAD_BUTTON_START, "START", Icon::kNone, {42, 42}},
       {ControlKind::kButton, SDL_GAMEPAD_BUTTON_BACK, "BACK", Icon::kNone, {42, 42}},
+      // Holds L3+R3 while touched: the runtime's Host Settings chord, which
+      // is otherwise unreachable without stick-click buttons.
+      {ControlKind::kMenuChord, 0, "MENU", Icon::kNone, {64, 30}},
       {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_UP, "", Icon::kUp, {42, 42}},
       {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_DOWN, "", Icon::kDown, {42, 42}},
       {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_LEFT, "", Icon::kLeft, {42, 42}},
@@ -250,11 +253,12 @@ UIBezierPath* TrianglePath(Icon icon, CGPoint c, CGFloat s) {
   [self placeControl:ControlKind::kTrigger index:SDL_GAMEPAD_AXIS_RIGHT_TRIGGER
                   at:{rstick.x + 52, rrow_y}];
 
-  // Bottom center: BACK ... START.
+  // Bottom center: BACK ... MENU ... START.
   [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_BACK
-                  at:{W / 2 - 60, H - bottom - 24}];
+                  at:{W / 2 - 90, H - bottom - 24}];
+  [self placeControl:ControlKind::kMenuChord index:0 at:{W / 2, H - bottom - 24}];
   [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_START
-                  at:{W / 2 + 60, H - bottom - 24}];
+                  at:{W / 2 + 90, H - bottom - 24}];
 }
 
 - (void)setStick:(Control&)control offset:(CGPoint)offset {
@@ -322,6 +326,14 @@ UIBezierPath* TrianglePath(Icon icon, CGPoint c, CGFloat s) {
       break;
     case ControlKind::kButton:
       SDL_SetJoystickVirtualButton(joystick_, control.sdl_index, down);
+      control.base.fillColor =
+          [UIColor colorWithWhite:1.0 alpha:down ? kFillPressedAlpha : kFillAlpha].CGColor;
+      break;
+    case ControlKind::kMenuChord:
+      // Host Settings opens after the runtime sees L3+R3 held ~0.75 s; keep
+      // both pressed for as long as the finger stays on the button.
+      SDL_SetJoystickVirtualButton(joystick_, SDL_GAMEPAD_BUTTON_LEFT_STICK, down);
+      SDL_SetJoystickVirtualButton(joystick_, SDL_GAMEPAD_BUTTON_RIGHT_STICK, down);
       control.base.fillColor =
           [UIColor colorWithWhite:1.0 alpha:down ? kFillPressedAlpha : kFillAlpha].CGColor;
       break;
