@@ -55,9 +55,15 @@ REXCVAR_DEFINE_STRING(controller_button_map, "", "Input/Controller",
     });
 REXCVAR_DEFINE_BOOL(controller_gyro_aim, true, "Input/Controller",
                     "Gyro aiming while the left trigger is held, on controllers with a gyro "
-                    "(DualShock 4, DualSense, Switch Pro)");
+                    "(DualShock 4, DualSense, Switch Pro) or via the device's own gyro");
+REXCVAR_DEFINE_STRING(controller_gyro_mode, "hold", "Input/Controller",
+                      "Gyro aim response: 'hold' maps the tilt held since aiming began to the "
+                      "crosshair offset (GoldenEye's aim mode keeps the crosshair where the "
+                      "stick holds it); 'rate' maps rotation speed to stick speed")
+    .allowed({"hold", "rate"});
 REXCVAR_DEFINE_DOUBLE(controller_gyro_sensitivity, 1.0, "Input/Controller",
-                      "Gyro aim sensitivity (1.0 = 2 rad/s of rotation for full stick deflection)")
+                      "Gyro aim sensitivity. hold: 1.0 = ~14 degrees of tilt for full stick "
+                      "deflection; rate: 1.0 = 2 rad/s for full deflection")
     .range(0.1, 10.0);
 
 namespace rex::input::sdl {
@@ -998,13 +1004,15 @@ void SDLInputDriver::RefreshControllerStateLocked(ControllerState& controller) {
   controller.state_changed = true;
 }
 
-void SDLInputDriver::ApplyGyroAim(const ControllerState& controller,
-                                  X_INPUT_GAMEPAD& gamepad) const {
+void SDLInputDriver::ApplyGyroAim(ControllerState& controller, X_INPUT_GAMEPAD& gamepad) const {
   if (!REXCVAR_GET(controller_gyro_aim) || !controller.sdl) {
     return;
   }
   // Aim gate: the left trigger must be meaningfully held.
   if (gamepad.left_trigger < 32) {
+    controller.gyro_aiming = false;
+    controller.gyro_yaw_angle = 0.0;
+    controller.gyro_pitch_angle = 0.0;
     return;
   }
   // Look rates in rad/s: positive yaw looks left, positive pitch looks up.
@@ -1019,16 +1027,45 @@ void SDLInputDriver::ApplyGyroAim(const ControllerState& controller,
     // GameSir G8 rely on the attached iPad's own sensor).
     return;
   }
-  // At sensitivity 1.0, 2 rad/s of rotation equals full stick deflection.
-  const double scale = REXCVAR_GET(controller_gyro_sensitivity) * (32767.0 / 2.0);
+
+  const double sensitivity = REXCVAR_GET(controller_gyro_sensitivity);
   const double invert = REXCVAR_GET(controller_invert_y) ? -1.0 : 1.0;
   auto inject = [](int32_t current, double add) {
     return static_cast<int16_t>(
         std::clamp<int32_t>(current + static_cast<int32_t>(std::lround(add)), INT16_MIN,
                             INT16_MAX));
   };
-  gamepad.thumb_rx = inject(int16_t(gamepad.thumb_rx), -double(yaw_left) * scale);
-  gamepad.thumb_ry = inject(int16_t(gamepad.thumb_ry), invert * double(pitch_up) * scale);
+
+  double yaw_deflection;
+  double pitch_deflection;
+  if (REXCVAR_GET(controller_gyro_mode) == "rate") {
+    // Rotation speed -> stick speed. 2 rad/s = full deflection at 1.0.
+    const double scale = sensitivity * (32767.0 / 2.0);
+    yaw_deflection = double(yaw_left) * scale;
+    pitch_deflection = double(pitch_up) * scale;
+  } else {
+    // Hold: tilt held since the aim began -> crosshair offset. GoldenEye's
+    // aim mode maps stick deflection to crosshair position, so a held tilt
+    // must produce a held deflection. ~14 degrees = full deflection at 1.0.
+    const uint64_t now_ns = SDL_GetTicksNS();
+    if (!controller.gyro_aiming) {
+      controller.gyro_aiming = true;
+      controller.gyro_yaw_angle = 0.0;
+      controller.gyro_pitch_angle = 0.0;
+    } else {
+      double dt = double(now_ns - controller.gyro_last_time_ns) * 1e-9;
+      dt = std::clamp(dt, 0.0, 0.1);
+      controller.gyro_yaw_angle += double(yaw_left) * dt;
+      controller.gyro_pitch_angle += double(pitch_up) * dt;
+    }
+    controller.gyro_last_time_ns = now_ns;
+    constexpr double kFullDeflectionRad = 0.25;
+    const double scale = sensitivity * (32767.0 / kFullDeflectionRad);
+    yaw_deflection = controller.gyro_yaw_angle * scale;
+    pitch_deflection = controller.gyro_pitch_angle * scale;
+  }
+  gamepad.thumb_rx = inject(int16_t(gamepad.thumb_rx), -yaw_deflection);
+  gamepad.thumb_ry = inject(int16_t(gamepad.thumb_ry), invert * pitch_deflection);
 }
 
 X_INPUT_GAMEPAD SDLInputDriver::ApplyControllerTuning(const X_INPUT_GAMEPAD& gamepad) const {
