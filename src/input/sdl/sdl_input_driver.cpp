@@ -19,6 +19,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/input/flags.h>
+#include <rex/input/ios_device_motion.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
@@ -1006,12 +1007,19 @@ void SDLInputDriver::ApplyGyroAim(const ControllerState& controller,
   if (gamepad.left_trigger < 32) {
     return;
   }
+  // Look rates in rad/s: positive yaw looks left, positive pitch looks up.
+  float yaw_left = 0.0f;
+  float pitch_up = 0.0f;
   float rate[3];  // rad/s, right-hand rule, controller held level (SDL convention)
-  if (!SDL_GetGamepadSensorData(controller.sdl, SDL_SENSOR_GYRO, rate, 3)) {
+  if (SDL_GetGamepadSensorData(controller.sdl, SDL_SENSOR_GYRO, rate, 3)) {
+    yaw_left = rate[1];
+    pitch_up = rate[0];
+  } else if (!rex::input::ios::GetDeviceGyroLook(&yaw_left, &pitch_up)) {
+    // No controller gyro and no device gyro (grip controllers such as the
+    // GameSir G8 rely on the attached iPad's own sensor).
     return;
   }
-  // At sensitivity 1.0, 2 rad/s of controller rotation equals full stick
-  // deflection. Yaw (rotate left, +Y) looks left; pitch (tilt up, +X) looks up.
+  // At sensitivity 1.0, 2 rad/s of rotation equals full stick deflection.
   const double scale = REXCVAR_GET(controller_gyro_sensitivity) * (32767.0 / 2.0);
   const double invert = REXCVAR_GET(controller_invert_y) ? -1.0 : 1.0;
   auto inject = [](int32_t current, double add) {
@@ -1019,8 +1027,8 @@ void SDLInputDriver::ApplyGyroAim(const ControllerState& controller,
         std::clamp<int32_t>(current + static_cast<int32_t>(std::lround(add)), INT16_MIN,
                             INT16_MAX));
   };
-  gamepad.thumb_rx = inject(int16_t(gamepad.thumb_rx), -double(rate[1]) * scale);
-  gamepad.thumb_ry = inject(int16_t(gamepad.thumb_ry), invert * double(rate[0]) * scale);
+  gamepad.thumb_rx = inject(int16_t(gamepad.thumb_rx), -double(yaw_left) * scale);
+  gamepad.thumb_ry = inject(int16_t(gamepad.thumb_ry), invert * double(pitch_up) * scale);
 }
 
 X_INPUT_GAMEPAD SDLInputDriver::ApplyControllerTuning(const X_INPUT_GAMEPAD& gamepad) const {
