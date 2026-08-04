@@ -16,7 +16,7 @@ planejamento (2026-08-03).
 | Sequência | Baseline macOS primeiro | Compilar e rodar a versão macOS com o backup próprio antes do port. Prova a revisão do backup, a toolchain e isola bugs futuros do iPad como bugs do port. |
 | Launcher no iPad | Não portar | Import feito no Mac (launcher macOS do baseline); a pasta de game data importada vai por AirDrop para Documents do app (UIFileSharingEnabled, esquema GeneralsX). O app iPad boota direto no jogo com `game_data_root` → Documents, com bootstrap mínimo de validação (`ValidateImportedDirectory`). |
 | Input | Controle físico Bluetooth apenas | Driver SDL3 de gamepad já existe e suporta GCController no iOS. Teclado/mouse (AppKit) e touch overlay ficam fora do escopo inicial. |
-| Assinatura/distribuição | SideStore, pipeline GeneralsX | Team pessoal `SNS5MZ4U4A`, bundle ID sugerido `digital.coopers.goldeneye`. Re-sign semanal on-device. |
+| Assinatura/distribuição | SideStore, pipeline GeneralsX | Team pessoal `<TEAM_ID>`, bundle ID sugerido `digital.coopers.goldeneye`. Re-sign semanal on-device. |
 
 ## Decisões deferidas (resolver durante execução)
 
@@ -171,7 +171,7 @@ planejamento (2026-08-03).
 - SDL3 já é usado para input e áudio (suporta iOS).
 - Compilação de MSL em runtime (`msl_compiler.mm`) é permitida no iOS.
 - Distribuição: sideload via SideStore (pipeline do GeneralsX reaproveitável —
-  team `SNS5MZ4U4A`, gotchas de `xattr -cr` + `zip -X`).
+  team `<TEAM_ID>`, gotchas de `xattr -cr` + `zip -X`).
 
 ## Decisões em aberto
 
