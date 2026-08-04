@@ -22,6 +22,12 @@
 
 namespace rex::audio::sdl {
 
+/// Resume every registered playback device. Mobile OSes interrupt the audio
+/// session while the app is backgrounded; if the device does not restart on
+/// return, the guest waits forever for buffer-completion callbacks and the
+/// game appears frozen. Call from the platform's did-become-active hook.
+void ResumeAllDevicesForForeground();
+
 class SDLAudioDriver : public AudioDriver {
  public:
   SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore);

@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/input/ios_touch_gamepad.h>
 #include <rex/logging.h>
@@ -135,6 +136,14 @@ std::vector<std::string> g_positional_arguments;
   if (app_) {
     app_->OnEnterBackground();
   }
+}
+
+- (void)applicationDidBecomeActive:(UIApplication*)application {
+  (void)application;
+  // iOS interrupts the audio session while backgrounded. Without this the
+  // guest waits forever on audio buffer completions after closing the pause
+  // menu - frozen world, live UI.
+  rex::audio::sdl::ResumeAllDevicesForForeground();
 }
 
 - (void)applicationWillTerminate:(UIApplication*)application {

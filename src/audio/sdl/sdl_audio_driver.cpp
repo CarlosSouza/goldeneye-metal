@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
@@ -33,6 +35,36 @@ REXCVAR_DEFINE_DOUBLE(master_volume, 1.0, "Audio",
     .range(0.0, 1.0);
 
 namespace rex::audio::sdl {
+
+namespace {
+// Streams whose devices must be revived after a mobile background/foreground
+// cycle (see ResumeAllDevicesForForeground).
+std::mutex g_active_streams_mutex;
+std::vector<SDL_AudioStream*> g_active_streams;
+
+void RegisterActiveStream(SDL_AudioStream* stream) {
+  std::lock_guard lock(g_active_streams_mutex);
+  g_active_streams.push_back(stream);
+}
+
+void UnregisterActiveStream(SDL_AudioStream* stream) {
+  std::lock_guard lock(g_active_streams_mutex);
+  g_active_streams.erase(
+      std::remove(g_active_streams.begin(), g_active_streams.end(), stream),
+      g_active_streams.end());
+}
+}  // namespace
+
+void ResumeAllDevicesForForeground() {
+  std::lock_guard lock(g_active_streams_mutex);
+  for (SDL_AudioStream* stream : g_active_streams) {
+    SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(stream);
+    if (device && !SDL_ResumeAudioDevice(device)) {
+      REXAPU_WARN("Foreground audio resume failed: {}", SDL_GetError());
+    }
+  }
+  REXAPU_INFO("Foreground audio resume: {} stream(s) poked", g_active_streams.size());
+}
 
 SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
     : AudioDriver(memory), semaphore_(semaphore) {}
@@ -105,6 +137,7 @@ bool SDLAudioDriver::Initialize() {
     return false;
   }
 
+  RegisterActiveStream(sdl_stream_);
   return true;
 }
 
@@ -139,6 +172,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
 void SDLAudioDriver::Shutdown() {
   if (sdl_stream_) {
+    UnregisterActiveStream(sdl_stream_);
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
   }

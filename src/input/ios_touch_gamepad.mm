@@ -2,10 +2,12 @@
  * @file        rex/input/ios_touch_gamepad.mm
  * @brief       On-screen touch gamepad implementation (see header)
  *
- * Layout in the spirit of MelonX's digital overlay: two virtual sticks in the
- * lower corners, ABXY diamond on the right, big LT/RT at the edges (aim/fire
- * in GoldenEye's modern layout), LB/RB in the top corners, START/BACK at the
- * top center, and a compact d-pad above the left stick.
+ * Layout replicated from MeloNX's Melo-Controller package (landscape):
+ * bottom-anchored columns with the trigger/shoulder pill row directly above
+ * each stick, the d-pad overlapping the left stick's footprint and the face
+ * buttons overlapping the right stick's (Joy-Con style), BACK/START at the
+ * bottom center. Face buttons use the Xbox arrangement (Y top, X left,
+ * B right, A bottom) since the guest is an Xbox 360 title.
  */
 
 #include <rex/input/ios_touch_gamepad.h>
@@ -26,9 +28,12 @@
 
 namespace {
 
-constexpr float kOverlayAlpha = 0.38f;
+constexpr float kStrokeAlpha = 0.42f;
+constexpr float kFillAlpha = 0.10f;
+constexpr float kFillPressedAlpha = 0.32f;
 
 enum class ControlKind { kStick, kButton, kTrigger };
+enum class Icon { kNone, kUp, kDown, kLeft, kRight };
 
 struct Control {
   ControlKind kind;
@@ -36,11 +41,44 @@ struct Control {
   // trigger / the stick's X axis (Y is axis + 1).
   int sdl_index;
   const char* label;
-  CGPoint center;      // set by layout
-  CGFloat radius;      // hit/base radius
+  Icon icon;
+  CGSize size;     // pills use w != h; circles use w == h (diameter)
+  CGPoint center;  // set by layout
   CAShapeLayer* base = nil;
   CAShapeLayer* nub = nil;  // kStick only
+
+  CGFloat HitRadius() const { return std::max(size.width, size.height) * 0.5; }
 };
+
+UIBezierPath* TrianglePath(Icon icon, CGPoint c, CGFloat s) {
+  UIBezierPath* path = [UIBezierPath bezierPath];
+  switch (icon) {
+    case Icon::kUp:
+      [path moveToPoint:CGPointMake(c.x, c.y - s)];
+      [path addLineToPoint:CGPointMake(c.x - s, c.y + s * 0.7)];
+      [path addLineToPoint:CGPointMake(c.x + s, c.y + s * 0.7)];
+      break;
+    case Icon::kDown:
+      [path moveToPoint:CGPointMake(c.x, c.y + s)];
+      [path addLineToPoint:CGPointMake(c.x - s, c.y - s * 0.7)];
+      [path addLineToPoint:CGPointMake(c.x + s, c.y - s * 0.7)];
+      break;
+    case Icon::kLeft:
+      [path moveToPoint:CGPointMake(c.x - s, c.y)];
+      [path addLineToPoint:CGPointMake(c.x + s * 0.7, c.y - s)];
+      [path addLineToPoint:CGPointMake(c.x + s * 0.7, c.y + s)];
+      break;
+    case Icon::kRight:
+      [path moveToPoint:CGPointMake(c.x + s, c.y)];
+      [path addLineToPoint:CGPointMake(c.x - s * 0.7, c.y - s)];
+      [path addLineToPoint:CGPointMake(c.x - s * 0.7, c.y + s)];
+      break;
+    case Icon::kNone:
+      break;
+  }
+  [path closePath];
+  return path;
+}
 
 }  // namespace
 
@@ -67,43 +105,46 @@ struct Control {
   self.multipleTouchEnabled = YES;
   self.backgroundColor = [UIColor clearColor];
 
+  // Sizes from Melo-Controller (iPad multiplier 1.2 applied): sticks 160,
+  // face buttons 54, small buttons 42, trigger pills 84x48.
   controls_ = {
-      {ControlKind::kStick, SDL_GAMEPAD_AXIS_LEFTX, "", CGPointZero, 75},
-      {ControlKind::kStick, SDL_GAMEPAD_AXIS_RIGHTX, "", CGPointZero, 65},
-      {ControlKind::kTrigger, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "LT", CGPointZero, 38},
-      {ControlKind::kTrigger, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "RT", CGPointZero, 38},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_SOUTH, "A", CGPointZero, 26},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_EAST, "B", CGPointZero, 26},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_WEST, "X", CGPointZero, 26},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_NORTH, "Y", CGPointZero, 26},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "LB", CGPointZero, 27},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "RB", CGPointZero, 27},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_START, "START", CGPointZero, 22},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_BACK, "BACK", CGPointZero, 22},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_UP, "▲", CGPointZero, 20},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_DOWN, "▼", CGPointZero, 20},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_LEFT, "◀", CGPointZero, 20},
-      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "▶", CGPointZero, 20},
+      {ControlKind::kStick, SDL_GAMEPAD_AXIS_LEFTX, "", Icon::kNone, {160, 160}},
+      {ControlKind::kStick, SDL_GAMEPAD_AXIS_RIGHTX, "", Icon::kNone, {160, 160}},
+      {ControlKind::kTrigger, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "LT", Icon::kNone, {84, 48}},
+      {ControlKind::kTrigger, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "RT", Icon::kNone, {84, 48}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "LB", Icon::kNone, {84, 48}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "RB", Icon::kNone, {84, 48}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_SOUTH, "A", Icon::kNone, {54, 54}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_EAST, "B", Icon::kNone, {54, 54}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_WEST, "X", Icon::kNone, {54, 54}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_NORTH, "Y", Icon::kNone, {54, 54}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_START, "START", Icon::kNone, {42, 42}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_BACK, "BACK", Icon::kNone, {42, 42}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_UP, "", Icon::kUp, {42, 42}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_DOWN, "", Icon::kDown, {42, 42}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_LEFT, "", Icon::kLeft, {42, 42}},
+      {ControlKind::kButton, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "", Icon::kRight, {42, 42}},
   };
   for (auto& control : controls_) {
     control.base = [CAShapeLayer layer];
     control.base.fillColor =
-        [UIColor colorWithWhite:1.0 alpha:control.kind == ControlKind::kStick ? 0.06 : 0.10]
+        [UIColor colorWithWhite:1.0
+                          alpha:control.kind == ControlKind::kStick ? 0.05 : kFillAlpha]
             .CGColor;
-    control.base.strokeColor = [UIColor colorWithWhite:1.0 alpha:kOverlayAlpha].CGColor;
+    control.base.strokeColor = [UIColor colorWithWhite:1.0 alpha:kStrokeAlpha].CGColor;
     control.base.lineWidth = 2.0;
     [self.layer addSublayer:control.base];
     if (control.kind == ControlKind::kStick) {
       control.nub = [CAShapeLayer layer];
-      control.nub.fillColor = [UIColor colorWithWhite:1.0 alpha:kOverlayAlpha].CGColor;
+      control.nub.fillColor = [UIColor colorWithWhite:1.0 alpha:kStrokeAlpha].CGColor;
       [self.layer addSublayer:control.nub];
     }
     if (control.label[0] != '\0') {
       CATextLayer* text = [CATextLayer layer];
       text.string = [NSString stringWithUTF8String:control.label];
-      text.fontSize = control.radius > 25 ? 15 : 11;
+      text.fontSize = std::strlen(control.label) > 2 ? 11 : 16;
       text.alignmentMode = kCAAlignmentCenter;
-      text.foregroundColor = [UIColor colorWithWhite:1.0 alpha:kOverlayAlpha + 0.2].CGColor;
+      text.foregroundColor = [UIColor colorWithWhite:1.0 alpha:kStrokeAlpha + 0.25].CGColor;
       text.contentsScale = [UIScreen mainScreen].scale;
       [control.base addSublayer:text];
     }
@@ -111,50 +152,113 @@ struct Control {
   return self;
 }
 
+- (void)dealloc {
+  [touch_to_control_ release];
+  [super dealloc];
+}
+
+- (Control*)findControl:(ControlKind)kind index:(int)sdl_index {
+  for (auto& control : controls_) {
+    if (control.kind == kind && control.sdl_index == sdl_index) {
+      return &control;
+    }
+  }
+  return nullptr;
+}
+
+- (void)placeControl:(ControlKind)kind index:(int)sdl_index at:(CGPoint)p {
+  Control* control = [self findControl:kind index:sdl_index];
+  if (!control) {
+    return;
+  }
+  control->center = p;
+  const CGFloat w = control->size.width;
+  const CGFloat h = control->size.height;
+  const CGRect rect = CGRectMake(p.x - w / 2, p.y - h / 2, w, h);
+  if (control->icon != Icon::kNone) {
+    // D-pad: circular base with a vector triangle (text glyphs render
+    // unreliably in CATextLayer).
+    control->base.path = [UIBezierPath bezierPathWithOvalInRect:rect].CGPath;
+    CAShapeLayer* arrow = nil;
+    for (CALayer* sub in control->base.sublayers) {
+      if ([sub isKindOfClass:[CAShapeLayer class]]) {
+        arrow = (CAShapeLayer*)sub;
+        break;
+      }
+    }
+    if (!arrow) {
+      arrow = [CAShapeLayer layer];
+      arrow.fillColor = [UIColor colorWithWhite:1.0 alpha:kStrokeAlpha + 0.25].CGColor;
+      [control->base addSublayer:arrow];
+    }
+    arrow.path = TrianglePath(control->icon, p, w * 0.22).CGPath;
+  } else {
+    control->base.path =
+        [UIBezierPath bezierPathWithRoundedRect:rect cornerRadius:std::min(w, h) / 2].CGPath;
+  }
+  if (control->nub) {
+    [self setStick:*control offset:CGPointZero];
+  }
+  for (CALayer* sub in control->base.sublayers) {
+    if ([sub isKindOfClass:[CATextLayer class]]) {
+      sub.frame = CGRectMake(p.x - w / 2, p.y - 9, w, 18);
+    }
+  }
+}
+
 - (void)layoutSubviews {
   [super layoutSubviews];
   const CGFloat W = self.bounds.size.width;
   const CGFloat H = self.bounds.size.height;
-  auto place = [&](int sdl_index, ControlKind kind, CGPoint p) {
-    for (auto& control : controls_) {
-      if (control.kind == kind && control.sdl_index == sdl_index) {
-        control.center = p;
-        const CGFloat r = control.radius;
-        control.base.path =
-            [UIBezierPath bezierPathWithOvalInRect:CGRectMake(p.x - r, p.y - r, 2 * r, 2 * r)]
-                .CGPath;
-        if (control.nub) {
-          [self setStick:control offset:CGPointZero];
-        }
-        for (CALayer* sub in control.base.sublayers) {
-          sub.frame = CGRectMake(p.x - r, p.y - 8, 2 * r, 16);
-        }
-        return;
-      }
-    }
-  };
-  place(SDL_GAMEPAD_AXIS_LEFTX, ControlKind::kStick, {160, H - 175});
-  place(SDL_GAMEPAD_AXIS_RIGHTX, ControlKind::kStick, {W - 170, H - 165});
-  place(SDL_GAMEPAD_AXIS_LEFT_TRIGGER, ControlKind::kTrigger, {80, H - 330});
-  place(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, ControlKind::kTrigger, {W - 80, H - 320});
-  const CGPoint face = {W - 210, H - 340};
-  place(SDL_GAMEPAD_BUTTON_SOUTH, ControlKind::kButton, {face.x, face.y + 52});
-  place(SDL_GAMEPAD_BUTTON_EAST, ControlKind::kButton, {face.x + 52, face.y});
-  place(SDL_GAMEPAD_BUTTON_WEST, ControlKind::kButton, {face.x - 52, face.y});
-  place(SDL_GAMEPAD_BUTTON_NORTH, ControlKind::kButton, {face.x, face.y - 52});
-  place(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, ControlKind::kButton, {90, 60});
-  place(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, ControlKind::kButton, {W - 90, 60});
-  place(SDL_GAMEPAD_BUTTON_START, ControlKind::kButton, {W / 2 + 70, 44});
-  place(SDL_GAMEPAD_BUTTON_BACK, ControlKind::kButton, {W / 2 - 70, 44});
-  const CGPoint dpad = {170, H - 430};
-  place(SDL_GAMEPAD_BUTTON_DPAD_UP, ControlKind::kButton, {dpad.x, dpad.y - 44});
-  place(SDL_GAMEPAD_BUTTON_DPAD_DOWN, ControlKind::kButton, {dpad.x, dpad.y + 44});
-  place(SDL_GAMEPAD_BUTTON_DPAD_LEFT, ControlKind::kButton, {dpad.x - 44, dpad.y});
-  place(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, ControlKind::kButton, {dpad.x + 44, dpad.y});
+  const UIEdgeInsets safe = self.safeAreaInsets;
+  const CGFloat left = std::max<CGFloat>(safe.left, 20);
+  const CGFloat right = std::max<CGFloat>(safe.right, 20);
+  const CGFloat bottom = std::max<CGFloat>(safe.bottom, 16);
+
+  // Left column: [LT LB] pill row above the stick; d-pad on the stick's rim.
+  const CGPoint lstick = {left + 90, H - bottom - 90};
+  [self placeControl:ControlKind::kStick index:SDL_GAMEPAD_AXIS_LEFTX at:lstick];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_DPAD_UP
+                  at:{lstick.x, lstick.y - 58}];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_DPAD_DOWN
+                  at:{lstick.x, lstick.y + 58}];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_DPAD_LEFT
+                  at:{lstick.x - 58, lstick.y}];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_DPAD_RIGHT
+                  at:{lstick.x + 58, lstick.y}];
+  const CGFloat lrow_y = lstick.y - 80 - 20 - 24;
+  [self placeControl:ControlKind::kTrigger index:SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+                  at:{lstick.x - 52, lrow_y}];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_LEFT_SHOULDER
+                  at:{lstick.x + 52, lrow_y}];
+
+  // Right column mirrored: [RB RT] pills; ABXY on the stick's rim in the
+  // Xbox arrangement.
+  const CGPoint rstick = {W - right - 90, H - bottom - 90};
+  [self placeControl:ControlKind::kStick index:SDL_GAMEPAD_AXIS_RIGHTX at:rstick];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_NORTH
+                  at:{rstick.x, rstick.y - 58}];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_SOUTH
+                  at:{rstick.x, rstick.y + 58}];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_WEST
+                  at:{rstick.x - 58, rstick.y}];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_EAST
+                  at:{rstick.x + 58, rstick.y}];
+  const CGFloat rrow_y = rstick.y - 80 - 20 - 24;
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER
+                  at:{rstick.x - 52, rrow_y}];
+  [self placeControl:ControlKind::kTrigger index:SDL_GAMEPAD_AXIS_RIGHT_TRIGGER
+                  at:{rstick.x + 52, rrow_y}];
+
+  // Bottom center: BACK ... START.
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_BACK
+                  at:{W / 2 - 60, H - bottom - 24}];
+  [self placeControl:ControlKind::kButton index:SDL_GAMEPAD_BUTTON_START
+                  at:{W / 2 + 60, H - bottom - 24}];
 }
 
 - (void)setStick:(Control&)control offset:(CGPoint)offset {
-  const CGFloat nub_radius = control.radius * 0.45;
+  const CGFloat nub_radius = control.HitRadius() * 0.42;
   const CGPoint p = {control.center.x + offset.x, control.center.y + offset.y};
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
@@ -166,6 +270,9 @@ struct Control {
 }
 
 - (int)controlIndexAt:(CGPoint)point {
+  // Nearest control whose reach contains the point. Buttons sit on the
+  // sticks' rims (MeloNX layout), so nearest-wins keeps taps on buttons and
+  // center grabs on the stick.
   int best = -1;
   CGFloat best_distance = CGFLOAT_MAX;
   for (size_t i = 0; i < controls_.size(); ++i) {
@@ -173,9 +280,8 @@ struct Control {
     const CGFloat dx = point.x - control.center.x;
     const CGFloat dy = point.y - control.center.y;
     const CGFloat distance = std::sqrt(dx * dx + dy * dy);
-    // Sticks accept grabs a little outside their base.
-    const CGFloat reach =
-        control.kind == ControlKind::kStick ? control.radius * 1.5 : control.radius * 1.25;
+    const CGFloat reach = control.kind == ControlKind::kStick ? control.HitRadius() * 1.25
+                                                              : control.HitRadius() * 1.15;
     if (distance <= reach && distance < best_distance) {
       best = static_cast<int>(i);
       best_distance = distance;
@@ -187,6 +293,7 @@ struct Control {
 - (void)applyControl:(Control&)control down:(BOOL)down at:(CGPoint)point {
   switch (control.kind) {
     case ControlKind::kStick: {
+      const CGFloat radius = control.HitRadius();
       CGPoint offset = {0, 0};
       float nx = 0.0f;
       float ny = 0.0f;
@@ -194,10 +301,10 @@ struct Control {
         const CGFloat dx = point.x - control.center.x;
         const CGFloat dy = point.y - control.center.y;
         const CGFloat length = std::max<CGFloat>(1.0, std::sqrt(dx * dx + dy * dy));
-        const CGFloat clamped = std::min<CGFloat>(length, control.radius);
+        const CGFloat clamped = std::min<CGFloat>(length, radius);
         offset = {dx / length * clamped, dy / length * clamped};
-        nx = static_cast<float>(std::clamp<CGFloat>(dx / control.radius, -1.0, 1.0));
-        ny = static_cast<float>(std::clamp<CGFloat>(dy / control.radius, -1.0, 1.0));
+        nx = static_cast<float>(std::clamp<CGFloat>(dx / radius, -1.0, 1.0));
+        ny = static_cast<float>(std::clamp<CGFloat>(dy / radius, -1.0, 1.0));
       }
       [self setStick:control offset:offset];
       // UIKit y grows downward, matching SDL's stick convention.
@@ -211,12 +318,12 @@ struct Control {
       SDL_SetJoystickVirtualAxis(joystick_, control.sdl_index,
                                  down ? SDL_MAX_SINT16 : SDL_MIN_SINT16);
       control.base.fillColor =
-          [UIColor colorWithWhite:1.0 alpha:down ? 0.30 : 0.10].CGColor;
+          [UIColor colorWithWhite:1.0 alpha:down ? kFillPressedAlpha : kFillAlpha].CGColor;
       break;
     case ControlKind::kButton:
       SDL_SetJoystickVirtualButton(joystick_, control.sdl_index, down);
       control.base.fillColor =
-          [UIColor colorWithWhite:1.0 alpha:down ? 0.30 : 0.10].CGColor;
+          [UIColor colorWithWhite:1.0 alpha:down ? kFillPressedAlpha : kFillAlpha].CGColor;
       break;
   }
 }
@@ -263,7 +370,7 @@ struct Control {
 }
 
 // Only touches on a control belong to the overlay; everything else falls
-// through to the game view (and the ImGui overlay's future touch path).
+// through to the game view (which drives the ImGui host UI).
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent*)event {
   return self.hidden ? NO : [self controlIndexAt:point] >= 0;
 }
