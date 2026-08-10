@@ -3262,6 +3262,38 @@ bool ge_guard_cleanup_child_node(PPCRegister& r11, PPCRegister& r30, PPCRegister
   return true;
 }
 
+// sub_821448F8 is the shared 3D-audio location setter. The retail sound-create
+// path may return a null handle (for example when no sound record is available),
+// while some callers immediately position the result without checking it. On
+// macOS a null handle makes the first store hit protected guest address 0x10.
+// Treat only an invalid object/coordinate range as a failed no-op and retain
+// sparse, flushed evidence so a tester bundle identifies the recovered caller.
+bool ge_guard_audio_location(PPCRegister& r3, PPCRegister& r4) {
+  const uint32_t sound_buffer = r3.u32;
+  const uint32_t position = r4.u32;
+  if (!ge::crash_guards::AudioLocationNeedsRecovery(sound_buffer, position)) {
+    return false;
+  }
+
+  PPCContext* ctx;
+  uint8_t* base;
+  getcb(ctx, base);
+  (void)base;
+
+  static std::atomic<uint64_t> hits{0};
+  const uint64_t hit = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (ge_should_log_sparse_recovery(hit)) {
+    REXKRNL_WARN(
+        "[GE-GUARD-821448F8-v1] recovered hit={} caller=0x{:08X} "
+        "sound=0x{:08X} position=0x{:08X} guest_sp=0x{:08X}",
+        hit, static_cast<uint32_t>(ctx->lr), sound_buffer, position, ctx->r1.u32);
+    if (auto* logger = rex::GetLoggerRaw(rex::log::krnl())) {
+      logger->flush();
+    }
+  }
+  return true;
+}
+
 // Guard both vtable+16 calls before dispatch. A purecall target here means this
 // packed-data resource has reached a base/destructed state. Returning the
 // accessor's existing empty value is safe; intercepting _purecall globally is

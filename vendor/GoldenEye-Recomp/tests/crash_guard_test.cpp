@@ -3,6 +3,7 @@
 #include <cstdint>
 
 int main() {
+  using ge::crash_guards::AudioLocationNeedsRecovery;
   using ge::crash_guards::CleanupListNodeNeedsRecovery;
   using ge::crash_guards::RecoverPackedDataPureVirtualDispatch;
 
@@ -30,6 +31,23 @@ int main() {
   if (!CleanupListNodeNeedsRecovery(0xFFFFFFF9u) || !CleanupListNodeNeedsRecovery(0xFFFFFFFBu) ||
       !CleanupListNodeNeedsRecovery(0xFFFFFFFCu) || !CleanupListNodeNeedsRecovery(0xFFFFFFFFu)) {
     return 6;
+  }
+  // Captured v0.4.1 signature: sound creation left a null output handle while
+  // the caller still supplied a valid position.
+  if (!AudioLocationNeedsRecovery(0, 0x830CB318u)) {
+    return 7;
+  }
+  if (!AudioLocationNeedsRecovery(0x0000FFFFu, 0x830CB318u) ||
+      !AudioLocationNeedsRecovery(0x40000000u, 0x0000FFFFu)) {
+    return 8;
+  }
+  if (!AudioLocationNeedsRecovery(0xFFFFFFE1u, 0x830CB318u) ||
+      !AudioLocationNeedsRecovery(0x40000000u, 0xFFFFFFF5u)) {
+    return 9;
+  }
+  if (AudioLocationNeedsRecovery(0x00010000u, 0x830CB318u) ||
+      AudioLocationNeedsRecovery(0xFFFFFFE0u, 0xFFFFFFF4u)) {
+    return 10;
   }
   return 0;
 }
