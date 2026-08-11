@@ -155,6 +155,9 @@ class GeApp : public rex::ReXApp {
     REXLOG_INFO(
         "[GE-GUARD-823DACE0-v1] active; protects cleanup-list node loads at "
         "823DAD08");
+    REXLOG_INFO(
+        "[GE-GUARD-821448F8-v1] active; protects 3D audio location updates at "
+        "821448F8");
     if (auto* logger = rex::GetLoggerRaw(rex::log::core())) {
       logger->flush();
     }

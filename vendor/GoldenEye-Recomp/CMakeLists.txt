@@ -227,9 +227,9 @@ endif()
 # The staged .app, its verification suite and the launcher are macOS-only;
 # iOS packaging is a separate flow (docs/ipad/PLAN.md).
 if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    set(GOLDENEYE_VERSION "0.4.1" CACHE STRING
+    set(GOLDENEYE_VERSION "0.4.2" CACHE STRING
         "GoldenEye Metal CFBundleShortVersionString")
-    set(GOLDENEYE_BUILD_NUMBER "9" CACHE STRING
+    set(GOLDENEYE_BUILD_NUMBER "10" CACHE STRING
         "GoldenEye Metal numeric CFBundleVersion")
     set(GOLDENEYE_BUNDLE_IDENTIFIER "io.github.ysrdevs.goldeneye-metal" CACHE STRING
         "GoldenEye Metal reverse-DNS bundle identifier")

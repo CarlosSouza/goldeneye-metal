@@ -348,5 +348,72 @@ if(critical_section_argument_position LESS 0 OR
         "returning to 0x823E4B88")
 endif()
 
+# A v0.4.1 tester crash proved that a failed SFX creation can reach the shared
+# 3D-location setter with r3 == 0. The guard must remain the first operation in
+# this leaf function, return before any guest access on recovery, and retain the
+# complete original read/write sequence for valid sound objects.
+extract_generated_function("sub_821448F8" audio_location_body)
+set(audio_location_guard
+    "if (ge_guard_audio_location(ctx.r3, ctx.r4)) {")
+string(REGEX MATCHALL "ge_guard_audio_location\\("
+    audio_location_guard_calls "${audio_location_body}")
+list(LENGTH audio_location_guard_calls audio_location_guard_count)
+string(FIND "${audio_location_body}" "${audio_location_guard}"
+    audio_location_guard_position)
+string(FIND "${audio_location_body}"
+    "REX_STORE_U8(ctx.r3.u32 + 16, ctx.r11.u8);"
+    audio_location_first_store_position)
+if(NOT audio_location_guard_count EQUAL 1 OR
+   audio_location_guard_position LESS 0 OR
+   audio_location_first_store_position LESS 0 OR
+   NOT audio_location_guard_position LESS audio_location_first_store_position)
+    message(FATAL_ERROR
+        "sub_821448F8 must contain exactly one audio-location guard before "
+        "its first sound-object store")
+endif()
+
+string(SUBSTRING "${audio_location_body}" 0
+    ${audio_location_guard_position} audio_location_before_guard)
+string(REGEX MATCH "REX_(LOAD|STORE)_[A-Z0-9]+"
+    audio_location_early_access "${audio_location_before_guard}")
+if(NOT audio_location_early_access STREQUAL "")
+    message(FATAL_ERROR
+        "sub_821448F8 accesses guest memory before the audio-location guard")
+endif()
+
+math(EXPR audio_location_guarded_length
+    "${audio_location_first_store_position} - ${audio_location_guard_position}")
+string(SUBSTRING "${audio_location_body}" ${audio_location_guard_position}
+    ${audio_location_guarded_length} audio_location_guarded_region)
+string(FIND "${audio_location_guarded_region}" "return;"
+    audio_location_recovery_return)
+string(FIND "${audio_location_guarded_region}" "else"
+    audio_location_recovery_else)
+if(audio_location_recovery_return LESS 0 OR
+   audio_location_recovery_else LESS 0 OR
+   NOT audio_location_recovery_return LESS audio_location_recovery_else)
+    message(FATAL_ERROR
+        "sub_821448F8 audio-location recovery must return from the guard's true "
+        "branch before guest memory access")
+endif()
+
+foreach(original_access IN ITEMS
+    "REX_STORE_U8(ctx.r3.u32 + 16, ctx.r11.u8);"
+    "REX_LOAD_U32(ctx.r4.u32 + 0);"
+    "REX_STORE_U32(ctx.r3.u32 + 20, temp.u32);"
+    "REX_LOAD_U32(ctx.r4.u32 + 4);"
+    "REX_STORE_U32(ctx.r3.u32 + 24, temp.u32);"
+    "REX_LOAD_U32(ctx.r4.u32 + 8);"
+    "REX_STORE_U32(ctx.r3.u32 + 28, temp.u32);")
+    string(FIND "${audio_location_body}" "${original_access}"
+        original_access_position)
+    if(original_access_position LESS audio_location_first_store_position)
+        message(FATAL_ERROR
+            "sub_821448F8 no longer retains its guarded valid-path access: "
+            "${original_access}")
+    endif()
+endforeach()
+
 message(STATUS
-    "Verified audio/cleanup guards, child-list containment, and lock-wait diagnostic callsite")
+    "Verified audio/cleanup guards, audio-location containment, child-list containment, "
+    "and lock-wait diagnostic callsite")

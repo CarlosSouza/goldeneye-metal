@@ -154,6 +154,46 @@ TEST_CASE("critical-section ledger records leave mismatches without changing own
         CriticalSectionLeaveMismatchReason::kNoOwnershipRecord);
 }
 
+TEST_CASE("critical-section ledger preserves the ge_023 recursive handoff signature",
+          "[kernel][critical_section_ledger][goldeneye]") {
+  // ge_023 captured the cleanup worker as the recorded owner after entering
+  // sub_823CFC00, but guest memory named the blocked audio thread as owner with
+  // recursion two when the cleanup worker reached the leave callsite. A foreign
+  // leave must remain diagnostic-only in this ledger: it must not consume the
+  // cleanup worker's recorded outer ownership.
+  constexpr uint32_t kGeCriticalSection = 0x4466DA44;
+  constexpr uint32_t kCleanupWorker = 0x30039018;
+  constexpr uint32_t kBlockedAudioThread = 0x3002A018;
+  constexpr uint32_t kCleanupEnterLr = 0x823CFC30;
+  constexpr uint32_t kCleanupLeaveLr = 0x823CFD48;
+
+  CriticalSectionOwnershipLedger cleanup_worker_ledger;
+  cleanup_worker_ledger.RecordEnter(kGeCriticalSection, kCleanupEnterLr, 1);
+  cleanup_worker_ledger.RecordEnter(kGeCriticalSection, kCleanupEnterLr, 2);
+  cleanup_worker_ledger.RecordLeave(kGeCriticalSection, kCleanupLeaveLr, kCleanupWorker,
+                                    kCleanupWorker, 2, 1);
+
+  cleanup_worker_ledger.RecordLeaveMismatch(
+      kGeCriticalSection, kCleanupLeaveLr, kCleanupWorker, kBlockedAudioThread, 2,
+      CriticalSectionLeaveMismatchReason::kGuestOwnerMismatch);
+
+  const auto snapshot = Query(cleanup_worker_ledger, kGeCriticalSection);
+  CHECK(snapshot.ownership_found);
+  CHECK_FALSE(snapshot.provenance_incomplete);
+  CHECK(snapshot.first_enter_lr == kCleanupEnterLr);
+  CHECK(snapshot.last_enter_lr == kCleanupEnterLr);
+  CHECK(snapshot.recorded_depth == 1);
+  CHECK(snapshot.enter_count == 2);
+  CHECK(snapshot.total_leave_mismatches == 1);
+  REQUIRE(snapshot.recent_leave_mismatch_found);
+  CHECK(snapshot.recent_leave_mismatch.leave_lr == kCleanupLeaveLr);
+  CHECK(snapshot.recent_leave_mismatch.current_thread == kCleanupWorker);
+  CHECK(snapshot.recent_leave_mismatch.observed_owner == kBlockedAudioThread);
+  CHECK(snapshot.recent_leave_mismatch.observed_recursion == 2);
+  CHECK(snapshot.recent_leave_mismatch.reason ==
+        CriticalSectionLeaveMismatchReason::kGuestOwnerMismatch);
+}
+
 TEST_CASE("critical-section ledger bounds active ownership and mismatch history",
           "[kernel][critical_section_ledger]") {
   CriticalSectionOwnershipLedger ledger;
