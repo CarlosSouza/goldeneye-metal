@@ -79,6 +79,9 @@ TEST_CASE("GoldenEye restore consumers require exact shader and fetch words",
                                              kGoldenEyePostprocessDepthRgbaFetch) ==
         GoldenEyePostprocessConsumer::kDepthRgba);
   CHECK(ClassifyGoldenEyePostprocessConsumer(kGoldenEyePostprocessPixelShaderHash,
+                                             kGoldenEyePostprocessDepthRgbaMultiplayerFetch) ==
+        GoldenEyePostprocessConsumer::kDepthRgba);
+  CHECK(ClassifyGoldenEyePostprocessConsumer(kGoldenEyePostprocessPixelShaderHash,
                                              kGoldenEyePostprocessDepth24Stencil8Fetch) ==
         GoldenEyePostprocessConsumer::kDepth24Stencil8);
 
@@ -86,9 +89,10 @@ TEST_CASE("GoldenEye restore consumers require exact shader and fetch words",
                                              kGoldenEyePostprocessColorRgbaFetch) ==
         GoldenEyePostprocessConsumer::kNone);
 
-  const std::array<std::array<uint32_t, 6>, 3> exact_fetches = {
+  const std::array<std::array<uint32_t, 6>, 4> exact_fetches = {
       kGoldenEyePostprocessColorRgbaFetch,
       kGoldenEyePostprocessDepthRgbaFetch,
+      kGoldenEyePostprocessDepthRgbaMultiplayerFetch,
       kGoldenEyePostprocessDepth24Stencil8Fetch,
   };
   for (const auto& exact_fetch : exact_fetches) {
@@ -125,25 +129,58 @@ TEST_CASE("GoldenEye restore bands require exact raw predicated-tile state",
   CHECK(ClassifyGoldenEyePostprocessBand(0xC, 0x7FFFFFFF, 0, -256, 0, 256, 1280, 512, false) ==
         GoldenEyePostprocessBand::kNone);
 
-  CHECK(IsGoldenEyePostprocessProducerTileMask(
-      GoldenEyePostprocessBand::kTop, 0xFFFFFFFF));
-  CHECK(IsGoldenEyePostprocessProducerTileMask(
-      GoldenEyePostprocessBand::kMiddle, 0xFFFFFFFF));
-  CHECK(IsGoldenEyePostprocessProducerTileMask(
-      GoldenEyePostprocessBand::kBottom, 0xFFFFFFFF));
-  CHECK_FALSE(IsGoldenEyePostprocessProducerTileMask(
-      GoldenEyePostprocessBand::kMiddle, 0x8000003F));
+  CHECK(IsGoldenEyePostprocessProducerTileMask(GoldenEyePostprocessBand::kTop, 0xFFFFFFFF));
+  CHECK(IsGoldenEyePostprocessProducerTileMask(GoldenEyePostprocessBand::kMiddle, 0xFFFFFFFF));
+  CHECK(IsGoldenEyePostprocessProducerTileMask(GoldenEyePostprocessBand::kBottom, 0xFFFFFFFF));
+  CHECK_FALSE(
+      IsGoldenEyePostprocessProducerTileMask(GoldenEyePostprocessBand::kMiddle, 0x8000003F));
 
-  CHECK(IsGoldenEyePostprocessConsumerTileMask(
-      GoldenEyePostprocessBand::kTop, 0xFFFFFFFF));
-  CHECK(IsGoldenEyePostprocessConsumerTileMask(
-      GoldenEyePostprocessBand::kMiddle, 0x8000003F));
-  CHECK(IsGoldenEyePostprocessConsumerTileMask(
-      GoldenEyePostprocessBand::kBottom, 0x8000003F));
-  CHECK_FALSE(IsGoldenEyePostprocessConsumerTileMask(
-      GoldenEyePostprocessBand::kMiddle, 0xFFFFFFFF));
-  CHECK_FALSE(IsGoldenEyePostprocessConsumerTileMask(
-      GoldenEyePostprocessBand::kNone, 0xFFFFFFFF));
+  CHECK(IsGoldenEyePostprocessConsumerTileMask(GoldenEyePostprocessBand::kTop, 0xFFFFFFFF));
+  CHECK(IsGoldenEyePostprocessConsumerTileMask(GoldenEyePostprocessBand::kMiddle, 0x8000003F));
+  CHECK(IsGoldenEyePostprocessConsumerTileMask(GoldenEyePostprocessBand::kBottom, 0x8000003F));
+  CHECK_FALSE(
+      IsGoldenEyePostprocessConsumerTileMask(GoldenEyePostprocessBand::kMiddle, 0xFFFFFFFF));
+  CHECK_FALSE(IsGoldenEyePostprocessConsumerTileMask(GoldenEyePostprocessBand::kNone, 0xFFFFFFFF));
+}
+
+TEST_CASE("GoldenEye restore consumer draw requires the complete identity",
+          "[graphics][metal][goldeneye][postprocess]") {
+  constexpr std::array<std::array<uint32_t, 6>, 3> fetches = {
+      kGoldenEyePostprocessColorRgbaFetch,
+      kGoldenEyePostprocessDepth24Stencil8Fetch,
+      kGoldenEyePostprocessDepthRgbaFetch,
+  };
+  constexpr auto kBand = GoldenEyePostprocessBand::kMiddle;
+  constexpr uint64_t kMask = UINT64_C(0x8000003F);
+  CHECK(IsGoldenEyePostprocessConsumerDraw(
+      kGoldenEyePostprocessVertexShaderHash, kGoldenEyePostprocessPixelShaderHash,
+      rex::graphics::xenos::PrimitiveType::kTriangleList, 6, kBand, kMask, fetches));
+  CHECK_FALSE(IsGoldenEyePostprocessConsumerDraw(
+      kGoldenEyePostprocessVertexShaderHash ^ 1, kGoldenEyePostprocessPixelShaderHash,
+      rex::graphics::xenos::PrimitiveType::kTriangleList, 6, kBand, kMask, fetches));
+  CHECK_FALSE(IsGoldenEyePostprocessConsumerDraw(
+      kGoldenEyePostprocessVertexShaderHash, kGoldenEyePostprocessPixelShaderHash ^ 1,
+      rex::graphics::xenos::PrimitiveType::kTriangleList, 6, kBand, kMask, fetches));
+  CHECK_FALSE(IsGoldenEyePostprocessConsumerDraw(
+      kGoldenEyePostprocessVertexShaderHash, kGoldenEyePostprocessPixelShaderHash,
+      rex::graphics::xenos::PrimitiveType::kTriangleStrip, 6, kBand, kMask, fetches));
+  CHECK_FALSE(IsGoldenEyePostprocessConsumerDraw(
+      kGoldenEyePostprocessVertexShaderHash, kGoldenEyePostprocessPixelShaderHash,
+      rex::graphics::xenos::PrimitiveType::kTriangleList, 5, kBand, kMask, fetches));
+  CHECK_FALSE(IsGoldenEyePostprocessConsumerDraw(
+      kGoldenEyePostprocessVertexShaderHash, kGoldenEyePostprocessPixelShaderHash,
+      rex::graphics::xenos::PrimitiveType::kTriangleList, 6, GoldenEyePostprocessBand::kNone, kMask,
+      fetches));
+  CHECK_FALSE(IsGoldenEyePostprocessConsumerDraw(
+      kGoldenEyePostprocessVertexShaderHash, kGoldenEyePostprocessPixelShaderHash,
+      rex::graphics::xenos::PrimitiveType::kTriangleList, 6, kBand, UINT64_C(0xFFFFFFFF), fetches));
+  for (size_t fetch_index = 0; fetch_index < fetches.size(); ++fetch_index) {
+    auto mismatched_fetches = fetches;
+    mismatched_fetches[fetch_index][0] ^= 1;
+    CHECK_FALSE(IsGoldenEyePostprocessConsumerDraw(
+        kGoldenEyePostprocessVertexShaderHash, kGoldenEyePostprocessPixelShaderHash,
+        rex::graphics::xenos::PrimitiveType::kTriangleList, 6, kBand, kMask, mismatched_fetches));
+  }
 }
 
 TEST_CASE("GoldenEye restore producer classification fails closed",

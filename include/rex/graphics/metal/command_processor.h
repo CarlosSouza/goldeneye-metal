@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -16,6 +17,8 @@
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/metal/draw_renderer.h>
 #include <rex/graphics/metal/edram_snapshot.h>
+#include <rex/graphics/metal/exact_output_merger.h>
+#include <rex/graphics/metal/exact_output_merger_state.h>
 #include <rex/graphics/metal/goldeneye_postprocess_alias.h>
 #include <rex/graphics/metal/graphics_system.h>
 #include <rex/graphics/metal/msl_compiler.h>
@@ -62,6 +65,122 @@ inline bool UpdateExactResolvedSurfaceRowCoverage(std::vector<uint8_t>& row_vali
   return true;
 }
 
+// Identifies one exact resolved-surface assembly. A top-origin band may start
+// an assembly before the title has sampled the surface; later bands still need
+// an exact identity match and an already-published contiguous prefix.
+struct ExactResolvedSurfaceAssemblyIdentity {
+  uint32_t base = 0;
+  uint32_t pitch = 0;
+  uint32_t snapshot_height = 0;
+  uint32_t surface_height = 0;
+  uint32_t tiled_extent = 0;
+  uint32_t endian = 0;
+  uint64_t resolve_signature = 0;
+
+  bool operator==(const ExactResolvedSurfaceAssemblyIdentity&) const = default;
+};
+
+inline bool CanPrepareExactResolvedSurfaceAssemblyBand(
+    const ExactResolvedSurfaceAssemblyIdentity* active_identity, uint32_t active_row_capacity,
+    uint32_t active_valid_row_count, const ExactResolvedSurfaceAssemblyIdentity& proposed_identity,
+    uint32_t snapshot_y, uint32_t write_height) {
+  if (!proposed_identity.base || !proposed_identity.pitch || !proposed_identity.snapshot_height ||
+      proposed_identity.snapshot_height != proposed_identity.surface_height ||
+      !proposed_identity.tiled_extent || !write_height ||
+      snapshot_y > proposed_identity.snapshot_height ||
+      write_height > proposed_identity.snapshot_height - snapshot_y) {
+    return false;
+  }
+  if (!snapshot_y) {
+    return true;
+  }
+  return active_identity && *active_identity == proposed_identity &&
+         active_row_capacity == proposed_identity.snapshot_height &&
+         active_valid_row_count == snapshot_y;
+}
+
+// Identifies one in-flight copy into the exact resolved-surface texture. The
+// guest range is the full tiled surface because any write within it may make a
+// partially assembled snapshot stale.
+struct ExactResolvedSurfacePublicationIdentity {
+  uint32_t base = 0;
+  uint32_t pitch = 0;
+  uint32_t surface_height = 0;
+  uint32_t tiled_extent = 0;
+  uint32_t snapshot_y = 0;
+  uint32_t write_height = 0;
+  uint32_t endian = 0;
+  uint64_t resolve_signature = 0;
+
+  bool operator==(const ExactResolvedSurfacePublicationIdentity&) const = default;
+};
+
+// Tracks the range exposed between preparing a native Metal snapshot copy and
+// publishing its row coverage. Callers serialize this with the exact-surface
+// mutex. A token prevents an old completion from publishing a superseded or
+// invalidated candidate.
+class ExactResolvedSurfacePublicationTracker {
+ public:
+  struct InvalidationResult {
+    bool current_overlap = false;
+    bool pending_overlap = false;
+
+    bool any_overlap() const { return current_overlap || pending_overlap; }
+  };
+
+  uint64_t Arm(const ExactResolvedSurfacePublicationIdentity& identity) {
+    do {
+      ++next_token_;
+    } while (!next_token_);
+    pending_identity_ = identity;
+    pending_token_ = next_token_;
+    pending_active_ = true;
+    return pending_token_;
+  }
+
+  bool Consume(uint64_t token, const ExactResolvedSurfacePublicationIdentity& identity) {
+    if (!pending_active_ || !token || token != pending_token_ || identity != pending_identity_) {
+      return false;
+    }
+    pending_active_ = false;
+    return true;
+  }
+
+  void Reset() { pending_active_ = false; }
+
+  bool pending_active() const { return pending_active_; }
+
+  InvalidationResult Invalidate(bool current_active, uint32_t current_base, uint32_t current_extent,
+                                uint32_t write_base, uint32_t write_length) {
+    InvalidationResult result;
+    if (!write_length) {
+      return result;
+    }
+    result.current_overlap =
+        current_active && RangesOverlap(current_base, current_extent, write_base, write_length);
+    result.pending_overlap =
+        pending_active_ && RangesOverlap(pending_identity_.base, pending_identity_.tiled_extent,
+                                         write_base, write_length);
+    if (result.pending_overlap) {
+      pending_active_ = false;
+    }
+    return result;
+  }
+
+ private:
+  static bool RangesOverlap(uint32_t a_base, uint32_t a_length, uint32_t b_base,
+                            uint32_t b_length) {
+    uint64_t a_end = uint64_t(a_base) + a_length;
+    uint64_t b_end = uint64_t(b_base) + b_length;
+    return a_length && b_length && uint64_t(a_base) < b_end && uint64_t(b_base) < a_end;
+  }
+
+  ExactResolvedSurfacePublicationIdentity pending_identity_;
+  uint64_t next_token_ = 0;
+  uint64_t pending_token_ = 0;
+  bool pending_active_ = false;
+};
+
 class MetalCommandProcessor final : public CommandProcessor {
  public:
   MetalCommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
@@ -90,6 +209,8 @@ class MetalCommandProcessor final : public CommandProcessor {
       std::chrono::milliseconds timeout) override;
   void EndWaitRegMemMemoryChange() override;
   void OnPrimaryBufferEnd() override;
+  uint32_t QueryPendingBackendSubmissionsForProfile() const override;
+  bool IsGpuChainProfilingEnabled() const override { return profile_enabled_; }
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   void OnWaitRegMemComplete(bool is_memory, uint32_t poll_address, uint32_t reference,
                             uint32_t mask, uint32_t operation, uint32_t wait, uint32_t last_value,
@@ -126,10 +247,29 @@ class MetalCommandProcessor final : public CommandProcessor {
   MetalShader::MetalTranslation* GetTranslatedShader(MetalShader& shader);
   bool EnsureShaderTranslated(MetalShader& shader, uint64_t modification);
   bool EnsureShaderTranslated(MetalShader& shader);
-  void* CreateCachedRenderPipelineState(void* vertex_library, void* fragment_library,
-                                        std::string* error_out,
-                                        const ProbeColorTargetState* color_target_state = nullptr,
-                                        uint32_t sample_count = 1);
+  bool EnsureExactOutputMergerShaderTranslator();
+  uint64_t GetExactOutputMergerDefaultShaderModification(MetalShader& shader);
+  void GetCurrentExactOutputMergerShaderModifications(MetalShader* vertex_shader,
+                                                      MetalShader* pixel_shader,
+                                                      uint64_t& vertex_modification,
+                                                      uint64_t& pixel_modification,
+                                                      uint32_t* interpolator_mask_out = nullptr,
+                                                      uint32_t* ps_param_gen_pos_out = nullptr);
+  bool EnsureExactOutputMergerShaderTranslated(MetalShader& shader, uint64_t modification);
+  MetalShader::MetalTranslation* GetExactOutputMergerTranslatedShader(MetalShader& shader,
+                                                                      uint64_t modification);
+  bool EnsureExactOutputMergerInitialized();
+  ExactOutputMergerExecutionResult TryExecuteExactOutputMergerDraw(
+      MetalShader& vertex_shader, MetalShader& pixel_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      bool primitive_polygonal, std::string* error_out);
+  bool MaterializeExactOutputMergerEdram(const char* reason, std::string* error_out = nullptr);
+  void ClearExactOutputMergerPipelineCache();
+  void ShutdownExactOutputMerger();
+  void* CreateCachedRenderPipelineState(
+      void* vertex_library, void* fragment_library, std::string* error_out,
+      const ProbeRenderPipelineDescription* pipeline_description = nullptr,
+      uint32_t sample_count = 1);
   void FinalizePipelineArchiveSerializationLocked();
   void HandlePipelineArchiveSerializationResultLocked(bool succeeded, uint64_t archive_size,
                                                       uint64_t elapsed_ns,
@@ -138,6 +278,9 @@ class MetalCommandProcessor final : public CommandProcessor {
   void ShutdownPipelineArchive();
   void* EnsureRenderPipeline(MetalShader& vertex_shader, MetalShader& pixel_shader,
                              uint32_t rt_index = 0, uint32_t color_write_mask = 0xF);
+  void* EnsureMrtRenderPipeline(MetalShader& vertex_shader, MetalShader& pixel_shader,
+                                const ProbeRenderPipelineDescription& pipeline_description,
+                                uint32_t sample_count);
   void UpdateMinimalSystemConstants(xenos::PrimitiveType prim_type,
                                     const IndexBufferInfo* index_buffer_info);
   void UpdateGuestConstantBuffers();
@@ -147,7 +290,11 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool TryRenderPipelineProbe(
       MetalShader& vertex_shader, MetalShader* pixel_shader, void* pipeline_state,
       xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug = false,
-      const PrimitiveProcessor::ProcessingResult* primitive_processing_result = nullptr);
+      const PrimitiveProcessor::ProcessingResult* primitive_processing_result = nullptr,
+      uint32_t color_attachment_index = 0,
+      const std::array<void*, xenos::kMaxColorRenderTargets>* mrt_contexts = nullptr,
+      const ProbeRenderPipelineDescription* mrt_pipeline_description = nullptr,
+      PipelineProbeMrtTelemetry* mrt_telemetry_out = nullptr);
   struct HostRenderTarget;
   struct HostDepthStencilTarget;
   // Drains every persistent context except ordered_context. Work on the
@@ -167,10 +314,12 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool RefreshHostRenderTargetBacking(uint32_t width, uint32_t height);
   bool EnsureEdramBgraBacking();
   CanonicalEdramSurfaceLayout GetCanonicalColorLayout(const HostRenderTarget& target) const;
-  CanonicalEdramSurfaceLayout GetCanonicalDepthLayout(
-      const HostDepthStencilTarget& target) const;
-  bool CaptureCanonicalEdramSnapshot(std::vector<uint8_t>& snapshot_out,
-                                     std::string* error_out);
+  CanonicalEdramSurfaceLayout GetCanonicalDepthLayout(const HostDepthStencilTarget& target) const;
+  bool CaptureCanonicalEdramSnapshot(std::vector<uint8_t>& snapshot_out, std::string* error_out);
+  bool ReplaceCanonicalEdramSnapshot(const void* snapshot, bool from_exact_output_merger);
+  void InvalidateCanonicalEdramAfterExactFailure();
+  void PublishExactOutputMergerCopyDestination(uint32_t start, uint32_t length);
+  void RevokeExactOutputMergerCopyDestination(uint32_t start, uint32_t length);
   void RecordCanonicalColorRequirement(xenos::ColorRenderTargetFormat format,
                                        xenos::MsaaSamples msaa_samples);
   void RecordCanonicalDepthRequirement(xenos::DepthRenderTargetFormat format,
@@ -182,8 +331,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   bool PrepareCanonicalContextForUse(void* context, uint32_t width, uint32_t height,
                                      std::string* error_out);
   bool PrepareCanonicalDepthTargetForUse(HostDepthStencilTarget& target, uint64_t target_key,
-                                         uint32_t width, uint32_t height,
-                                         std::string* error_out);
+                                         uint32_t width, uint32_t height, std::string* error_out);
   void MarkCanonicalColorTargetWritten(HostRenderTarget& target, uint64_t target_key);
   void MarkCanonicalDepthTargetWritten(HostDepthStencilTarget& target, uint64_t target_key);
   void MarkCanonicalWritesForContext(void* context, uint32_t shader_color_target_mask,
@@ -261,56 +409,50 @@ class MetalCommandProcessor final : public CommandProcessor {
                                        uint32_t write_height, xenos::Endian128 dest_endian,
                                        uint64_t expected_invalidation_epoch);
   bool EnsureExactResolvedSurfaceSnapshot(uint32_t width, uint32_t height);
-  void RememberCompatibleExactResolvedSurfaceFetch(const xenos::xe_gpu_texture_fetch_t& fetch);
-  bool HasCompatibleExactResolvedSurfaceFetch(uint32_t base, uint32_t pitch, uint32_t height,
-                                              xenos::Endian128 endian) const;
   bool PrepareExactResolvedSurfaceGpuBand(uint32_t dest_base, uint32_t pitch,
                                           uint32_t surface_height, uint32_t snapshot_y,
                                           uint32_t write_height, xenos::Endian128 dest_endian,
                                           uint64_t resolve_signature, void*& texture_out,
-                                          uint64_t& invalidation_epoch_out);
+                                          uint64_t& publication_token_out);
   void UpdateExactResolvedSurfaceGpuCache(uint32_t dest_base, uint32_t pitch,
                                           uint32_t surface_height, uint32_t snapshot_width,
                                           uint32_t snapshot_height, uint32_t snapshot_y,
                                           uint32_t write_height, xenos::Endian128 dest_endian,
-                                          uint64_t resolve_signature,
-                                          uint64_t expected_invalidation_epoch);
+                                          uint64_t resolve_signature, uint64_t publication_token);
   bool GetExactResolvedSurfaceTextureForFetch(const xenos::xe_gpu_texture_fetch_t& fetch,
                                               void*& texture_out, uint32_t& width_out,
                                               uint32_t& height_out, uint32_t& host_swizzle_out,
                                               uint8_t& swizzled_signs_out) const;
   void ReleaseExactResolvedSurfaceSnapshot();
   bool EnsureResolvedDepthSnapshot(uint32_t width, uint32_t height);
-  bool PrepareResolvedDepthSnapshotGpuBand(
-      uint32_t base, uint32_t pitch, uint32_t tiled_extent, uint32_t snapshot_width,
-      uint32_t snapshot_height, uint32_t snapshot_y, uint32_t write_height,
-      xenos::DepthRenderTargetFormat format, xenos::Endian128 endian,
-      uint64_t resolve_signature, void*& texture_out,
-      uint64_t& invalidation_epoch_out);
-  void UpdateResolvedDepthSnapshotGpuCache(
-      uint32_t base, uint32_t pitch, uint32_t tiled_extent, uint32_t snapshot_width,
-      uint32_t snapshot_height, uint32_t snapshot_y, uint32_t write_height,
-      xenos::DepthRenderTargetFormat format, xenos::Endian128 endian,
-      uint64_t resolve_signature, uint64_t expected_invalidation_epoch);
+  bool PrepareResolvedDepthSnapshotGpuBand(uint32_t base, uint32_t pitch, uint32_t tiled_extent,
+                                           uint32_t snapshot_width, uint32_t snapshot_height,
+                                           uint32_t snapshot_y, uint32_t write_height,
+                                           xenos::DepthRenderTargetFormat format,
+                                           xenos::Endian128 endian, uint64_t resolve_signature,
+                                           void*& texture_out, uint64_t& invalidation_epoch_out);
+  void UpdateResolvedDepthSnapshotGpuCache(uint32_t base, uint32_t pitch, uint32_t tiled_extent,
+                                           uint32_t snapshot_width, uint32_t snapshot_height,
+                                           uint32_t snapshot_y, uint32_t write_height,
+                                           xenos::DepthRenderTargetFormat format,
+                                           xenos::Endian128 endian, uint64_t resolve_signature,
+                                           uint64_t expected_invalidation_epoch);
   bool GetResolvedDepthSnapshotTextureForFetch(const xenos::xe_gpu_texture_fetch_t& fetch,
                                                void*& texture_out, uint32_t& width_out,
                                                uint32_t& height_out, uint32_t& host_swizzle_out,
                                                uint8_t& swizzled_signs_out) const;
   void InvalidateResolvedDepthSnapshot(uint32_t base_physical, uint32_t length);
   void ReleaseResolvedDepthSnapshot();
-  bool EnsureGoldenEyePostprocessTextures(
-      void*& color_texture_out, void*& depth_texture_out,
-      void*& packed_depth_texture_out);
+  bool EnsureGoldenEyePostprocessTextures(void*& color_texture_out, void*& depth_texture_out,
+                                          void*& packed_depth_texture_out);
   GoldenEyePostprocessBand GetGoldenEyePostprocessBand() const;
-  bool PublishGoldenEyePostprocessProducer(
-      const GoldenEyePostprocessProducer& producer);
-  bool GetGoldenEyePostprocessTextureForFetch(
-      uint64_t pixel_shader_hash, const xenos::xe_gpu_texture_fetch_t& fetch,
-      void*& texture_out,
-      uint32_t& width_out, uint32_t& height_out, uint32_t& host_swizzle_out,
-      uint8_t& swizzled_signs_out) const;
-  void InvalidateGoldenEyePostprocessAliases(uint32_t base_physical,
-                                             uint32_t length);
+  bool PublishGoldenEyePostprocessProducer(const GoldenEyePostprocessProducer& producer);
+  bool GetGoldenEyePostprocessTextureForFetch(uint64_t pixel_shader_hash,
+                                              const xenos::xe_gpu_texture_fetch_t& fetch,
+                                              void*& texture_out, uint32_t& width_out,
+                                              uint32_t& height_out, uint32_t& host_swizzle_out,
+                                              uint8_t& swizzled_signs_out) const;
+  void InvalidateGoldenEyePostprocessAliases(uint32_t base_physical, uint32_t length);
   void ReleaseGoldenEyePostprocessTextures();
   static void WaitRegMemMemoryChangeWatchCallback(
       const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
@@ -342,6 +484,17 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unique_ptr<MetalSharedMemory> shared_memory_;
   std::unique_ptr<MetalTextureCache> texture_cache_;
   std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  // Created lazily only when the default-off exact route asks for a
+  // translation. Native draws therefore allocate and compile nothing for it.
+  std::unique_ptr<SpirvShaderTranslator> exact_output_merger_shader_translator_;
+  void* exact_output_merger_resources_ = nullptr;
+  // Exact pipelines are production state, not a diagnostic hint. Keep the
+  // complete identity instead of accepting a 64-bit hash collision between
+  // different guest shader pairs or sample counts.
+  std::map<std::array<uint64_t, 5>, ExactOutputMergerPipeline*>
+      exact_output_merger_pipeline_states_;
+  std::vector<uint8_t> exact_output_merger_edram_transfer_;
+  ExactOutputMergerResidencyTracker exact_output_merger_residency_;
   std::unique_ptr<MetalDrawRenderer> draw_renderer_;
   std::unique_ptr<PrimitiveProcessor> primitive_processor_;
   void* metal_device_ = nullptr;
@@ -440,6 +593,10 @@ class MetalCommandProcessor final : public CommandProcessor {
   // Unsupported private formats keep live rendering on the compatibility
   // path, but permanently disqualify the current state from exact capture.
   bool canonical_edram_unsupported_state_ = false;
+  // A native write to a logically self-aliasing target cannot be serialized
+  // losslessly. IssueCopy must reject before publishing a destination rather
+  // than partially resolving and discovering this during a later clear.
+  bool canonical_edram_unexportable_native_alias_ = false;
   std::vector<uint8_t> pending_texture_resolve_bgra_;
   std::vector<uint8_t> pending_host_texture_rgba_;
   struct RetainedResolvedFrame {
@@ -545,6 +702,7 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint32_t, RetainedResolvedFrame> retained_resolve_frames_by_base_;
   mutable std::recursive_mutex exact_resolved_surface_mutex_;
   ExactResolvedSurface exact_resolved_surface_;
+  ExactResolvedSurfacePublicationTracker exact_resolved_surface_publication_tracker_;
   mutable std::recursive_mutex resolved_depth_snapshot_mutex_;
   ResolvedDepthSnapshot resolved_depth_snapshot_;
   std::atomic<uint64_t> resolved_depth_snapshot_invalidation_epoch_{0};
@@ -563,13 +721,9 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::atomic<bool> resolved_depth_expected_gpu_write_active_{false};
   std::atomic<uint32_t> resolved_depth_expected_gpu_write_first_{0};
   std::atomic<uint32_t> resolved_depth_expected_gpu_write_last_{0};
-  std::atomic<bool>
-      goldeneye_postprocess_expected_gpu_write_active_{false};
-  std::atomic<uint32_t>
-      goldeneye_postprocess_expected_gpu_write_first_{0};
-  std::atomic<uint32_t>
-      goldeneye_postprocess_expected_gpu_write_last_{0};
-  std::unordered_set<uint64_t> observed_exact_resolved_surface_fetches_;
+  std::atomic<bool> goldeneye_postprocess_expected_gpu_write_active_{false};
+  std::atomic<uint32_t> goldeneye_postprocess_expected_gpu_write_first_{0};
+  std::atomic<uint32_t> goldeneye_postprocess_expected_gpu_write_last_{0};
   std::unordered_map<uint64_t, HostRenderTarget> host_render_targets_;
   std::unordered_map<uint64_t, HostDepthStencilTarget> host_depth_stencil_targets_;
   std::vector<PendingReadbackResolveSlice> pending_readback_resolve_slices_;
@@ -618,6 +772,15 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint32_t color_target_candidate_draws_this_swap_ = 0;
   uint32_t register_color_candidate_draws_this_swap_ = 0;
   uint32_t register_color_unrouted_draws_this_swap_ = 0;
+  uint32_t unsupported_mrt_draws_this_swap_ = 0;
+  uint32_t production_mrt_attempts_this_swap_ = 0;
+  uint32_t production_mrt_successes_this_swap_ = 0;
+  uint32_t production_mrt_rejections_this_swap_ = 0;
+  uint32_t production_mrt_targets_this_swap_ = 0;
+  uint32_t production_mrt_encoded_draws_this_swap_ = 0;
+  uint32_t production_mrt_completed_commands_this_swap_ = 0;
+  uint32_t production_mrt_vertex_memexport_draws_this_swap_ = 0;
+  uint32_t production_mrt_pixel_memexport_draws_this_swap_ = 0;
   uint32_t owned_rt_routed_draws_this_swap_ = 0;
   uint32_t owned_rt_routed_targets_this_swap_ = 0;
   uint32_t diagnostic_frame_count_ = 0;
@@ -635,6 +798,18 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t gpu_tiled_resolve_fallback_count_ = 0;
   uint64_t gpu_tiled_resolve_mirror_count_ = 0;
   uint64_t gpu_tiled_resolve_mirror_byte_count_ = 0;
+  uint64_t gpu_tiled_resolve_async_count_ = 0;
+  uint64_t gpu_tiled_resolve_sync_readback_count_ = 0;
+  uint64_t gpu_tiled_resolve_sync_missing_snapshot_count_ = 0;
+  uint64_t gpu_tiled_resolve_sync_verbose_count_ = 0;
+  uint64_t gpu_tiled_resolve_sync_missing_alias_count_ = 0;
+  uint64_t gpu_tiled_resolve_exact_snapshot_count_ = 0;
+  uint64_t profiled_gpu_tiled_resolve_async_count_ = 0;
+  uint64_t profiled_gpu_tiled_resolve_sync_readback_count_ = 0;
+  uint64_t profiled_gpu_tiled_resolve_sync_missing_snapshot_count_ = 0;
+  uint64_t profiled_gpu_tiled_resolve_sync_verbose_count_ = 0;
+  uint64_t profiled_gpu_tiled_resolve_sync_missing_alias_count_ = 0;
+  uint64_t profiled_gpu_tiled_resolve_exact_snapshot_count_ = 0;
   uint64_t gpu_depth_resolve_count_ = 0;
   uint64_t gpu_depth_resolve_pixel_count_ = 0;
   uint64_t gpu_depth_resolve_fallback_count_ = 0;
@@ -652,6 +827,18 @@ class MetalCommandProcessor final : public CommandProcessor {
   uint64_t wait_reg_mem_event_signal_count_ = 0;
   uint64_t wait_reg_mem_event_timeout_count_ = 0;
   uint64_t wait_reg_mem_event_unavailable_count_ = 0;
+  struct ExactOutputMergerProfileCounters {
+    uint64_t attempts = 0;
+    uint64_t enqueued = 0;
+    uint64_t completed = 0;
+    uint64_t rejected = 0;
+    uint64_t terminal_failures = 0;
+    uint64_t materializations = 0;
+    uint64_t full_uploads = 0;
+    uint64_t full_upload_bytes = 0;
+    uint64_t full_downloads = 0;
+    uint64_t full_download_bytes = 0;
+  } exact_output_merger_profile_counters_, profiled_exact_output_merger_counters_;
   uint32_t host_pixel_draws_this_swap_ = 0;
   uint32_t host_fallback_pixel_draws_this_swap_ = 0;
   uint32_t host_rt_cpu_draws_this_swap_ = 0;
@@ -705,6 +892,14 @@ class MetalCommandProcessor final : public CommandProcessor {
   std::unordered_map<WaitRegMemProfileKey, WaitRegMemProfileEntry, WaitRegMemProfileKeyHash>
       wait_reg_mem_profile_entries_;
   profiling::CommandProfileWindow profile_window_;
+  GpuChainProfileSnapshot last_gpu_chain_profile_snapshot_;
+  PipelineProbeSubmissionStats last_profiled_probe_submission_stats_;
+  PipelineProbeSubmissionStats last_profiled_exact_output_merger_submission_stats_;
+  uint64_t last_profiled_exact_output_merger_context_identity_ = 0;
+  std::vector<uint64_t> last_profiled_probe_context_identities_;
+  uint64_t profiled_wait_reg_mem_event_signal_count_ = 0;
+  uint64_t profiled_wait_reg_mem_event_timeout_count_ = 0;
+  uint64_t profiled_wait_reg_mem_event_unavailable_count_ = 0;
   uint64_t profiled_swap_count_ = 0;
   uint64_t profile_window_start_ns_ = 0;
   uint64_t profiled_pipeline_probe_count_ = 0;

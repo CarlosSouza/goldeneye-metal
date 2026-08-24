@@ -19,16 +19,15 @@
 
 namespace {
 
-rex::memory::Memory& GetTestMemory() {
-  static rex::memory::Memory memory;
-  static bool initialized = false;
-  if (!initialized) {
+// Memory owns the process-wide MMIO handler. Keep it scoped to each case so
+// the dispatcher tests can coexist with other Memory tests in one process.
+class ScopedTestMemory final : public rex::memory::Memory {
+ public:
+  ScopedTestMemory() {
     rex::InitLogging();
-    REQUIRE(memory.Initialize());
-    initialized = true;
+    REQUIRE(Initialize());
   }
-  return memory;
-}
+};
 
 void DummyFn(PPCContext&, uint8_t*) {}
 
@@ -36,7 +35,7 @@ void DummyFn(PPCContext&, uint8_t*) {}
 
 TEST_CASE("FunctionDispatcher: caller_address routes thunk to caller's module pool",
           "[runtime][dispatcher]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   rex::runtime::ExportResolver resolver;
   rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
 
@@ -66,7 +65,7 @@ TEST_CASE("FunctionDispatcher: AllocateThunk(0) uses the entrypoint pool only wh
   // caller_address=0 is reserved for host-initiated allocations that have no
   // guest caller (the entrypoint wiring its own __imp__* exports during
   // setup). It must land in the entrypoint module's pool.
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   rex::runtime::ExportResolver resolver;
   rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
 
@@ -84,7 +83,7 @@ TEST_CASE("FunctionDispatcher: AllocateThunk(0) uses the entrypoint pool only wh
 
 TEST_CASE("FunctionDispatcher: AllocateThunk(0) rejects when no entrypoint registered",
           "[runtime][dispatcher]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   rex::runtime::ExportResolver resolver;
   rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
 
@@ -99,7 +98,7 @@ TEST_CASE("FunctionDispatcher: AllocateThunk(0) rejects when no entrypoint regis
 
 TEST_CASE("FunctionDispatcher: AllocateThunk rejects caller_address outside any module",
           "[runtime][dispatcher]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   rex::runtime::ExportResolver resolver;
   rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
 
@@ -124,7 +123,7 @@ void RegisterOne(rex::runtime::IModuleRegistrar* registrar) {
 }  // namespace
 
 TEST_CASE("FunctionDispatcher: UnregisterModule clears pool and slots", "[runtime][dispatcher]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   rex::runtime::ExportResolver resolver;
   rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
 
@@ -158,7 +157,7 @@ TEST_CASE("FunctionDispatcher: UnregisterModule clears pool and slots", "[runtim
 
 TEST_CASE("FunctionDispatcher: UnregisterModule on unknown id returns nullopt",
           "[runtime][dispatcher]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   rex::runtime::ExportResolver resolver;
   rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
   CHECK_FALSE(dispatcher.UnregisterModule("nope").has_value());

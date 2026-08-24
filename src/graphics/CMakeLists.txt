@@ -18,6 +18,7 @@ set(REXGRAPHICS_CORE_SOURCES
 set(REXGRAPHICS_SYSTEM_SOURCES
     graphics_system.cpp
     command_processor.cpp
+    trace_capture.cpp
     trace_writer.cpp
     trace_reader.cpp
     trace_player.cpp
@@ -67,6 +68,9 @@ if(REXGLUE_USE_METAL)
         metal/graphics_system.cpp
         metal/command_processor.cpp
         metal/edram_snapshot.cpp
+        metal/exact_output_merger.mm
+        metal/exact_output_merger_state.cpp
+        metal/raw_color_sidecar.cpp
         metal/draw_renderer.mm
         metal/msl_compiler.mm
         metal/shared_memory.mm
@@ -250,6 +254,7 @@ if(REXGLUE_USE_METAL)
     add_executable(metal_pipeline_probe_test
         metal/pipeline_probe_test.mm
         metal/edram_snapshot.cpp
+        metal/raw_color_sidecar.cpp
         metal/msl_compiler.mm
         xenos.cpp
     )
@@ -268,6 +273,93 @@ if(REXGLUE_USE_METAL)
     )
     if(REXGLUE_BUILD_TESTS)
         add_test(NAME metal_pipeline_probe_test COMMAND metal_pipeline_probe_test)
+    endif()
+
+    # Isolated regression gate for the four-slot render-pipeline descriptor
+    # and the synchronous real-Metal MRT path used by production IssueDraw.
+    add_executable(metal_mrt_probe_test
+        metal/mrt_probe_test.mm
+        metal/edram_snapshot.cpp
+        metal/raw_color_sidecar.cpp
+        metal/msl_compiler.mm
+        xenos.cpp
+    )
+    target_include_directories(metal_mrt_probe_test PRIVATE
+        ${REXGLUE_ROOT}/include
+    )
+    target_compile_definitions(metal_mrt_probe_test PRIVATE
+        REX_METAL_MRT_PROBE_TESTING=1
+    )
+    target_link_libraries(metal_mrt_probe_test PRIVATE
+        rexcore
+        "-framework Metal"
+        "-framework Foundation"
+    )
+    set_target_properties(metal_mrt_probe_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    if(REXGLUE_BUILD_TESTS)
+        add_test(NAME metal_mrt_probe_test COMMAND metal_mrt_probe_test)
+        set_tests_properties(metal_mrt_probe_test PROPERTIES
+            ENVIRONMENT "MTL_DEBUG_LAYER=1"
+        )
+    endif()
+
+    # Real-device go/no-go gate for lowering the existing SPIR-V fragment
+    # interlock output-merger path to Metal raster-order groups. This remains
+    # isolated from production IssueDraw until every ordered RMW case passes.
+    add_executable(metal_raster_order_probe_test
+        metal/raster_order_probe_test.mm
+    )
+    target_include_directories(metal_raster_order_probe_test PRIVATE
+        ${REXGLUE_ROOT}/include
+    )
+    target_link_libraries(metal_raster_order_probe_test PRIVATE
+        rexruntime
+        glslang::SPIRV
+        "-framework Metal"
+        "-framework Foundation"
+    )
+    set_target_properties(metal_raster_order_probe_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    if(REXGLUE_BUILD_TESTS)
+        add_test(NAME metal_raster_order_probe_test COMMAND metal_raster_order_probe_test)
+        set_tests_properties(metal_raster_order_probe_test PROPERTIES
+            ENVIRONMENT "MTL_DEBUG_LAYER=1"
+        )
+    endif()
+
+    # Focused real-device gate for the exact-EDRAM IssueCopy consumer. This is
+    # separate from the raster-order draw probe so resolve/copy/clear ordering
+    # and dependent asynchronous failure revocation stay independently visible.
+    add_executable(metal_exact_resolve_probe_test
+        metal/exact_resolve_probe_test.mm
+    )
+    target_include_directories(metal_exact_resolve_probe_test PRIVATE
+        ${REXGLUE_ROOT}/include
+    )
+    target_link_libraries(metal_exact_resolve_probe_test PRIVATE
+        rexruntime
+        glslang::SPIRV
+        xxHash::xxhash
+        "-framework Metal"
+        "-framework Foundation"
+    )
+    set_target_properties(metal_exact_resolve_probe_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    if(REXGLUE_BUILD_TESTS)
+        add_test(NAME metal_exact_resolve_probe_test COMMAND metal_exact_resolve_probe_test)
+        set_tests_properties(metal_exact_resolve_probe_test PROPERTIES
+            ENVIRONMENT "MTL_DEBUG_LAYER=1"
+        )
     endif()
 
     # Pure checked-span regression gate for direct probe texture decoding. In

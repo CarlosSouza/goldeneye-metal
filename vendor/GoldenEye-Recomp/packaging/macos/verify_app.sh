@@ -3,6 +3,9 @@
 set -euo pipefail
 
 APP_BUNDLE="${1:-}"
+EXPECTED_VERSION="${2:-}"
+EXPECTED_BUILD_NUMBER="${3:-}"
+EXPECTED_INPUT_TEST_HARNESS="${4:-}"
 
 fail() {
   printf 'GoldenEye Metal app verification failed: %s\n' "$1" >&2
@@ -10,7 +13,16 @@ fail() {
 }
 
 [ "$(uname -s)" = "Darwin" ] || fail "this verifier requires macOS"
-[ -n "$APP_BUNDLE" ] || fail "usage: verify_app.sh /path/to/GoldenEye\\ Metal.app"
+[ -n "$APP_BUNDLE" ] && [ -n "$EXPECTED_VERSION" ] && [ -n "$EXPECTED_BUILD_NUMBER" ] &&
+  [ -n "$EXPECTED_INPUT_TEST_HARNESS" ] ||
+  fail "usage: verify_app.sh /path/to/GoldenEye\\ Metal.app expected-version expected-build on|off"
+[[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
+  fail "expected version must contain two or three numeric components"
+[[ "$EXPECTED_BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+)?(\.[0-9]+)?$ ]] ||
+  fail "expected build must contain one to three numeric components"
+[ "$EXPECTED_INPUT_TEST_HARNESS" = "on" ] ||
+  [ "$EXPECTED_INPUT_TEST_HARNESS" = "off" ] ||
+  fail "expected input test harness must be on or off"
 [ -d "$APP_BUNDLE" ] || fail "bundle does not exist: $APP_BUNDLE"
 
 CONTENTS="$APP_BUNDLE/Contents"
@@ -71,9 +83,14 @@ plist_value() {
 [ -n "$(plist_value CFBundleIdentifier)" ] || fail "CFBundleIdentifier is empty"
 [ "$(plist_value CFBundleIconFile)" = "GoldenEyeMetal" ] ||
   fail "CFBundleIconFile must be GoldenEyeMetal"
-[ -n "$(plist_value CFBundleShortVersionString)" ] ||
-  fail "CFBundleShortVersionString is empty"
-[ -n "$(plist_value CFBundleVersion)" ] || fail "CFBundleVersion is empty"
+ACTUAL_VERSION="$(plist_value CFBundleShortVersionString)"
+ACTUAL_BUILD_NUMBER="$(plist_value CFBundleVersion)"
+[ -n "$ACTUAL_VERSION" ] || fail "CFBundleShortVersionString is empty"
+[ -n "$ACTUAL_BUILD_NUMBER" ] || fail "CFBundleVersion is empty"
+[ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] ||
+  fail "CFBundleShortVersionString ($ACTUAL_VERSION) does not match expected version $EXPECTED_VERSION"
+[ "$ACTUAL_BUILD_NUMBER" = "$EXPECTED_BUILD_NUMBER" ] ||
+  fail "CFBundleVersion ($ACTUAL_BUILD_NUMBER) does not match expected build $EXPECTED_BUILD_NUMBER"
 PLIST_MINIMUM_SYSTEM_VERSION="$(plist_value LSMinimumSystemVersion)"
 [ -n "$PLIST_MINIMUM_SYSTEM_VERSION" ] || fail "LSMinimumSystemVersion is empty"
 
@@ -99,6 +116,27 @@ for binary in "$EXECUTABLE" "$RUNTIME"; do
     fail "a build-owner home-directory path is embedded in $binary"
   fi
 done
+
+# Output isolation prevents normal developer and release builds from sharing a
+# runtime, but verify both bundle halves as a final defense against copied or
+# stale artifacts from an older build tree.
+if [ "$EXPECTED_INPUT_TEST_HARNESS" = "on" ]; then
+  /usr/bin/strings "$EXECUTABLE" |
+    /usr/bin/grep -F 'GOLDENEYE_TEST_CAPTURE_DAM_FRAME' >/dev/null ||
+    fail "developer executable is missing its input-test harness marker"
+  /usr/bin/strings "$RUNTIME" |
+    /usr/bin/grep -F 'REX_TEST_VIRTUAL_GAMEPADS' >/dev/null ||
+    fail "developer runtime is missing its input-test harness marker"
+else
+  if /usr/bin/strings "$EXECUTABLE" |
+      /usr/bin/grep -F 'GOLDENEYE_TEST_CAPTURE_DAM_FRAME' >/dev/null; then
+    fail "release executable contains the developer input-test harness"
+  fi
+  if /usr/bin/strings "$RUNTIME" |
+      /usr/bin/grep -F 'REX_TEST_VIRTUAL_GAMEPADS' >/dev/null; then
+    fail "release runtime contains the developer input-test harness"
+  fi
+fi
 
 for binary in "$EXECUTABLE" "$RUNTIME"; do
   BINARY_MINIMUM_SYSTEM_VERSION="$(${VTOOL:-/usr/bin/vtool} -show-build "$binary" |
@@ -137,9 +175,9 @@ fi
 
 printf 'GoldenEye Metal app verification passed.\n'
 printf '  Bundle: %s\n' "$APP_BUNDLE"
-printf '  Version: %s (%s)\n' \
-  "$(plist_value CFBundleShortVersionString)" "$(plist_value CFBundleVersion)"
+printf '  Version: %s (%s)\n' "$ACTUAL_VERSION" "$ACTUAL_BUILD_NUMBER"
 printf '  Identifier: %s\n' "$(plist_value CFBundleIdentifier)"
 printf '  Minimum macOS: %s\n' "$PLIST_MINIMUM_SYSTEM_VERSION"
 printf '  Runtime: bundled and portable\n'
+printf '  Input test harness: %s\n' "$EXPECTED_INPUT_TEST_HARNESS"
 printf '  Recognizable standalone game data: not staged\n'

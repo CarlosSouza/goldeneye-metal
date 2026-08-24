@@ -431,6 +431,24 @@ void GraphicsSystem::RequestFrameTrace() {
   command_processor_->RequestFrameTrace(REXCVAR_GET(trace_gpu_prefix));
 }
 
+uint64_t GraphicsSystem::RequestPrivateFrameTrace(
+    const std::filesystem::path& safe_root, uint64_t byte_budget) {
+  return command_processor_->RequestPrivateFrameTrace(safe_root, byte_budget);
+}
+
+uint64_t GraphicsSystem::ReportPrivateFrameTraceFailure(std::string reason) {
+  return command_processor_->ReportPrivateFrameTraceFailure(std::move(reason));
+}
+
+FrameTraceCaptureStatus GraphicsSystem::GetPrivateFrameTraceStatus() const {
+  return command_processor_->GetPrivateFrameTraceStatus();
+}
+
+bool GraphicsSystem::DeletePrivateFrameTrace(
+    const std::filesystem::path& safe_root, std::string* reason_out) {
+  return command_processor_->DeletePrivateFrameTrace(safe_root, reason_out);
+}
+
 void GraphicsSystem::BeginTracing() {
   command_processor_->BeginTracing(REXCVAR_GET(trace_gpu_prefix));
 }

@@ -339,6 +339,13 @@ void GeMenuDialog::OnClose() {
     callbacks_.persist_config();
   if (callbacks_.on_closed)
     callbacks_.on_closed();
+#if defined(__APPLE__)
+  // on_closed restores guest input and requests unpause first. Only then may
+  // the next presented gameplay frame be queued for capture.
+  if (deferred_gpu_capture_request_.TakeAfterClose(quit_requested_) &&
+      callbacks_.request_gpu_capture)
+    callbacks_.request_gpu_capture();
+#endif
   if (performance_report_pending_ && !quit_requested_)
     rex::perf::StartMetalPerformanceReport(60);
   if (quit_requested_ && callbacks_.on_quit)
@@ -675,7 +682,7 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
     case kVideoTab: {
 #if defined(__APPLE__)
       // These presets change only renderer quality controls. They deliberately
-      // leave V-Sync, the stability throttle and the player's colour grade
+      // leave V-Sync, the GPU handoff wait and the player's colour grade
       // alone, so applying a preset never changes timing or a saved look.
       static const struct {
         const char* label;
@@ -850,22 +857,20 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       ImGui::EndDisabled();
 #endif
 
-      // --- GPU throttle. Pauses the emulated GPU command worker after each ring
-      //     drain so it can't outrun the render thread -- the cause of the
-      //     intermittent picture freeze. Higher = fewer freezes but more input
-      //     latency; lower = snappier but more freeze risk; 0 = off. Applied
-      //     live (the CP worker reads it each drain); saved to ge.toml on
-      //     release. This is the supported way to tune it -- editing ge.toml by
-      //     hand is fragile because the game rewrites the file on every save. ---
+      // --- GPU handoff wait. After a drained command batch, wait up to this
+      //     budget for the guest's next WPTR doorbell. The worker wakes as soon
+      //     as real work arrives, so a larger safety budget no longer adds a
+      //     fixed delay to every batch. The old cvar name remains for config
+      //     compatibility. ---
       int throttle_us = std::atoi(rex::cvar::GetFlagByName("ge_gpu_throttle_us").c_str());
-      if (ImGui::SliderInt("GPU Throttle (us)", &throttle_us, 0, 500)) {
+      if (ImGui::SliderInt("GPU Handoff Wait (us)", &throttle_us, 0, 500)) {
         if (throttle_us < 0)
           throttle_us = 0;
         rex::cvar::SetFlagByName("ge_gpu_throttle_us", std::to_string(throttle_us));
       }
       if (ImGui::IsItemDeactivatedAfterEdit() && callbacks_.persist_config)
         callbacks_.persist_config();
-      TextWrappedColored(kInkDim, "(stability tuning; higher = fewer freezes, more lag)");
+      TextWrappedColored(kInkDim, "(maximum wait; wakes immediately when new GPU work arrives)");
 
       ImGui::Spacing();
       ImGui::Separator();
@@ -1912,6 +1917,47 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
     case kSystemTab:
     default: {
       const ImVec2 bsize(content_w * 0.85f, std::floor(fh * 0.07f));
+#if defined(__APPLE__)
+      ImGui::TextColored(ImColor(kTitle), "GPU CAPTURE");
+      rex::graphics::FrameTraceCaptureStatus capture_status;
+      if (callbacks_.get_gpu_capture_status) {
+        capture_status = callbacks_.get_gpu_capture_status();
+      }
+      const auto presentation = ge::gpu_capture::PresentStatus(capture_status);
+      ImGui::TextColored(ImColor(kInk), "%s", presentation.label.c_str());
+      TextWrappedColored(kInkDim, presentation.detail.c_str());
+      const bool has_completed = callbacks_.has_completed_gpu_capture &&
+                                 callbacks_.has_completed_gpu_capture();
+      ImGui::BeginDisabled(!presentation.can_request ||
+                           !callbacks_.request_gpu_capture);
+      if (ImGui::Button("CAPTURE NEXT GAMEPLAY FRAME", bsize)) {
+        gpu_capture_action_message_.clear();
+        deferred_gpu_capture_request_.Queue();
+        Close();
+      }
+      ImGui::EndDisabled();
+      ImGui::BeginDisabled(presentation.active || !has_completed ||
+                           !callbacks_.delete_gpu_capture);
+      if (ImGui::Button("DELETE CAPTURE", bsize)) {
+        std::string error;
+        if (callbacks_.delete_gpu_capture(&error)) {
+          gpu_capture_action_message_ = "Capture deleted.";
+        } else {
+          gpu_capture_action_message_ =
+              error.empty() ? "Capture could not be deleted safely." : std::move(error);
+        }
+      }
+      ImGui::EndDisabled();
+      if (!gpu_capture_action_message_.empty()) {
+        TextWrappedColored(kInkDim, gpu_capture_action_message_.c_str());
+      }
+      TextWrappedColored(
+          kInkDim,
+          "May contain game memory. Share only when requested for debugging.");
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+#endif
       if (ImGui::Button("RESUME GAME", bsize)) {
         Close();
       }

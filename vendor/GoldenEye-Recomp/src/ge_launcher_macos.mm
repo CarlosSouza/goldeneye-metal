@@ -12,6 +12,7 @@
 #include "ge_launcher.h"
 
 #include "ge_game_data.h"
+#include "ge_gpu_capture.h"
 #include "ge_launch_recovery.h"
 #include "ge_save_manager.h"
 
@@ -121,12 +122,12 @@ void ApplySafeModeOverrides() {
   for (const auto& [name, value] : overrides) {
     rex::cvar::SetFlagByName(name, value);
   }
-  // The supported player-facing stability control. Its maximum trades a small
-  // amount of latency for the most conservative GPU command pacing.
+  // The supported player-facing stability control. The maximum gives the
+  // guest producer the widest handoff budget, but wakes immediately on WPTR.
   rex::cvar::SetFlagByName("ge_gpu_throttle_us", "500");
   REXLOG_WARN(
       "GoldenEye Safe Mode active for this run: windowed, V-Sync, bilinear output, "
-      "reduced filtering, no AA/Post-FX/overlay, maximum stability throttle");
+      "reduced filtering, no AA/Post-FX/overlay, maximum GPU handoff wait");
 }
 
 NSWindow* FindGameplayWindow(NSWindow* launcher_window) {
@@ -1332,8 +1333,9 @@ bool PublishPrivateFileAtomically(const std::filesystem::path& source,
   return success;
 }
 
-bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem::path& destination,
-                            std::string* error) {
+bool ExportDiagnosticBundle(const rex::PathConfig& paths,
+                            const std::filesystem::path& destination,
+                            bool include_gpu_capture, std::string* error) {
   std::filesystem::path temporary_root;
   if (!CreatePrivateTemporaryDirectory(&temporary_root, error)) {
     return false;
@@ -1346,7 +1348,7 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
   };
   auto bundle_root = temporary_root / "GoldenEye Metal Diagnostics";
   std::filesystem::create_directory(bundle_root, ec);
-  if (ec) {
+  if (ec || chmod(bundle_root.c_str(), S_IRWXU) != 0) {
     cleanup();
     *error = "Could not prepare the diagnostic bundle.";
     return false;
@@ -1383,6 +1385,23 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
   std::vector<std::string> log_manifest;
   std::vector<std::string> crash_manifest;
   const auto runtime_logs = FindRuntimeLogs(paths.user_data_root);
+  const std::string system_report = BuildSystemReport();
+  const std::string application_report = BuildApplicationReport();
+  const std::string recovery_report = BuildRecoveryReport();
+  const auto performance_report = FindLatestMetalPerformanceReport(runtime_logs);
+  const uint64_t generated_report_bytes =
+      system_report.size() + application_report.size() +
+      recovery_report.size() +
+      (performance_report ? performance_report->size() : 0);
+  if (generated_report_bytes >
+      kMaximumDiagnosticBundleBytes -
+          ge::gpu_capture::kDiagnosticMetadataAllowance) {
+    cleanup();
+    *error = "Generated diagnostic metadata exceeded its safety budget.";
+    return false;
+  }
+  copied_diagnostic_bytes =
+      generated_report_bytes + ge::gpu_capture::kDiagnosticMetadataAllowance;
   CopyDiagnosticFiles(runtime_logs, bundle_root / "Runtime Logs",
                       path_redactions, kMaximumRuntimeLogs, &copied_diagnostic_bytes, &log_stats,
                       &log_manifest);
@@ -1391,21 +1410,36 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
                       &crash_manifest);
 
   std::string write_error;
-  if (!WritePrivateTextFile(bundle_root / "System.txt", BuildSystemReport(), &write_error) ||
-      !WritePrivateTextFile(bundle_root / "Application.txt", BuildApplicationReport(),
+  if (!WritePrivateTextFile(bundle_root / "System.txt", system_report, &write_error) ||
+      !WritePrivateTextFile(bundle_root / "Application.txt", application_report,
                             &write_error) ||
-      !WritePrivateTextFile(bundle_root / "Recovery.txt", BuildRecoveryReport(), &write_error)) {
+      !WritePrivateTextFile(bundle_root / "Recovery.txt", recovery_report, &write_error)) {
     cleanup();
     *error = write_error;
     return false;
   }
-  const auto performance_report = FindLatestMetalPerformanceReport(runtime_logs);
   if (performance_report &&
       !WritePrivateTextFile(bundle_root / "Metal Performance.txt", *performance_report,
                             &write_error)) {
     cleanup();
     *error = write_error;
     return false;
+  }
+  ge::gpu_capture::CompletedCaptureInfo gpu_capture_info;
+  if (include_gpu_capture) {
+    const uint64_t capture_limit =
+        ge::gpu_capture::BoundedDiagnosticCaptureAllowance(
+            copied_diagnostic_bytes, kMaximumDiagnosticBundleBytes);
+    if (!ge::gpu_capture::CopyCompletedCaptureForDiagnostics(
+            paths.user_data_root, bundle_root, &gpu_capture_info, &write_error,
+            capture_limit)) {
+      cleanup();
+      *error = write_error.empty()
+                   ? "The selected GPU capture could not be included safely."
+                   : write_error;
+      return false;
+    }
+    copied_diagnostic_bytes += gpu_capture_info.byte_count;
   }
 
   std::ostringstream readme;
@@ -1419,14 +1453,24 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
   if (performance_report) {
     readme << "- the latest completed 60-second Metal performance report\n";
   }
+  if (include_gpu_capture) {
+    readme << "- one validated completed GPU frame capture (explicitly opted in)\n";
+  }
   readme
       << "\n"
       << "Privacy:\n"
-      << "- No game data, saves, Xbox package, cache, remembered paths, or settings file is "
-         "included.\n"
+      << (include_gpu_capture
+              ? "- Outside the explicitly opted-in GPU capture, no game data, saves, Xbox "
+                "package, cache, remembered paths, or settings file is included.\n"
+              : "- No game data, saves, Xbox package, cache, remembered paths, or settings "
+                "file is included.\n")
       << "- Home, game-data, and Application Support paths are redacted from copied reports.\n"
       << "- Credential-like log lines and macOS crash-report identifiers are redacted.\n"
       << "- Hardware serial numbers and Apple Account information are not collected.\n";
+  if (include_gpu_capture) {
+    readme << "- The opted-in GPU capture may contain game memory; share it only when "
+              "requested.\n";
+  }
   if (log_stats.skipped != 0 || crash_stats.skipped != 0) {
     readme << "\nSafety limits skipped " << log_stats.skipped << " runtime log(s) and "
            << crash_stats.skipped << " crash report(s).\n";
@@ -1443,7 +1487,18 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
       readme << "- " << name << "\n";
     }
   }
-  if (!WritePrivateTextFile(bundle_root / "README.txt", readme.str(), &write_error)) {
+  const std::string readme_text = readme.str();
+  const uint64_t late_metadata_bytes =
+      readme_text.size() +
+      (include_gpu_capture
+           ? ge::gpu_capture::BuildMetadata(gpu_capture_info).size()
+           : 0);
+  if (late_metadata_bytes > ge::gpu_capture::kDiagnosticMetadataAllowance) {
+    cleanup();
+    *error = "Diagnostic metadata exceeded its reserved safety allowance.";
+    return false;
+  }
+  if (!WritePrivateTextFile(bundle_root / "README.txt", readme_text, &write_error)) {
     cleanup();
     *error = write_error;
     return false;
@@ -1476,6 +1531,7 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
   NSButton* choose_folder_;
   NSButton* manage_saves_;
   NSButton* export_diagnostics_;
+  NSButton* include_gpu_capture_;
   NSButton* quit_;
   NSWindow* save_window_;
   NSTextField* save_summary_;
@@ -1499,6 +1555,7 @@ bool ExportDiagnosticBundle(const rex::PathConfig& paths, const std::filesystem:
   BOOL save_reconciliation_repaired_;
   BOOL save_snapshot_valid_;
   BOOL save_undo_is_redo_;
+  BOOL gpu_capture_available_;
   ge::save::Snapshot save_snapshot_;
   std::filesystem::path save_undo_quarantine_;
   std::string startup_warning_;
@@ -1536,6 +1593,10 @@ GoldenEyeLauncherController* g_launcher = nil;
     save_reconciliation_repaired_ = g_save_reconciliation_repaired ? YES : NO;
     save_snapshot_valid_ = NO;
     save_undo_is_redo_ = NO;
+    gpu_capture_available_ =
+        ge::gpu_capture::InspectCompletedCapture(paths_.user_data_root).available
+            ? YES
+            : NO;
     startup_warning_ = recovery.warning;
   }
   return self;
@@ -1674,6 +1735,28 @@ GoldenEyeLauncherController* g_launcher = nil;
   [export_diagnostics_ setAction:@selector(exportDiagnostics:)];
   [content addSubview:export_diagnostics_];
 
+  include_gpu_capture_ =
+      [[[NSButton alloc] initWithFrame:NSMakeRect(48, 82, 280, 22)] autorelease];
+  [include_gpu_capture_ setTitle:@"Include GPU capture"];
+  [include_gpu_capture_ setButtonType:NSButtonTypeSwitch];
+  [include_gpu_capture_
+      setState:ge::gpu_capture::kIncludeInDiagnosticsByDefault
+                   ? NSControlStateValueOn
+                   : NSControlStateValueOff];
+  [include_gpu_capture_ setEnabled:gpu_capture_available_];
+  [include_gpu_capture_
+      setToolTip:gpu_capture_available_
+                     ? @"Includes the validated completed latest.xtr capture."
+                     : @"No validated completed GPU capture is available."];
+  [content addSubview:include_gpu_capture_];
+
+  NSTextField* capture_warning = [self
+      labelWithFrame:NSMakeRect(70, 58, 500, 20)
+                text:@"May contain game memory. Share only when requested."
+                font:[NSFont systemFontOfSize:11]
+               color:[NSColor systemOrangeColor]];
+  [content addSubview:capture_warning];
+
   progress_ =
       [[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(48, 142, 584, 18)] autorelease];
   [progress_ setStyle:NSProgressIndicatorStyleBar];
@@ -1688,16 +1771,16 @@ GoldenEyeLauncherController* g_launcher = nil;
   [content addSubview:status_];
 
   NSTextField* notice = [self
-      labelWithFrame:NSMakeRect(48, 32, 500, 58)
-                text:@"Game files are not included or downloaded. Diagnostic exports contain "
-                     @"logs and matching crash reports, never game data, saves, cache or settings."
+      labelWithFrame:NSMakeRect(48, 18, 490, 34)
+                text:@"Diagnostics exclude game files, saves, cache and settings. A GPU "
+                     @"capture is included only when selected above."
                 font:[NSFont systemFontOfSize:12]
                color:[NSColor tertiaryLabelColor]];
   [notice setLineBreakMode:NSLineBreakByWordWrapping];
-  [notice setMaximumNumberOfLines:3];
+  [notice setMaximumNumberOfLines:2];
   [content addSubview:notice];
 
-  quit_ = [[[NSButton alloc] initWithFrame:NSMakeRect(558, 47, 74, 32)] autorelease];
+  quit_ = [[[NSButton alloc] initWithFrame:NSMakeRect(558, 24, 74, 32)] autorelease];
   [quit_ setTitle:@"Quit"];
   [quit_ setBezelStyle:NSBezelStyleRounded];
   [quit_ setTarget:self];
@@ -1813,6 +1896,8 @@ GoldenEyeLauncherController* g_launcher = nil;
   [choose_folder_ setEnabled:launcher_available];
   [manage_saves_ setEnabled:launcher_available && save_reconciliation_ok_];
   [export_diagnostics_ setEnabled:launcher_available];
+  [include_gpu_capture_
+      setEnabled:launcher_available && gpu_capture_available_];
   [quit_ setEnabled:!save_manager_visible && !save_work && (!busy || !exporting)];
   [quit_ setTitle:(busy && !exporting && !save_work) ? @"Cancel" : @"Quit"];
   [status_ setStringValue:message ?: @""];
@@ -2698,7 +2783,8 @@ GoldenEyeLauncherController* g_launcher = nil;
   [alert beginSheetModalForWindow:window_ completionHandler:nil];
 }
 
-- (void)beginDiagnosticExport:(std::filesystem::path)destination {
+- (void)beginDiagnosticExport:(std::filesystem::path)destination
+            includeGPUCapture:(BOOL)includeGPUCapture {
   if (busy_.exchange(true)) {
     return;
   }
@@ -2711,13 +2797,15 @@ GoldenEyeLauncherController* g_launcher = nil;
 
   GoldenEyeLauncherController* controller = [self retain];
   rex::PathConfig paths = paths_;
+  const bool include_gpu_capture = includeGPUCapture == YES;
   std::thread([controller, paths = std::move(paths),
-               destination = std::move(destination)]() mutable {
+               destination = std::move(destination), include_gpu_capture]() mutable {
     @autoreleasepool {
       std::string error;
       bool success = false;
       try {
-        success = ExportDiagnosticBundle(paths, destination, &error);
+        success = ExportDiagnosticBundle(paths, destination,
+                                         include_gpu_capture, &error);
       } catch (const std::exception& exception) {
         error = std::string("Diagnostic export failed unexpectedly: ") + exception.what();
       } catch (...) {
@@ -2751,10 +2839,15 @@ GoldenEyeLauncherController* g_launcher = nil;
                                                   [formatter stringFromDate:[NSDate date]]];
 
   NSSavePanel* panel = [NSSavePanel savePanel];
+  const BOOL include_gpu_capture =
+      gpu_capture_available_ &&
+      [include_gpu_capture_ state] == NSControlStateValueOn;
   [panel setTitle:@"Export GoldenEye Metal diagnostics"];
-  [panel setMessage:@"Creates one easy-to-send ZIP with runtime logs, matching macOS crash "
-                    @"reports and build information. Game data, saves, cache and settings are "
-                    @"never included."];
+  [panel setMessage:include_gpu_capture
+                        ? @"Includes the opted-in GPU capture, which may contain game memory. "
+                           @"Share it only when requested."
+                        : @"Creates a ZIP with logs, matching crash reports and build "
+                           @"information. GPU captures are excluded."];
   [panel setPrompt:@"Export"];
   [panel setNameFieldStringValue:filename];
   [panel setAllowedContentTypes:@[ UTTypeZIP ]];
@@ -2766,7 +2859,8 @@ GoldenEyeLauncherController* g_launcher = nil;
                     return;
                   }
                   std::filesystem::path destination([[[panel URL] path] fileSystemRepresentation]);
-                  [self beginDiagnosticExport:std::move(destination)];
+                  [self beginDiagnosticExport:std::move(destination)
+                            includeGPUCapture:include_gpu_capture];
                 }];
 }
 

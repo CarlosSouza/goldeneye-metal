@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 
@@ -56,6 +57,9 @@
 
 #include "ge_crash_guards.h"
 #include "ge_controller_shortcut.h"
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS) && defined(__APPLE__)
+#include "ge_gpu_capture.h"
+#endif
 #include "ge_host_pause.h"
 #include "ge_player_stuck_telemetry.h"
 #include "ge_testing_tools.h"
@@ -1870,6 +1874,12 @@ constexpr uint32_t GE_OFF_WATCH = 0x2E8u;          // watch status (!=0 -> input
 constexpr uint32_t GE_OFF_DISABLED = 0x80u;        // control-disabled flag (cutscene)
 constexpr uint32_t GE_OFF_CAM_X = 0x254u;          // camera yaw
 constexpr uint32_t GE_OFF_CAM_Y = 0x264u;          // camera pitch
+constexpr uint32_t GE_OFF_RIGHT_WEAPON = 0x928u;   // right-hand weapon id
+// The title's generated sub_820A55C8 reads player + hand * 0x3A8 + 0x954
+// to return the loaded magazine count. Reading the right-hand value here is
+// telemetry-only and lets the integration scenario prove that firing reached
+// gameplay, rather than merely proving that the trigger reached the pad buffer.
+constexpr uint32_t GE_OFF_RIGHT_MAGAZINE = 0x954u;
 constexpr uint32_t GE_OFF_CH_X = 0x10A8u;          // crosshair X
 constexpr uint32_t GE_OFF_CH_Y = 0x10ACu;          // crosshair Y
 constexpr uint32_t GE_OFF_GUN_X = 0x10BCu;         // gun X
@@ -2519,6 +2529,264 @@ void ge_apply_ce_data_patches(uint8_t* base);                                   
 namespace {
 ge::player_stuck::Tracker g_player_stuck_tracker;
 
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+struct TestHostPauseState {
+  ge::host_pause::detail::LiveTestGate gate;
+  bool terminal_logged = false;
+};
+
+TestHostPauseState g_test_host_pause;
+
+const char* ge_host_pause_live_phase_name(
+    ge::host_pause::detail::LiveTestPhase phase) noexcept {
+  using Phase = ge::host_pause::detail::LiveTestPhase;
+  switch (phase) {
+    case Phase::kWaitingForGameplay:
+      return "waiting-for-gameplay";
+    case Phase::kWaitingForPause:
+      return "waiting-for-pause";
+    case Phase::kObservingPause:
+      return "observing-pause";
+    case Phase::kWaitingForResume:
+      return "waiting-for-resume";
+    case Phase::kObservingResume:
+      return "observing-resume";
+    case Phase::kComplete:
+      return "complete";
+    case Phase::kFailed:
+      return "failed";
+  }
+  return "invalid";
+}
+
+bool ge_host_pause_test_input_neutral(
+    const ge::player_stuck::Sample& sample) noexcept {
+  constexpr int16_t deadzone =
+      ge::host_pause::ResumeInputLatch::kStickDeadzone;
+  constexpr uint8_t trigger_threshold =
+      ge::host_pause::ResumeInputLatch::kTriggerThreshold;
+  return sample.guest_buttons == 0 &&
+         sample.guest_left_trigger < trigger_threshold &&
+         sample.guest_right_trigger < trigger_threshold &&
+         sample.guest_lx >= -deadzone && sample.guest_lx <= deadzone &&
+         sample.guest_ly >= -deadzone && sample.guest_ly <= deadzone &&
+         sample.guest_rx >= -deadzone && sample.guest_rx <= deadzone &&
+         sample.guest_ry >= -deadzone && sample.guest_ry <= deadzone;
+}
+
+void ge_maybe_run_host_pause_live_test(
+    const ge::player_stuck::Sample& sample, int32_t current_weapon,
+    bool right_magazine_valid, int32_t right_magazine) {
+  static const bool enabled =
+      EnvironmentFlagEnabled("GOLDENEYE_TEST_HOST_PAUSE");
+  if (!enabled || g_test_host_pause.terminal_logged) {
+    return;
+  }
+
+  const ge::testing::MissionSnapshot mission =
+      ge::testing::GetMissionSnapshot();
+  ge::host_pause::detail::LiveTestObservation observation;
+  observation.monotonic_ms = sample.monotonic_ms;
+  observation.dam_gameplay_ready =
+      mission.valid && mission.level_id == 0x21 && mission.player_count == 1 &&
+      !mission.network_session;
+  observation.ui_open = ge::host_pause::test_harness::MenuOpen();
+  observation.world_valid =
+      sample.player_valid && sample.position_valid && sample.player != 0 &&
+      sample.coordinates != 0 && std::isfinite(sample.camera_yaw) &&
+      std::isfinite(sample.camera_pitch);
+  observation.ammo_valid = right_magazine_valid;
+  observation.input_neutral = ge_host_pause_test_input_neutral(sample);
+  observation.player = sample.player;
+  observation.coordinates = sample.coordinates;
+  observation.guest_frame = sample.guest_frame;
+  observation.present = sample.present;
+  observation.pause_value = sample.pause;
+  observation.position_x = sample.position_x;
+  observation.position_y = sample.position_y;
+  observation.position_z = sample.position_z;
+  observation.camera_yaw = sample.camera_yaw;
+  observation.camera_pitch = sample.camera_pitch;
+  observation.weapon = current_weapon;
+  observation.ammo = right_magazine;
+  observation.pause = ge::host_pause::GetSnapshot();
+
+  const auto phase_before = g_test_host_pause.gate.phase();
+  auto update = g_test_host_pause.gate.Observe(observation);
+  if (update.request ==
+      ge::host_pause::detail::LiveTestRequest::kOpenHostSettings) {
+    const bool queued =
+        ge::host_pause::test_harness::RequestMenuState(true);
+    REXKRNL_INFO("[ge-test] host-pause open-request queued={}",
+                 queued ? 1 : 0);
+    if (!queued) {
+      update = g_test_host_pause.gate.Fail("open-request-not-queued");
+    }
+  }
+
+  if (update.frozen_proven) {
+    const auto& proof = g_test_host_pause.gate.proof();
+    REXKRNL_INFO(
+        "[ge-test] host-pause frozen open_generation={} samples={} "
+        "duration_ms={} frame_delta={} present_delta={} world_stable=1 "
+        "ui_open=1 owned=1",
+        proof.open_generation, proof.frozen_samples,
+        proof.frozen_duration_ms, proof.paused_frame_delta,
+        proof.paused_present_delta);
+  }
+
+  if (update.request ==
+      ge::host_pause::detail::LiveTestRequest::kCloseHostSettings) {
+    const auto& proof = g_test_host_pause.gate.proof();
+    const bool queued =
+        ge::host_pause::test_harness::RequestMenuState(false);
+    REXKRNL_INFO(
+        "[ge-test] host-pause close-request open_generation={} queued={}",
+        proof.open_generation, queued ? 1 : 0);
+    if (!queued) {
+      update = g_test_host_pause.gate.Fail("close-request-not-queued");
+    }
+  }
+
+  if (update.completed) {
+    const auto& proof = g_test_host_pause.gate.proof();
+    REXKRNL_INFO(
+        "[ge-test] host-pause resumed open_generation={} resume_generation={} "
+        "samples={} duration_ms={} frame_delta={} present_delta={} "
+        "ui_closed=1 pause_released=1 input_ready=1",
+        proof.open_generation, proof.resume_generation,
+        proof.resumed_samples, proof.resumed_duration_ms,
+        proof.resumed_frame_delta, proof.resumed_present_delta);
+    g_test_host_pause.terminal_logged = true;
+    return;
+  }
+
+  if (update.failure_reason) {
+    REXKRNL_ERROR("[ge-test] host-pause failed phase={} reason={}",
+                  ge_host_pause_live_phase_name(phase_before),
+                  update.failure_reason);
+    g_test_host_pause.terminal_logged = true;
+  }
+}
+#endif
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS) && defined(__APPLE__)
+struct TestDamGpuCaptureState {
+  ge::gpu_capture::DamGameplayCaptureGate gate;
+  uint64_t request_token = 0;
+  std::filesystem::path capture_root;
+  bool terminal_logged = false;
+};
+
+TestDamGpuCaptureState g_test_dam_gpu_capture;
+
+void ge_maybe_capture_test_dam_frame(
+    const ge::player_stuck::Sample& sample) {
+  static const bool enabled =
+      EnvironmentFlagEnabled("GOLDENEYE_TEST_CAPTURE_DAM_FRAME");
+  if (!enabled || g_test_dam_gpu_capture.terminal_logged) {
+    return;
+  }
+
+  auto* runtime = rex::Runtime::instance();
+  auto* graphics_system = ge_gs();
+  if (!runtime || !graphics_system) {
+    return;
+  }
+
+  if (!g_test_dam_gpu_capture.request_token) {
+    const ge::testing::MissionSnapshot mission =
+        ge::testing::GetMissionSnapshot();
+    if (!mission.valid) {
+      return;
+    }
+    ge::gpu_capture::DamGameplayObservation observation;
+    observation.level_id = mission.level_id;
+    observation.player_count = mission.player_count;
+    observation.network_session = mission.network_session;
+    observation.player_valid = sample.player_valid;
+    observation.position_valid = sample.position_valid;
+    observation.player = sample.player;
+    observation.coordinates = sample.coordinates;
+    observation.guest_frame = sample.guest_frame;
+    observation.present = sample.present;
+    observation.pause = sample.pause;
+    observation.control_disabled = sample.control_disabled;
+    observation.watch = sample.watch;
+    if (!g_test_dam_gpu_capture.gate.Observe(observation)) {
+      return;
+    }
+
+    std::string error;
+    if (!ge::gpu_capture::EnsurePrivateRoot(
+            runtime->user_data_root(),
+            &g_test_dam_gpu_capture.capture_root, &error)) {
+      g_test_dam_gpu_capture.request_token =
+          graphics_system->ReportPrivateFrameTraceFailure(
+              error.empty() ? "test harness could not prepare private capture root"
+                            : std::move(error));
+    } else {
+      g_test_dam_gpu_capture.request_token =
+          graphics_system->RequestPrivateFrameTrace(
+              g_test_dam_gpu_capture.capture_root);
+    }
+    if (!g_test_dam_gpu_capture.request_token) {
+      REXKRNL_ERROR(
+          "[ge-test] gpu-capture failed token=0 state=Rejected validation=0");
+      g_test_dam_gpu_capture.terminal_logged = true;
+      return;
+    }
+    REXKRNL_INFO(
+        "[ge-test] gpu-capture requested token={} dam_ready=1 frames_progressed=1 "
+        "presents_progressed=1",
+        g_test_dam_gpu_capture.request_token);
+    return;
+  }
+
+  const auto status = graphics_system->GetPrivateFrameTraceStatus();
+  if (status.request_token != g_test_dam_gpu_capture.request_token ||
+      !status.terminal()) {
+    return;
+  }
+  g_test_dam_gpu_capture.terminal_logged = true;
+  const char* state_name =
+      rex::graphics::FrameTraceCaptureStateName(status.state);
+  if (status.state != rex::graphics::FrameTraceCaptureState::kComplete) {
+    REXKRNL_ERROR(
+        "[ge-test] gpu-capture failed token={} state={} validation=0",
+        status.request_token, state_name);
+    return;
+  }
+
+  const auto inspected =
+      ge::gpu_capture::InspectCompletedCapture(runtime->user_data_root());
+  std::error_code partial_error;
+  const bool partial_absent =
+      !std::filesystem::exists(
+          g_test_dam_gpu_capture.capture_root / "latest.xtr.partial",
+          partial_error) &&
+      !partial_error;
+  const bool valid =
+      inspected.available &&
+      inspected.state == rex::graphics::FrameTraceCaptureState::kComplete &&
+      inspected.byte_count > 0 && inspected.byte_count == status.byte_count &&
+      status.final_path ==
+          g_test_dam_gpu_capture.capture_root /
+              ge::gpu_capture::kCompletedCaptureName &&
+      partial_absent;
+  if (!valid) {
+    REXKRNL_ERROR(
+        "[ge-test] gpu-capture failed token={} state={} validation=0",
+        status.request_token, state_name);
+    return;
+  }
+  REXKRNL_INFO(
+      "[ge-test] gpu-capture validated token={} state={} bytes={} frames=1 "
+      "private=1 partial=0",
+      status.request_token, state_name, inspected.byte_count);
+}
+#endif
+
 void ge_log_player_stuck_report(uint8_t* base, const ge::player_stuck::Report& report) {
   if (report.sample_count == 0) {
     return;
@@ -2622,6 +2890,9 @@ void ge_observe_player_stuck(uint8_t* base, uint64_t input_poll) {
 
   auto* memory = rex::system::kernel_state()->memory();
   uint32_t player = 0;
+  int32_t current_weapon = 0;
+  bool right_magazine_valid = false;
+  int32_t right_magazine = 0;
   for (uint32_t index = 0; index < GE_LOCAL_PAD_COUNT; ++index) {
     const uint32_t candidate = LD32(base, GE_PLAYER_PTR + index * sizeof(uint32_t));
     if (ge_guest_range_readable(memory, candidate, 0x908u) && LD32(base, candidate + 0x904u) == 0) {
@@ -2649,6 +2920,11 @@ void ge_observe_player_stuck(uint8_t* base, uint64_t input_poll) {
     sample.watch = LD32(base, player + GE_OFF_WATCH);
     sample.camera_yaw = LDF32(base, player + GE_OFF_CAM_X);
     sample.camera_pitch = LDF32(base, player + GE_OFF_CAM_Y);
+    if (ge_guest_range_readable(memory, player, GE_OFF_RIGHT_MAGAZINE + sizeof(uint32_t))) {
+      current_weapon = static_cast<int32_t>(LD32(base, player + GE_OFF_RIGHT_WEAPON));
+      right_magazine = static_cast<int32_t>(LD32(base, player + GE_OFF_RIGHT_MAGAZINE));
+      right_magazine_valid = right_magazine >= 0;
+    }
     const uint32_t coordinates = LD32(base, player + 0x1ACu);
     if (ge_guest_range_readable(memory, coordinates, 0x18u)) {
       const float x = LDF32(base, coordinates + 0x0Cu);
@@ -2663,6 +2939,145 @@ void ge_observe_player_stuck(uint8_t* base, uint64_t input_poll) {
       }
     }
   }
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  static const bool gameplay_trace_enabled =
+      EnvironmentFlagEnabled("GOLDENEYE_TEST_GAMEPLAY_TRACE");
+  if (gameplay_trace_enabled) {
+    static uint64_t gameplay_trace_sample = 0;
+    REXKRNL_INFO(
+        "[ge-test] gameplay sample={} poll={} frame={} present={} "
+        "player=0x{:08X} coords=0x{:08X} pos_valid={} "
+        "pos=({:.3f},{:.3f},{:.3f}) camera=({:.4f},{:.4f}) "
+        "weapon={} ammo_valid={} ammo={} "
+        "pause={} disabled={} watch={} buttons=0x{:04X} "
+        "lt={} rt={} lx={} ly={} rx={} ry={}",
+        ++gameplay_trace_sample, sample.input_poll, sample.guest_frame, sample.present,
+        sample.player, sample.coordinates, sample.position_valid ? 1 : 0, sample.position_x,
+        sample.position_y, sample.position_z, sample.camera_yaw, sample.camera_pitch,
+        current_weapon, right_magazine_valid ? 1 : 0, right_magazine, sample.pause,
+        sample.control_disabled, sample.watch, sample.guest_buttons, sample.guest_left_trigger,
+        sample.guest_right_trigger, sample.guest_lx, sample.guest_ly, sample.guest_rx,
+        sample.guest_ry);
+  }
+
+  static const bool multiplayer_trace_enabled =
+      EnvironmentFlagEnabled("GOLDENEYE_TEST_MULTIPLAYER_TRACE");
+  if (multiplayer_trace_enabled) {
+    static uint64_t multiplayer_trace_sample = 0;
+    const uint64_t trace_sample = ++multiplayer_trace_sample;
+    for (uint32_t slot = 0; slot < GE_LOCAL_PAD_COUNT; ++slot) {
+      rex::input::ControllerSnapshot slot_controller;
+      const bool connected = input && input->GetControllerSnapshot(slot, &slot_controller) &&
+                             slot_controller.connected;
+      const uint32_t pad = GE_PAD0 + slot * GE_PAD_STRIDE;
+      REXKRNL_INFO(
+          "[ge-test] local-pad sample={} poll={} frame={} present={} "
+          "slot={} connected={} device={} buttons=0x{:04X} "
+          "lt={} rt={} lx={} ly={} rx={} ry={}",
+          trace_sample, sample.input_poll, sample.guest_frame, sample.present, slot + 1,
+          connected ? 1 : 0, connected ? slot_controller.device_id : 0, LD16(base, pad + 0),
+          base[pad + 2], base[pad + 3], static_cast<int16_t>(LD16(base, pad + 4)),
+          static_cast<int16_t>(LD16(base, pad + 6)), static_cast<int16_t>(LD16(base, pad + 8)),
+          static_cast<int16_t>(LD16(base, pad + 10)));
+
+      // A pad-buffer sample proves only that host input reached XInput. Pair it
+      // with read-only title state for the player occupying the same local
+      // slot so the integration driver can prove that the game actually moved
+      // or turned that player. Every pointer is checked before dereferencing;
+      // an incomplete slot is logged as invalid and the driver fails closed.
+      uint32_t slot_player = 0;
+      uint32_t slot_coordinates = 0;
+      bool slot_player_valid = false;
+      bool slot_position_valid = false;
+      bool slot_camera_valid = false;
+      bool slot_weapon_valid = false;
+      bool slot_ammo_valid = false;
+      float slot_position_x = 0.0f;
+      float slot_position_y = 0.0f;
+      float slot_position_z = 0.0f;
+      float slot_camera_yaw = 0.0f;
+      float slot_camera_pitch = 0.0f;
+      int32_t slot_weapon = 0;
+      int32_t slot_ammo = 0;
+      uint32_t slot_disabled = 0;
+      uint32_t slot_watch = 0;
+
+      const uint32_t player_pointer_address =
+          GE_PLAYER_PTR + slot * sizeof(uint32_t);
+      if (ge_guest_range_readable(memory, player_pointer_address,
+                                  sizeof(uint32_t))) {
+        slot_player = LD32(base, player_pointer_address);
+      }
+      if (slot_player != 0 &&
+          ge_guest_range_readable(memory, slot_player,
+                                  GE_OFF_CAM_Y + sizeof(float))) {
+        slot_player_valid = true;
+        slot_disabled = LD32(base, slot_player + GE_OFF_DISABLED);
+        slot_watch = LD32(base, slot_player + GE_OFF_WATCH);
+        slot_camera_yaw = LDF32(base, slot_player + GE_OFF_CAM_X);
+        slot_camera_pitch = LDF32(base, slot_player + GE_OFF_CAM_Y);
+        slot_camera_valid = std::isfinite(slot_camera_yaw) &&
+                            std::isfinite(slot_camera_pitch);
+        if (!slot_camera_valid) {
+          slot_camera_yaw = 0.0f;
+          slot_camera_pitch = 0.0f;
+        }
+
+        slot_coordinates = LD32(base, slot_player + 0x1ACu);
+        if (slot_coordinates != 0 &&
+            ge_guest_range_readable(memory, slot_coordinates, 0x18u)) {
+          slot_position_x = LDF32(base, slot_coordinates + 0x0Cu);
+          slot_position_y = LDF32(base, slot_coordinates + 0x10u);
+          slot_position_z = LDF32(base, slot_coordinates + 0x14u);
+          slot_position_valid = std::isfinite(slot_position_x) &&
+                                std::isfinite(slot_position_y) &&
+                                std::isfinite(slot_position_z);
+          if (!slot_position_valid) {
+            slot_position_x = 0.0f;
+            slot_position_y = 0.0f;
+            slot_position_z = 0.0f;
+          }
+        }
+
+        if (ge_guest_range_readable(
+                memory, slot_player,
+                GE_OFF_RIGHT_MAGAZINE + sizeof(uint32_t))) {
+          slot_weapon_valid = true;
+          slot_weapon =
+              static_cast<int32_t>(LD32(base, slot_player + GE_OFF_RIGHT_WEAPON));
+          slot_ammo = static_cast<int32_t>(
+              LD32(base, slot_player + GE_OFF_RIGHT_MAGAZINE));
+          slot_ammo_valid = slot_ammo >= 0;
+        }
+      }
+
+      REXKRNL_INFO(
+          "[ge-test] local-player sample={} poll={} frame={} present={} "
+          "slot={} player=0x{:08X} player_valid={} coords=0x{:08X} "
+          "pos_valid={} pos=({:.3f},{:.3f},{:.3f}) "
+          "camera_valid={} camera=({:.4f},{:.4f}) "
+          "weapon_valid={} weapon={} ammo_valid={} ammo={} "
+          "pause={} disabled={} watch={}",
+          trace_sample, sample.input_poll, sample.guest_frame, sample.present,
+          slot + 1, slot_player, slot_player_valid ? 1 : 0,
+          slot_coordinates, slot_position_valid ? 1 : 0, slot_position_x,
+          slot_position_y, slot_position_z, slot_camera_valid ? 1 : 0,
+          slot_camera_yaw, slot_camera_pitch, slot_weapon_valid ? 1 : 0,
+          slot_weapon, slot_ammo_valid ? 1 : 0, slot_ammo, sample.pause,
+          slot_disabled, slot_watch);
+    }
+  }
+#endif
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS) && defined(__APPLE__)
+  ge_maybe_capture_test_dam_frame(sample);
+#endif
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  ge_maybe_run_host_pause_live_test(sample, current_weapon,
+                                    right_magazine_valid, right_magazine);
+#endif
 
   if (auto report = g_player_stuck_tracker.Observe(sample)) {
     ge_log_player_stuck_report(base, *report);

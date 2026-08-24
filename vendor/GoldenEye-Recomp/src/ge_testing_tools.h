@@ -75,6 +75,20 @@ void RequestRefresh() noexcept;
 // Game-thread bridge. Called by ge_inject_keyboard; not for UI code.
 void ProcessTestingToolRequests(PPCContext& context, uint8_t* base) noexcept;
 
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+struct MissionSnapshot {
+  bool valid = false;
+  int32_t level_id = -1;
+  int32_t player_count = 0;
+  bool network_session = false;
+};
+
+// Read-only mission identity published by the game-thread testing bridge. It
+// exists only in developer harness builds and is consumed by deterministic
+// integration checks such as the opt-in one-frame Dam GPU capture.
+MissionSnapshot GetMissionSnapshot() noexcept;
+#endif
+
 namespace detail {
 
 inline constexpr size_t kToolCount = static_cast<size_t>(Tool::kCount);

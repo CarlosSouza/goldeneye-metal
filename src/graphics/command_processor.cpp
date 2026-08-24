@@ -19,6 +19,12 @@
 #include <cstring>
 #include <string_view>
 
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
@@ -45,15 +51,14 @@
 // -> written; turning it OFF == default -> not written but boots off anyway).
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 
-// GoldenEye GPU throttle. The game's GPU command-submit chain is self-feeding
-// (each command buffer's kickoff enqueues the next when replayed); under the
-// emulator the GPU side outruns the render thread, the kickoff fires with no
-// next buffer, the chain dies, and the screen freezes. Pausing the CP worker a
-// little after each ring drain holds the GPU back so the render stays ahead and
-// the chain survives. Tune live in the .toml (ge_gpu_throttle_us = N); 0 = off.
+// GoldenEye GPU handoff budget. The game's GPU command-submit chain is
+// self-feeding: an interrupt from the drained batch wakes the guest producer,
+// which rings the next WPTR doorbell. Wait for that concrete handoff rather
+// than sleeping unconditionally. The existing cvar name is retained for saved
+// configuration compatibility; 0 disables the bounded wait.
 REXCVAR_DEFINE_INT32(ge_gpu_throttle_us, 120, "GPU",
-                     "GoldenEye: microseconds to pause the CP worker after each ring drain so the "
-                     "emulated GPU cannot outrun the render thread (0 = off)")
+                     "GoldenEye: maximum microseconds to wait for the next WPTR handoff after "
+                     "draining the command ring (0 = off)")
     .range(0, 500)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
@@ -114,6 +119,12 @@ bool EnvironmentFlagEnabled(const char* name) {
 bool MetalSubmissionDiagnosticsEnabled() {
   static const bool enabled = EnvironmentFlagEnabled("GOLDENEYE_METAL_SUBMISSION_DIAGNOSTICS");
   return enabled;
+}
+
+uint64_t SteadyNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
 }
 
 constexpr uint32_t kCommandRingSaveMarker = 0x52494E47u;  // "RING"
@@ -213,7 +224,7 @@ void CommandProcessor::Shutdown() {
     if (worker_accepting_functions_) {
       // This is the final accepted worker operation. It runs after every trace
       // request accepted before shutdown, and no later request can overtake it.
-      pending_fns_.push([this]() { EndTracingOnThread(); });
+      pending_fns_.push([this]() { EndTracingOnThread(true); });
     }
     worker_accepting_functions_ = false;
     paused_.store(false, std::memory_order_release);
@@ -236,7 +247,7 @@ void CommandProcessor::Shutdown() {
   // before draining accepted functions. With the worker joined, it is safe to
   // finalize here; the trace lock also excludes any direct packet span still
   // unwinding after worker shutdown was published.
-  EndTracingOnThread();
+  EndTracingOnThread(true);
   // A healthy worker drained the queue before exit. If context setup failed or
   // a test/tool harness exposed the gate without a worker, release leftovers
   // rather than retaining callbacks that can never run.
@@ -251,28 +262,49 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                uint32_t title_id, bool blocking) {}
 
 bool CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
-  const std::filesystem::path requested_path = root_path;
-  if (!CallInThread(
-          [this, requested_path]() { RequestFrameTraceOnThread(requested_path); })) {
-    REXGPU_WARN("Frame trace request rejected because the command worker is not accepting work");
+  const uint64_t token = RequestPrivateFrameTrace(root_path);
+  if (!token) {
     return false;
   }
-  return true;
+  const auto status = GetPrivateFrameTraceStatus();
+  return status.request_token == token && status.state != FrameTraceCaptureState::kFailed &&
+         status.state != FrameTraceCaptureState::kCancelled;
 }
 
-void CommandProcessor::RequestFrameTraceOnThread(
-    const std::filesystem::path& root_path) {
+uint64_t CommandProcessor::RequestPrivateFrameTrace(
+    const std::filesystem::path& safe_root, uint64_t byte_budget) {
+  const uint64_t token = frame_trace_capture_slot_.Queue(safe_root, byte_budget);
+  if (!token) {
+    REXGPU_WARN("Frame trace request rejected because the private slot is busy");
+    return 0;
+  }
+  if (!frame_trace_capture_slot_.owns_active_request(token)) {
+    return token;
+  }
+  if (!CallInThread([this, token]() { RequestFrameTraceOnThread(token); })) {
+    frame_trace_capture_slot_.Cancel(
+        token, "command worker stopped before the capture request was armed");
+  }
+  return token;
+}
+
+void CommandProcessor::RequestFrameTraceOnThread(uint64_t token) {
   std::lock_guard<std::shared_mutex> lifecycle_lock(trace_lifecycle_mutex_);
   if (trace_state_ == TraceState::kStreaming) {
     REXGPU_ERROR("Streaming trace; cannot also trace frame.");
+    frame_trace_capture_slot_.Fail(token, "streaming trace is already active");
     return;
   }
   if (trace_state_ == TraceState::kSingleFrame) {
     REXGPU_ERROR("Frame trace already pending; ignoring.");
+    frame_trace_capture_slot_.Fail(token, "another frame trace is already active");
+    return;
+  }
+  if (!frame_trace_capture_slot_.Arm(token)) {
     return;
   }
   trace_state_ = TraceState::kSingleFrame;
-  trace_frame_path_ = root_path;
+  active_frame_trace_token_ = token;
   trace_capture_active_.store(true, std::memory_order_release);
 }
 
@@ -302,27 +334,35 @@ void CommandProcessor::BeginTracingOnThread(const std::filesystem::path& root_pa
 }
 
 bool CommandProcessor::EndTracing() {
-  if (!CallInThread([this]() { EndTracingOnThread(); })) {
+  if (!CallInThread([this]() { EndTracingOnThread(false); })) {
     REXGPU_WARN("Trace stop request rejected because the command worker is not accepting work");
     return false;
   }
   return true;
 }
 
-void CommandProcessor::EndTracingOnThread() {
+void CommandProcessor::EndTracingOnThread(bool shutdown) {
   std::lock_guard<std::shared_mutex> lifecycle_lock(trace_lifecycle_mutex_);
   const TraceState previous_state = trace_state_;
   trace_state_ = TraceState::kDisabled;
   trace_stream_path_.clear();
-  trace_frame_path_.clear();
   if (trace_writer_.is_open()) {
     if (previous_state == TraceState::kStreaming) {
-      trace_writer_.Close();
+      if (!trace_writer_.Close()) {
+        REXGPU_ERROR("Streaming trace close failed: {}", trace_writer_.failure_reason());
+      }
     } else {
       // A single-frame capture is only complete when its swap closes it.
       // Stopping early (including shutdown) must not publish a partial trace.
       trace_writer_.Discard();
     }
+  }
+  if (active_frame_trace_token_) {
+    frame_trace_capture_slot_.Cancel(
+        active_frame_trace_token_,
+        shutdown ? "frame trace cancelled during GPU shutdown"
+                 : "frame trace cancelled before its completed swap");
+    active_frame_trace_token_ = 0;
   }
   trace_capture_active_.store(false, std::memory_order_release);
 }
@@ -528,35 +568,66 @@ void CommandProcessor::WorkerThreadMain() {
     }
     read_ptr_index = ring_snapshot.read_pointer;
     write_ptr_index = ring_snapshot.write_pointer;
+    const bool gpu_chain_profile_enabled = IsGpuChainProfilingEnabled();
+    const uint64_t batch_wptr_epoch = ring_snapshot.write_pointer_epoch;
+    if (gpu_chain_profile_enabled) {
+      gpu_chain_profiler_.RecordRingBatchStart(batch_wptr_epoch, SteadyNowNs());
+    }
 
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index = ExecutePrimaryBuffer(read_ptr_index, write_ptr_index, ring_snapshot.base,
                                           ring_snapshot.capacity_bytes());
-    if (!ring_state_.CommitReadPointerAndApply(
-            ring_snapshot.generation, read_ptr_index,
-            [this, read_ptr_index](const CommandRingState::Snapshot& committed_snapshot) {
-              if (!committed_snapshot.read_pointer_writeback_enabled()) {
-                return;
-              }
-              uint32_t writeback_address = committed_snapshot.read_pointer_writeback_address();
-              uint8_t* writeback_host = memory_->TranslatePhysical(writeback_address);
-              if (committed_snapshot.read_pointer_writeback_swap() == 2) {
-                memory::store_and_swap<uint32_t>(writeback_host, read_ptr_index);
-              } else {
-                memory::store<uint32_t>(writeback_host, read_ptr_index);
-              }
-            })) {
+    bool ring_commit_accepted = ring_state_.CommitReadPointerAndApply(
+        ring_snapshot.generation, read_ptr_index,
+        [this, read_ptr_index](const CommandRingState::Snapshot& committed_snapshot) {
+          if (!committed_snapshot.read_pointer_writeback_enabled()) {
+            return;
+          }
+          uint32_t writeback_address = committed_snapshot.read_pointer_writeback_address();
+          uint8_t* writeback_host = memory_->TranslatePhysical(writeback_address);
+          if (committed_snapshot.read_pointer_writeback_swap() == 2) {
+            memory::store_and_swap<uint32_t>(writeback_host, read_ptr_index);
+          } else {
+            memory::store<uint32_t>(writeback_host, read_ptr_index);
+          }
+        });
+    CommandRingState::Snapshot post_batch_snapshot = ring_state_.GetSnapshot();
+    uint32_t pending_backend_submissions = 0;
+    if (gpu_chain_profile_enabled) {
+      pending_backend_submissions = QueryPendingBackendSubmissionsForProfile();
+      gpu_chain_profiler_.RecordRingBatchEnd(
+          batch_wptr_epoch, post_batch_snapshot.write_pointer_epoch,
+          ring_commit_accepted, post_batch_snapshot.has_pending_commands());
+      gpu_chain_profiler_.RecordMetalPending(pending_backend_submissions);
+    }
+    if (!ring_commit_accepted) {
       // The guest replaced the ring while this batch was executing. Its new
       // generation owns RPTR and must not be overwritten by stale progress.
       continue;
     }
 
-    // GoldenEye GPU throttle: pause briefly after draining so the emulated GPU
-    // can't outrun the render thread (keeps the self-feeding GPU command chain
-    // alive -> no freeze). Tunable live via ge_gpu_throttle_us.
+    // GoldenEye GPU handoff: after a true drain, wait for the guest producer to
+    // ring a newer WPTR doorbell. The ring-owned condition variable closes the
+    // check-to-sleep race and wakes immediately on real work, avoiding the
+    // unconditional fixed delay that previously capped throughput.
     int32_t ge_throttle_us = REXCVAR_GET(ge_gpu_throttle_us);
     if (ge_throttle_us > 0) {
-      rex::thread::Sleep(std::chrono::microseconds(ge_throttle_us));
+      if (post_batch_snapshot.has_pending_commands()) {
+        if (gpu_chain_profile_enabled) {
+          gpu_chain_profiler_.RecordHandoffWaitSkipped(pending_backend_submissions != 0);
+        }
+      } else {
+        uint64_t wait_started_ns = gpu_chain_profile_enabled ? SteadyNowNs() : 0;
+        const auto wait_result = ring_state_.WaitForPendingWritePointerAfter(
+            post_batch_snapshot, std::chrono::microseconds(ge_throttle_us));
+        if (gpu_chain_profile_enabled) {
+          gpu_chain_profiler_.RecordHandoffWait(
+              uint64_t(ge_throttle_us) * 1000, SteadyNowNs() - wait_started_ns,
+              wait_result == CommandRingState::PendingWritePointerWaitResult::kPending,
+              wait_result == CommandRingState::PendingWritePointerWaitResult::kReconfigured,
+              pending_backend_submissions != 0);
+        }
+      }
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -703,10 +774,27 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
-  if (!ring_state_.WriteWritePointer(value)) {
+  const bool gpu_chain_profile_enabled = IsGpuChainProfilingEnabled();
+  CommandRingState::Snapshot ring_snapshot;
+  bool accepted = ring_state_.WriteWritePointerAndApply(
+      value, &ring_snapshot,
+      [this, gpu_chain_profile_enabled](const CommandRingState::Snapshot& previous,
+                                        const CommandRingState::Snapshot& current) noexcept {
+        if (!gpu_chain_profile_enabled) {
+          return;
+        }
+        const bool same_value = previous.write_pointer_valid() &&
+                                previous.write_pointer == current.write_pointer;
+        gpu_chain_profiler_.RecordWritePointer(
+            current.write_pointer_epoch, true, same_value,
+            current.pending_dword_count(), SteadyNowNs());
+      });
+  if (!accepted) {
+    if (gpu_chain_profile_enabled) {
+      gpu_chain_profiler_.RecordWritePointer(0, false, false, 0, SteadyNowNs());
+    }
     return;
   }
-  CommandRingState::Snapshot ring_snapshot = ring_state_.GetSnapshot();
   value = ring_snapshot.write_pointer;
   static std::atomic<uint32_t> wptr_logs{0};
   uint32_t wptr_index = wptr_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1666,20 +1754,66 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   if (opcode == PM4_XE_SWAP) {
     // End the trace writer frame.
     if (trace_writer_.is_open()) {
-      trace_writer_.WriteEvent(EventCommand::Type::kSwap);
-      trace_writer_.Flush();
+      const bool swap_written = trace_writer_.WriteEvent(EventCommand::Type::kSwap);
+      const bool swap_flushed = swap_written && trace_writer_.Flush();
       if (trace_state_ == TraceState::kSingleFrame) {
+        const uint64_t token = active_frame_trace_token_;
         trace_state_ = TraceState::kDisabled;
-        trace_writer_.Close();
+        active_frame_trace_token_ = 0;
+        if (!swap_flushed || trace_writer_.has_error()) {
+          const std::string failure = trace_writer_.failure_reason().empty()
+                                          ? "frame trace write or flush failed"
+                                          : std::string(trace_writer_.failure_reason());
+          trace_writer_.Discard();
+          frame_trace_capture_slot_.Fail(token, failure);
+        } else if (!trace_writer_.Close() ||
+                   !trace_writer_.last_close_finalized_manifest()) {
+          const std::string failure = trace_writer_.failure_reason().empty()
+                                          ? "frame trace close or manifest finalization failed"
+                                          : std::string(trace_writer_.failure_reason());
+          frame_trace_capture_slot_.Fail(token, failure);
+        } else {
+          frame_trace_capture_slot_.Publish(token);
+        }
+        trace_capture_active_.store(false, std::memory_order_release);
+      } else if (!swap_flushed || trace_writer_.has_error()) {
+        REXGPU_ERROR("Streaming trace failed and was discarded: {}",
+                     trace_writer_.failure_reason());
+        trace_writer_.Discard();
+        trace_state_ = TraceState::kDisabled;
         trace_capture_active_.store(false, std::memory_order_release);
       }
     } else if (trace_state_ == TraceState::kSingleFrame) {
       // New trace request - we only start tracing at the beginning of a frame.
-      uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
-      auto file_name =
-          fmt::format("{:08X}_{}.xtr", title_id, counter_.load(std::memory_order_acquire) - 1);
-      auto path = trace_frame_path_ / file_name;
-      OpenAndInitializeTrace(path, title_id);
+      const uint64_t token = active_frame_trace_token_;
+      uint32_t title_id = kernel_state_ && kernel_state_->GetExecutableModule()
+                              ? kernel_state_->GetExecutableModule()->title_id()
+                              : 0;
+      std::filesystem::path partial_path;
+      const int descriptor =
+          frame_trace_capture_slot_.CreatePartial(token, &partial_path);
+      if (descriptor < 0) {
+        trace_state_ = TraceState::kDisabled;
+        active_frame_trace_token_ = 0;
+        trace_capture_active_.store(false, std::memory_order_release);
+      } else if (!OpenAndInitializeTraceDescriptor(
+                     descriptor, partial_path, title_id,
+                     frame_trace_capture_slot_.byte_budget(token))) {
+        const std::string failure = trace_writer_.failure_reason().empty()
+                                        ? "frame trace initialization failed"
+                                        : std::string(trace_writer_.failure_reason());
+        frame_trace_capture_slot_.Fail(token, failure);
+        trace_state_ = TraceState::kDisabled;
+        active_frame_trace_token_ = 0;
+        trace_capture_active_.store(false, std::memory_order_release);
+      } else if (!frame_trace_capture_slot_.MarkCapturing(token)) {
+        trace_writer_.Discard();
+        frame_trace_capture_slot_.Fail(
+            token, "frame trace slot was cancelled during initialization");
+        trace_state_ = TraceState::kDisabled;
+        active_frame_trace_token_ = 0;
+        trace_capture_active_.store(false, std::memory_order_release);
+      }
     }
   }
 
@@ -1741,10 +1875,20 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+  const bool gpu_chain_profile_enabled = IsGpuChainProfilingEnabled();
+  if (gpu_chain_profile_enabled) {
+    // Arm before dispatch: GoldenEye may submit its next WPTR from the guest
+    // thread awakened by this callback while the synchronous ISR is running.
+    gpu_chain_profiler_.RecordInterrupt(SteadyNowNs());
+  }
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
+        uint64_t dispatch_started_ns = gpu_chain_profile_enabled ? SteadyNowNs() : 0;
         graphics_system_->DispatchInterruptCallback(1, n);
+        if (gpu_chain_profile_enabled) {
+          gpu_chain_profiler_.RecordIsrDispatch(SteadyNowNs() - dispatch_started_ns);
+        }
       }
     }
   }
@@ -2710,6 +2854,12 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
 bool CommandProcessor::OpenAndInitializeTrace(const std::filesystem::path& path,
                                               uint32_t title_id) {
   trace_initialization_incomplete_ = false;
+  if (!trace_writer_.SetByteBudget(TraceWriter::kDefaultByteBudget)) {
+    REXGPU_ERROR("Trace initialization failed to apply the default byte budget");
+    trace_state_ = TraceState::kDisabled;
+    trace_capture_active_.store(false, std::memory_order_release);
+    return false;
+  }
   if (!trace_writer_.Open(path, title_id)) {
     REXGPU_ERROR("Trace initialization failed to open {}", path.string());
     trace_state_ = TraceState::kDisabled;
@@ -2718,10 +2868,46 @@ bool CommandProcessor::OpenAndInitializeTrace(const std::filesystem::path& path,
   }
 
   InitializeTrace();
-  trace_writer_.Flush();
-  if (trace_initialization_incomplete_ || trace_writer_.has_error()) {
+  const bool flushed = trace_writer_.Flush();
+  if (trace_initialization_incomplete_ || !flushed || trace_writer_.has_error()) {
     REXGPU_ERROR("Trace initialization failed; discarding incomplete trace {}",
                  path.string());
+    trace_writer_.Discard();
+    trace_state_ = TraceState::kDisabled;
+    trace_capture_active_.store(false, std::memory_order_release);
+    return false;
+  }
+  return true;
+}
+
+bool CommandProcessor::OpenAndInitializeTraceDescriptor(
+    int descriptor, const std::filesystem::path& display_path, uint32_t title_id,
+    uint64_t byte_budget) {
+  trace_initialization_incomplete_ = false;
+  if (!trace_writer_.SetByteBudget(byte_budget)) {
+#ifdef _WIN32
+    _close(descriptor);
+#else
+    ::close(descriptor);
+#endif
+    REXGPU_ERROR("Trace initialization rejected the private capture byte budget");
+    trace_state_ = TraceState::kDisabled;
+    trace_capture_active_.store(false, std::memory_order_release);
+    return false;
+  }
+  if (!trace_writer_.OpenFileDescriptor(descriptor, display_path, title_id)) {
+    REXGPU_ERROR("Trace initialization failed to open private partial {}",
+                 display_path.string());
+    trace_state_ = TraceState::kDisabled;
+    trace_capture_active_.store(false, std::memory_order_release);
+    return false;
+  }
+
+  InitializeTrace();
+  const bool flushed = trace_writer_.Flush();
+  if (trace_initialization_incomplete_ || !flushed || trace_writer_.has_error()) {
+    REXGPU_ERROR("Trace initialization failed; discarding incomplete private trace {}",
+                 display_path.string());
     trace_writer_.Discard();
     trace_state_ = TraceState::kDisabled;
     trace_capture_active_.store(false, std::memory_order_release);

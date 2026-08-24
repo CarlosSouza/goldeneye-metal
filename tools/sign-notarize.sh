@@ -5,24 +5,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-VERSION="${VERSION:-${APP_VERSION:-0.4.2}}"
-BUILD_NUMBER="${BUILD_NUMBER:-10}"
+RELEASE_MANIFEST="$REPO_ROOT/config/goldeneye-release.json"
 BUNDLE_IDENTIFIER="${BUNDLE_IDENTIFIER:-io.github.ysrdevs.goldeneye-metal}"
 MACOS_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-14.0}"
 
 APP="$REPO_ROOT/vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist/GoldenEye Metal.app"
 RUNTIME="$APP/Contents/Frameworks/librexruntime.dylib"
+APP_PLIST="$APP/Contents/Info.plist"
 RELEASE_DIR="$REPO_ROOT/release"
-ZIP="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-macos-arm64.zip"
-DMG="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-macos-arm64.dmg"
-ZIP_TEMP="$RELEASE_DIR/.GoldenEye-Metal-${VERSION}-release.zip"
-DMG_TEMP="$RELEASE_DIR/.GoldenEye-Metal-${VERSION}-release.dmg"
-APP_UPLOAD_ZIP="$RELEASE_DIR/.GoldenEye-Metal-${VERSION}-app-notarization.zip"
-DMG_STAGE="$RELEASE_DIR/.GoldenEye-Metal-${VERSION}-dmg-root"
-APP_RESULT="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-app-notary-result.plist"
-APP_LOG="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-app-notary-log.json"
-DMG_RESULT="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-dmg-notary-result.plist"
-DMG_LOG="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-dmg-notary-log.json"
 
 usage() {
   cat <<'EOF'
@@ -60,6 +50,12 @@ cleanup() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+release_manifest_value() {
+  key="$1"
+  /usr/bin/plutil -extract "$key" raw -o - "$RELEASE_MANIFEST" 2>/dev/null ||
+    fail "release manifest has no valid '$key' value: $RELEASE_MANIFEST"
 }
 
 show_notary_result() {
@@ -106,15 +102,30 @@ submit_and_require_accepted() {
     "$submission_id" "$log_file"
 }
 
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  usage
-  exit 0
-fi
-[ "$#" -eq 0 ] || fail "unknown argument: $1 (use --help)"
+PRINT_VERSION=0
+case "${1:-}" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  --print-version)
+    PRINT_VERSION=1
+    ;;
+  "") ;;
+  *) fail "unknown argument: $1 (use --help)" ;;
+esac
+[ "$#" -le 1 ] || fail "too many arguments (use --help)"
 
 [ "$(/usr/bin/uname -s)" = "Darwin" ] || fail "this script requires macOS"
-[ -n "${SIGN_IDENTITY:-}" ] || fail "SIGN_IDENTITY is required (use --help for the exact command)"
-[ -n "${NOTARY_PROFILE:-}" ] || fail "NOTARY_PROFILE is required (use --help for the exact command)"
+
+require_command /usr/bin/plutil
+[ -f "$RELEASE_MANIFEST" ] || fail "release manifest is missing: $RELEASE_MANIFEST"
+/usr/bin/plutil -convert xml1 -o /dev/null "$RELEASE_MANIFEST" ||
+  fail "release manifest is invalid: $RELEASE_MANIFEST"
+MANIFEST_VERSION="$(release_manifest_value version)"
+MANIFEST_BUILD_NUMBER="$(release_manifest_value build)"
+VERSION="${VERSION:-${APP_VERSION:-$MANIFEST_VERSION}}"
+BUILD_NUMBER="${BUILD_NUMBER:-$MANIFEST_BUILD_NUMBER}"
 
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
   fail "VERSION must contain two or three numeric components"
@@ -123,10 +134,28 @@ fi
 [[ "$MACOS_DEPLOYMENT_TARGET" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
   fail "MACOS_DEPLOYMENT_TARGET must be a numeric macOS version"
 
+if [ "$PRINT_VERSION" -eq 1 ]; then
+  printf 'VERSION=%s\nBUILD_NUMBER=%s\n' "$VERSION" "$BUILD_NUMBER"
+  exit 0
+fi
+
+[ -n "${SIGN_IDENTITY:-}" ] || fail "SIGN_IDENTITY is required (use --help for the exact command)"
+[ -n "${NOTARY_PROFILE:-}" ] || fail "NOTARY_PROFILE is required (use --help for the exact command)"
+
+ZIP="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-macos-arm64.zip"
+DMG="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-macos-arm64.dmg"
+ZIP_TEMP="$RELEASE_DIR/.GoldenEye-Metal-${VERSION}-release.zip"
+DMG_TEMP="$RELEASE_DIR/.GoldenEye-Metal-${VERSION}-release.dmg"
+APP_UPLOAD_ZIP="$RELEASE_DIR/.GoldenEye-Metal-${VERSION}-app-notarization.zip"
+DMG_STAGE="$RELEASE_DIR/.GoldenEye-Metal-${VERSION}-dmg-root"
+APP_RESULT="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-app-notary-result.plist"
+APP_LOG="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-app-notary-log.json"
+DMG_RESULT="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-dmg-notary-result.plist"
+DMG_LOG="$RELEASE_DIR/GoldenEye-Metal-${VERSION}-dmg-notary-log.json"
+
 require_command /usr/bin/codesign
 require_command /usr/bin/ditto
 require_command /usr/bin/hdiutil
-require_command /usr/bin/plutil
 require_command /usr/bin/security
 require_command /usr/bin/xcrun
 require_command /usr/sbin/spctl
@@ -153,6 +182,13 @@ MACOS_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
 
 [ -d "$APP" ] || fail "app was not created: $APP"
 [ -f "$RUNTIME" ] || fail "bundled runtime is missing: $RUNTIME"
+[ -f "$APP_PLIST" ] || fail "bundled Info.plist is missing: $APP_PLIST"
+APP_VERSION_ACTUAL="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$APP_PLIST")"
+APP_BUILD_ACTUAL="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$APP_PLIST")"
+[ "$APP_VERSION_ACTUAL" = "$VERSION" ] ||
+  fail "app version $APP_VERSION_ACTUAL does not match release version $VERSION"
+[ "$APP_BUILD_ACTUAL" = "$BUILD_NUMBER" ] ||
+  fail "app build $APP_BUILD_ACTUAL does not match release build $BUILD_NUMBER"
 
 /bin/rm -f "$ZIP_TEMP" "$DMG_TEMP" "$APP_UPLOAD_ZIP"
 /bin/rm -rf "$DMG_STAGE"

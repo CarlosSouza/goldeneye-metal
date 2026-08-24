@@ -22,6 +22,26 @@ struct CanonicalEdramSurfaceLayout {
   bool is_depth = false;
 };
 
+enum class CanonicalEdramSurfaceLayoutClass : uint8_t {
+  kInvalid,
+  kNonAliasing,
+  kSelfAliasing,
+};
+
+// Classifies whether a logical surface has a one-to-one mapping to physical
+// EDRAM words. A self-aliasing private target may be read from a canonical
+// snapshot, but it can't become an authoritative export owner after a native
+// write because multiple independent Metal samples map to the same Xenos
+// word.
+CanonicalEdramSurfaceLayoutClass ClassifyCanonicalEdramSurfaceLayout(
+    const CanonicalEdramSurfaceLayout& layout, uint32_t width, uint32_t height);
+
+// Native self-alias containment is relevant only while a canonical image may
+// be consumed by private targets or exact EDRAM is authoritative. With both
+// states inactive (the default exact-output-merger-off route), native target
+// tracking must retain its legacy behavior.
+bool ShouldContainCanonicalEdramNativeAlias(bool target_hydration_enabled, bool exact_gpu_current);
+
 constexpr uint32_t GetCanonicalEdramSampleCount(xenos::MsaaSamples msaa_samples) {
   return uint32_t(1) << uint32_t(msaa_samples);
 }
@@ -73,18 +93,18 @@ struct CanonicalEdramTileOwner {
 // into private Metal targets. Live captures are serialization-only: the
 // full-surface ownership model may wrap and overlap physical EDRAM tiles, so
 // promoting a live capture would make color and depth targets repeatedly
-// overwrite each other. Only an explicit trace restore establishes hydration
-// authority.
+// overwrite each other. Only an explicit trace restore or a completed exact
+// output-merger publication establishes hydration authority.
 class CanonicalEdramAuthorityState {
  public:
   void Reset();
   void RecordCapture();
   void RecordRestore();
-
+  // A completed exact output-merger draw publishes another complete raw
+  // canonical image and is therefore a safe private-target hydration source.
+  void RecordExactDraw();
   bool has_snapshot() const { return has_snapshot_; }
-  bool target_hydration_enabled() const {
-    return has_snapshot_ && target_hydration_enabled_;
-  }
+  bool target_hydration_enabled() const { return has_snapshot_ && target_hydration_enabled_; }
 
  private:
   bool has_snapshot_ = false;

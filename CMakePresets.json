@@ -144,6 +144,16 @@
             "displayName": "macOS Apple Silicon RelWithDebInfo (Metal)",
             "inherits": "macos-arm64-base",
             "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+        },
+        {
+            "name": "macos-arm64-ubsan",
+            "displayName": "macOS Apple Silicon UBSan (Metal)",
+            "inherits": "macos-arm64-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "REXGLUE_ENABLE_SANITIZERS": "ON",
+                "REXGLUE_OUTPUT_DIRECTORY": "${sourceDir}/out/macos-arm64-ubsan"
+            }
         }
     ],
     "buildPresets": [
@@ -222,6 +232,10 @@
         {
             "name": "macos-arm64-relwithdebinfo",
             "configurePreset": "macos-arm64-relwithdebinfo"
+        },
+        {
+            "name": "macos-arm64-ubsan",
+            "configurePreset": "macos-arm64-ubsan"
         }
     ],
     "testPresets": [
@@ -300,6 +314,13 @@
         {
             "name": "macos-arm64-relwithdebinfo",
             "configurePreset": "macos-arm64-relwithdebinfo"
+        },
+        {
+            "name": "macos-arm64-ubsan",
+            "configurePreset": "macos-arm64-ubsan",
+            "environment": {
+                "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"
+            }
         }
     ]
 }

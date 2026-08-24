@@ -1,5 +1,7 @@
 #include <rex/graphics/metal/shader.h>
 
+#include <rex/graphics/metal/exact_output_merger.h>
+
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -391,18 +393,62 @@ MetalShader::MetalShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash
     : SpirvShader(shader_type, ucode_data_hash, ucode_dwords, ucode_dword_count,
                   ucode_source_endian) {}
 
+std::unique_ptr<SpirvShaderTranslator> CreateExactOutputMergerShaderTranslator() {
+  SpirvShaderTranslator::Features features(true);
+  features.image_view_format_swizzle = false;
+  // Metal raster-order groups provide the ordering. Advertising SPIR-V sample
+  // interlock would select a different, unsupported lowering contract.
+  features.fragment_shader_sample_interlock = false;
+  // The exact path supplies a dummy coverage attachment, including at 2x
+  // MSAA, while all guest color/depth operations target canonical EDRAM.
+  return std::make_unique<SpirvShaderTranslator>(features, true, true, true);
+}
+
 Shader::Translation* MetalShader::CreateTranslationInstance(uint64_t modification) {
   return new MetalTranslation(*this, modification);
+}
+
+MetalShader::MetalTranslation* MetalShader::GetOrCreateExactOutputMergerTranslation(
+    uint64_t modification, bool* is_new) {
+  auto it = exact_output_merger_translations_.find(modification);
+  if (it != exact_output_merger_translations_.end()) {
+    if (is_new) {
+      *is_new = false;
+    }
+    return it->second.get();
+  }
+  auto translation =
+      std::make_unique<MetalTranslation>(*this, modification, TranslationMode::kExactOutputMerger);
+  MetalTranslation* translation_ptr = translation.get();
+  exact_output_merger_translations_.emplace(modification, std::move(translation));
+  if (is_new) {
+    *is_new = true;
+  }
+  return translation_ptr;
+}
+
+MetalShader::MetalTranslation* MetalShader::GetExactOutputMergerTranslation(
+    uint64_t modification) const {
+  auto it = exact_output_merger_translations_.find(modification);
+  return it == exact_output_merger_translations_.end() ? nullptr : it->second.get();
+}
+
+void MetalShader::DestroyExactOutputMergerTranslation(uint64_t modification) {
+  exact_output_merger_translations_.erase(modification);
 }
 
 MetalShader::MetalTranslation::~MetalTranslation() {
   ReleaseMslLibrary(metal_library_);
   metal_library_ = nullptr;
+  metal_library_device_ = nullptr;
+  compiled_msl_generation_ = 0;
 }
 
-void MetalShader::MetalTranslation::ReflectMslSource() {
+bool MetalShader::MetalTranslation::ReflectMslSource(std::string* error_out) {
   msl_reflection_ = MslReflection{};
   msl_reflection_.shared_memory_buffer_index = FindMslBufferIndex(msl_source_, "xe_shared_memory");
+  msl_reflection_.system_constants_buffer_index =
+      FindMslBufferIndex(msl_source_, "xe_uniform_system_constants");
   msl_reflection_.float_constants_buffer_index =
       FindMslBufferIndex(msl_source_, "xe_uniform_float_constants");
   msl_reflection_.bool_loop_constants_buffer_index =
@@ -423,35 +469,118 @@ void MetalShader::MetalTranslation::ReflectMslSource() {
   msl_reflection_.writes_shared_memory = MslWritesSharedMemory(msl_source_);
   msl_reflection_.is_void_fragment = shader().type() == xenos::ShaderType::kPixel &&
                                      msl_source_.find("fragment void main0") != std::string::npos;
+  const bool has_edram_name = msl_source_.find("xe_edram") != std::string::npos;
+  if (has_edram_name) {
+    std::string binding_error;
+    uint32_t binding = UINT32_MAX;
+    if (FindExactOutputMergerEdramBinding(msl_source_, binding, &binding_error)) {
+      msl_reflection_.edram_buffer_index = binding;
+      msl_reflection_.edram_raster_order_group = true;
+      msl_reflection_.exact_output_merger_contract = true;
+    } else if (mode_ == TranslationMode::kExactOutputMerger) {
+      if (error_out) {
+        *error_out = std::move(binding_error);
+      }
+      return false;
+    }
+  }
+  if (mode_ == TranslationMode::kExactOutputMerger) {
+    if (shader().type() == xenos::ShaderType::kPixel &&
+        !msl_reflection_.exact_output_merger_contract) {
+      if (error_out) {
+        *error_out = "exact output-merger pixel translation has no coherent ROG EDRAM binding";
+      }
+      return false;
+    }
+    if (shader().type() == xenos::ShaderType::kVertex && has_edram_name) {
+      if (error_out) {
+        *error_out = "exact output-merger vertex translation unexpectedly exposes EDRAM";
+      }
+      return false;
+    }
+  }
+  return true;
 }
 
 bool MetalShader::MetalTranslation::TranslateMslFromSpirv() {
+  // A translation may be regenerated in place. Never leave an older Metal
+  // library attached to newly generated source.
+  ReleaseMslLibrary(metal_library_);
+  metal_library_ = nullptr;
+  metal_library_device_ = nullptr;
+  compiled_msl_generation_ = 0;
   if (!TranslateSpirvToMslSource(translated_binary(), shader().type(), shader().ucode_data_hash(),
                                  modification(), msl_source_, nullptr)) {
+    MakeInvalid();
     return false;
   }
-  ReflectMslSource();
+  std::string reflection_error;
+  if (!ReflectMslSource(&reflection_error)) {
+    MakeInvalid();
+    std::fprintf(stderr, "[metal] exact output-merger MSL reflection failed: %s\n",
+                 reflection_error.c_str());
+    std::fflush(stderr);
+    return false;
+  }
+  ++msl_source_generation_;
+  if (!msl_source_generation_) {
+    // Generation wrap would make stale-library identity ambiguous. It is not
+    // reachable in practice, but exact output-merger attestation fails closed.
+    MakeInvalid();
+    return false;
+  }
   DumpTranslatedMsl(static_cast<const MetalShader&>(shader()), modification(), msl_source_);
   return true;
 }
 
 bool MetalShader::MetalTranslation::CompileMslLibrary(void* metal_device, std::string* error_out) {
-  if (metal_library_) {
+  if (metal_library_is_current_for_device(metal_device)) {
     return true;
   }
+  ReleaseMslLibrary(metal_library_);
+  metal_library_ = nullptr;
+  metal_library_device_ = nullptr;
+  compiled_msl_generation_ = 0;
+  if (!metal_device || !msl_source_generation_ || msl_source_.empty()) {
+    if (error_out) {
+      *error_out = "Metal translation has no current MSL source or target device";
+    }
+    MakeInvalid();
+    return false;
+  }
   metal_library_ = CreateMslLibrary(metal_device, msl_source_, error_out);
-  return metal_library_ != nullptr;
+  if (!metal_library_) {
+    MakeInvalid();
+    return false;
+  }
+  metal_library_device_ = metal_device;
+  compiled_msl_generation_ = msl_source_generation_;
+  return true;
+}
+
+bool CreateDepthOnlyFragmentMslSource(
+    SpirvShaderTranslator& shader_translator,
+    SpirvShaderTranslator::Modification::DepthStencilMode depth_stencil_mode,
+    std::string& source_out, std::string* error_out, std::vector<uint8_t>* spirv_out) {
+  std::vector<uint8_t> spirv = shader_translator.CreateDepthOnlyFragmentShader(depth_stencil_mode);
+  if (!TranslateSpirvToMslSource(spirv, xenos::ShaderType::kPixel, 0,
+                                 static_cast<uint64_t>(depth_stencil_mode), source_out,
+                                 error_out)) {
+    return false;
+  }
+  if (spirv_out) {
+    *spirv_out = std::move(spirv);
+  }
+  return true;
 }
 
 void* CreateDepthOnlyFragmentMslLibrary(
     void* metal_device, SpirvShaderTranslator& shader_translator,
     SpirvShaderTranslator::Modification::DepthStencilMode depth_stencil_mode,
     std::string* error_out) {
-  std::vector<uint8_t> spirv = shader_translator.CreateDepthOnlyFragmentShader(depth_stencil_mode);
   std::string msl_source;
-  if (!TranslateSpirvToMslSource(spirv, xenos::ShaderType::kPixel, 0,
-                                 static_cast<uint64_t>(depth_stencil_mode), msl_source,
-                                 error_out)) {
+  if (!CreateDepthOnlyFragmentMslSource(shader_translator, depth_stencil_mode, msl_source,
+                                        error_out)) {
     return nullptr;
   }
   return CreateMslLibrary(metal_device, msl_source, error_out);

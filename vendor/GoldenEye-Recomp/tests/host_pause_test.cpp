@@ -541,6 +541,240 @@ void TestRetryLogGate() {
   CHECK_TRUE(!gate.active());
 }
 
+ge::host_pause::detail::LiveTestObservation RunningLiveObservation(
+    uint64_t monotonic_ms, uint32_t guest_frame, uint32_t present) {
+  return {
+      .monotonic_ms = monotonic_ms,
+      .dam_gameplay_ready = true,
+      .ui_open = false,
+      .world_valid = true,
+      .ammo_valid = true,
+      .input_neutral = true,
+      .player = 0x83001000u,
+      .coordinates = 0x83002000u,
+      .guest_frame = guest_frame,
+      .present = present,
+      .pause_value = 0,
+      .position_x = 10.0f,
+      .position_y = 20.0f,
+      .position_z = 30.0f,
+      .camera_yaw = 0.25f,
+      .camera_pitch = -0.1f,
+      .weapon = 3,
+      .ammo = 7,
+      .pause = {.requested = false,
+                .request_applied = true,
+                .available = false,
+                .gameplay_paused = false,
+                .host_owned = false,
+                .generation = 0,
+                .applied_generation = 0},
+  };
+}
+
+ge::host_pause::detail::LiveTestObservation PausedLiveObservation(
+    uint64_t monotonic_ms, uint32_t guest_frame, uint32_t present) {
+  auto observation =
+      RunningLiveObservation(monotonic_ms, guest_frame, present);
+  observation.ui_open = true;
+  observation.pause_value = ge::host_pause::kHostPauseToken;
+  observation.pause = {
+      .requested = true,
+      .request_applied = true,
+      .available = true,
+      .gameplay_paused = true,
+      .host_owned = true,
+      .generation = 1,
+      .applied_generation = 1,
+  };
+  return observation;
+}
+
+void ReachLiveTestPauseObservation(
+    ge::host_pause::detail::LiveTestGate& gate) {
+  using ge::host_pause::detail::LiveTestRequest;
+  CHECK_TRUE(gate.Observe(RunningLiveObservation(0, 100, 200)).request ==
+             LiveTestRequest::kNone);
+  CHECK_TRUE(gate.Observe(RunningLiveObservation(500, 101, 201)).request ==
+             LiveTestRequest::kOpenHostSettings);
+  CHECK_TRUE(gate.Observe(PausedLiveObservation(600, 102, 202)).request ==
+             LiveTestRequest::kNone);
+}
+
+void ReachLiveTestResumeWait(ge::host_pause::detail::LiveTestGate& gate) {
+  using ge::host_pause::detail::LiveTestRequest;
+  ReachLiveTestPauseObservation(gate);
+  CHECK_TRUE(gate.Observe(PausedLiveObservation(1100, 103, 203)).request ==
+             LiveTestRequest::kNone);
+  const auto frozen = gate.Observe(PausedLiveObservation(1600, 104, 204));
+  CHECK_TRUE(frozen.frozen_proven);
+  CHECK_TRUE(frozen.request == LiveTestRequest::kCloseHostSettings);
+}
+
+void TestLiveHostPauseGateSuccess() {
+  using ge::host_pause::detail::LiveTestPhase;
+  ge::host_pause::detail::LiveTestGate gate;
+  ReachLiveTestResumeWait(gate);
+  CHECK_TRUE(gate.phase() == LiveTestPhase::kWaitingForResume);
+  CHECK_TRUE(gate.proof().open_generation == 1);
+  CHECK_TRUE(gate.proof().frozen_samples == 3);
+  CHECK_TRUE(gate.proof().frozen_duration_ms == 1000);
+  CHECK_TRUE(gate.proof().paused_frame_delta == 2);
+  CHECK_TRUE(gate.proof().paused_present_delta == 2);
+
+  auto resumed = RunningLiveObservation(1700, 105, 205);
+  resumed.pause.generation = 2;
+  resumed.pause.applied_generation = 2;
+  CHECK_TRUE(!gate.Observe(resumed).completed);
+  resumed = RunningLiveObservation(2200, 106, 206);
+  resumed.pause.generation = 2;
+  resumed.pause.applied_generation = 2;
+  const auto complete = gate.Observe(resumed);
+  CHECK_TRUE(complete.completed);
+  CHECK_TRUE(gate.phase() == LiveTestPhase::kComplete);
+  CHECK_TRUE(gate.proof().resume_generation == 2);
+  CHECK_TRUE(gate.proof().resumed_samples == 2);
+  CHECK_TRUE(gate.proof().resumed_duration_ms == 500);
+  CHECK_TRUE(gate.proof().resumed_frame_delta == 1);
+  CHECK_TRUE(gate.proof().resumed_present_delta == 1);
+  CHECK_TRUE(gate.Observe(resumed).completed);
+}
+
+void TestLiveHostPauseGateFailsClosed() {
+  using ge::host_pause::detail::LiveTestPhase;
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    ReachLiveTestPauseObservation(gate);
+    auto moved = PausedLiveObservation(1100, 103, 203);
+    moved.position_x += 0.01f;
+    const auto result = gate.Observe(moved);
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) ==
+               "world-advanced-while-paused");
+    CHECK_TRUE(gate.phase() == LiveTestPhase::kFailed);
+  }
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    ReachLiveTestPauseObservation(gate);
+    CHECK_TRUE(!gate.Observe(PausedLiveObservation(1100, 103, 202))
+                    .failure_reason);
+    const auto result = gate.Observe(PausedLiveObservation(1600, 104, 202));
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) ==
+               "paused-presentation-stalled");
+  }
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    CHECK_TRUE(!gate.Observe(RunningLiveObservation(0, 100, 200))
+                    .failure_reason);
+    CHECK_TRUE(gate.Observe(RunningLiveObservation(500, 101, 201)).request ==
+               ge::host_pause::detail::LiveTestRequest::kOpenHostSettings);
+    const auto result = gate.Observe(RunningLiveObservation(5601, 102, 202));
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) == "phase-timeout");
+  }
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    ReachLiveTestPauseObservation(gate);
+    auto early_close = PausedLiveObservation(1100, 103, 203);
+    early_close.ui_open = false;
+    const auto result = gate.Observe(early_close);
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) == "ui-closed-early");
+  }
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    ReachLiveTestResumeWait(gate);
+    auto wrong_generation = RunningLiveObservation(1700, 105, 205);
+    wrong_generation.pause.generation = 9;
+    wrong_generation.pause.applied_generation = 9;
+    const auto result = gate.Observe(wrong_generation);
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) ==
+               "resume-generation-mismatch");
+  }
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    ReachLiveTestResumeWait(gate);
+    auto held_input = RunningLiveObservation(1700, 105, 205);
+    held_input.pause.generation = 2;
+    held_input.pause.applied_generation = 2;
+    held_input.input_neutral = false;
+    const auto result = gate.Observe(held_input);
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) ==
+               "resume-input-not-neutral");
+  }
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    ReachLiveTestResumeWait(gate);
+    auto resumed = RunningLiveObservation(1700, 105, 205);
+    resumed.pause.generation = 2;
+    resumed.pause.applied_generation = 2;
+    CHECK_TRUE(!gate.Observe(resumed).failure_reason);
+    resumed.monotonic_ms = 2200;
+    const auto result = gate.Observe(resumed);
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) ==
+               "resume-progress-stalled");
+  }
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    ReachLiveTestPauseObservation(gate);
+    auto ownership_lost = PausedLiveObservation(1100, 103, 203);
+    ownership_lost.pause.host_owned = false;
+    const auto result = gate.Observe(ownership_lost);
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) ==
+               "pause-ownership-lost");
+  }
+
+  {
+    ge::host_pause::detail::LiveTestGate gate;
+    CHECK_TRUE(!gate.Observe(RunningLiveObservation(500, 100, 200))
+                    .failure_reason);
+    const auto result = gate.Observe(RunningLiveObservation(499, 101, 201));
+    CHECK_TRUE(result.failure_reason != nullptr);
+    CHECK_TRUE(std::string_view(result.failure_reason) == "clock-regressed");
+  }
+}
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+void TestDeveloperMenuRequestBridge() {
+  ge::host_pause::test_harness::MenuRequestBridge bridge;
+  CHECK_TRUE(!bridge.Request(true));
+
+  bool requested = false;
+  bool desired_open = false;
+  bridge.SetHandler([&](bool open) {
+    requested = true;
+    desired_open = open;
+    return true;
+  });
+  CHECK_TRUE(bridge.Request(true));
+  CHECK_TRUE(requested);
+  CHECK_TRUE(desired_open);
+  CHECK_TRUE(!bridge.open());
+  bridge.PublishOpen(true);
+  CHECK_TRUE(bridge.open());
+
+  requested = false;
+  CHECK_TRUE(bridge.Request(false));
+  CHECK_TRUE(requested);
+  CHECK_TRUE(!desired_open);
+  bridge.ClearHandler();
+  CHECK_TRUE(!bridge.Request(true));
+}
+#endif
+
 size_t CountOccurrences(const std::string& text, const std::string& needle) {
   size_t count = 0;
   size_t position = 0;
@@ -639,6 +873,11 @@ int main() {
   TestIndependentMultiplayerResumeLatches();
   TestControllerHostSettingsShortcut();
   TestRetryLogGate();
+  TestLiveHostPauseGateSuccess();
+  TestLiveHostPauseGateFailsClosed();
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  TestDeveloperMenuRequestBridge();
+#endif
   TestGeneratedPauseWordContract();
   return failures == 0 ? 0 : 1;
 }

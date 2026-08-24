@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #include <rex/logging.h>
 
@@ -22,6 +24,44 @@ constexpr uint32_t kNetworkSessionFlagAddress = 0x830CAEA0u;
 constexpr uint32_t kCheatActiveFlagsAddress = 0x83063318u;
 constexpr uint32_t kSlowMotionTimeScaleAddress = 0x82003264u;
 
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+bool GameplayTraceEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GOLDENEYE_TEST_GAMEPLAY_TRACE");
+    return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0);
+  }();
+  return enabled;
+}
+
+bool MultiplayerTraceEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GOLDENEYE_TEST_MULTIPLAYER_TRACE");
+    return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0);
+  }();
+  return enabled;
+}
+
+void TraceMissionState(int32_t level_id, int32_t player_count, bool network_session) {
+  if (!GameplayTraceEnabled() && !MultiplayerTraceEnabled()) {
+    return;
+  }
+  static int32_t previous_level = INT32_MIN;
+  static int32_t previous_players = INT32_MIN;
+  static bool previous_network = false;
+  static bool initialized = false;
+  if (initialized && level_id == previous_level && player_count == previous_players &&
+      network_session == previous_network) {
+    return;
+  }
+  initialized = true;
+  previous_level = level_id;
+  previous_players = player_count;
+  previous_network = network_session;
+  REXLOG_INFO("[ge-test] mission level={} players={} network={}", level_id, player_count,
+              network_session ? 1 : 0);
+}
+#endif
+
 struct PublishedState {
   std::atomic<bool> available{false};
   std::atomic<bool> active_known{false};
@@ -36,6 +76,14 @@ std::atomic<uint64_t> g_mutation_token{0};
 std::atomic<AvailabilityBlock> g_availability_block{AvailabilityBlock::kNoMission};
 #if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
 detail::LocalMultiplayerReadinessTracker g_local_multiplayer_readiness;
+std::atomic<uint64_t> g_mission_snapshot{0};
+
+uint64_t PackMissionSnapshot(int32_t level_id, int32_t player_count,
+                             bool network_session) noexcept {
+  return uint64_t(static_cast<uint32_t>(level_id)) |
+         (uint64_t(static_cast<uint8_t>(player_count)) << 32) |
+         (uint64_t(network_session ? 1 : 0) << 40) | (uint64_t(1) << 63);
+}
 #endif
 
 constexpr bool IsSupported(Tool tool) noexcept {
@@ -228,6 +276,19 @@ void PublishGraphicsProperty(PPCContext& context, uint8_t* base) {
   const bool active = QueryOriginalGraphics(context, base, &known);
   g_states[index].active.store(active, std::memory_order_release);
   g_states[index].active_known.store(known, std::memory_order_release);
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  if (GameplayTraceEnabled()) {
+    static bool previous_active = false;
+    static bool previous_known = false;
+    static bool initialized = false;
+    if (!initialized || active != previous_active || known != previous_known) {
+      initialized = true;
+      previous_active = active;
+      previous_known = known;
+      REXLOG_INFO("[ge-test] graphics original={} known={}", active ? 1 : 0, known ? 1 : 0);
+    }
+  }
+#endif
 }
 
 uint64_t UpdateMutationEpoch(int32_t level_id, uint64_t pause_generation,
@@ -345,8 +406,25 @@ void RequestRefresh() noexcept {
   g_refresh_requested.store(true, std::memory_order_release);
 }
 
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+MissionSnapshot GetMissionSnapshot() noexcept {
+  const uint64_t packed = g_mission_snapshot.load(std::memory_order_acquire);
+  MissionSnapshot snapshot;
+  snapshot.valid = (packed >> 63) != 0;
+  if (snapshot.valid) {
+    snapshot.level_id = static_cast<int32_t>(static_cast<uint32_t>(packed));
+    snapshot.player_count = static_cast<int32_t>((packed >> 32) & 0xFFu);
+    snapshot.network_session = ((packed >> 40) & 1u) != 0;
+  }
+  return snapshot;
+}
+#endif
+
 void ProcessTestingToolRequests(PPCContext& context, uint8_t* base) noexcept {
   if (!base) {
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    g_mission_snapshot.store(0, std::memory_order_release);
+#endif
     PublishUnavailable(AvailabilityBlock::kNoMission);
     g_requests.DiscardAll();
     return;
@@ -357,6 +435,10 @@ void ProcessTestingToolRequests(PPCContext& context, uint8_t* base) noexcept {
   const int32_t player_count = ActivePlayerCount(context, base);
   const bool network_session = base[kNetworkSessionFlagAddress] != 0;
 #if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+  g_mission_snapshot.store(
+      PackMissionSnapshot(level_id, player_count, network_session),
+      std::memory_order_release);
+  TraceMissionState(level_id, player_count, network_session);
   if (g_local_multiplayer_readiness.Observe(level_id, player_count, network_session)) {
     REXLOG_INFO("[ge] local multiplayer ready level={} players={} network=0 stable_polls={}",
                 g_local_multiplayer_readiness.level_id(),
@@ -424,10 +506,8 @@ void ProcessTestingToolRequests(PPCContext& context, uint8_t* base) noexcept {
     // the current retail profile and its normal progression setter. Consume
     // both requests before choosing so an accidental same-frame pair can only
     // run the comprehensive action once.
-    const bool unlock_all_levels =
-        g_requests.TakeAction(Tool::kUnlockAllLevels, mutation_token);
-    const bool unlock_one_level =
-        g_requests.TakeAction(Tool::kUnlockOneLevel, mutation_token);
+    const bool unlock_all_levels = g_requests.TakeAction(Tool::kUnlockAllLevels, mutation_token);
+    const bool unlock_one_level = g_requests.TakeAction(Tool::kUnlockOneLevel, mutation_token);
     if (unlock_all_levels) {
       sub_82091CA8(context, base);
       state_changed = true;

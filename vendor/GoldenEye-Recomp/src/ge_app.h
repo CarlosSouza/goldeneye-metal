@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "ge_controller_shortcut.h"
@@ -29,6 +30,9 @@
 #include "ge_host_pause.h"
 #include "ge_launcher.h"
 #include "ge_postfx.h"
+#if defined(__APPLE__)
+#include "ge_gpu_capture.h"
+#endif
 
 // Relaunch the current executable as a fresh process (implemented in
 // ge_hooks.cpp, which owns the Win32 includes). Used by the ONLINE menu's
@@ -174,6 +178,9 @@ class GeApp : public rex::ReXApp {
     auto shortcut_state = controller_shortcut_ui_state_;
     shortcut_state->pending.store(false, std::memory_order_release);
     shortcut_state->alive.store(true, std::memory_order_release);
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    ge::host_pause::test_harness::PublishMenuOpen(false);
+#endif
     auto* shortcut_context = &app_context();
     ge::controller_shortcut::SetToggleHandler([this, shortcut_state,
                                                shortcut_context](uint32_t controller_slot) {
@@ -200,6 +207,33 @@ class GeApp : public rex::ReXApp {
         shortcut_state->pending.store(false, std::memory_order_release);
       }
     });
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    // Deterministic integration tests request an exact menu state through the
+    // same app-owned TogglePauseMenu path as Escape. The bridge exists only in
+    // developer harness builds and never enters a release executable.
+    ge::host_pause::test_harness::SetMenuRequestHandler(
+        [this, shortcut_state, shortcut_context](bool open) {
+          if (!shortcut_state->alive.load(std::memory_order_acquire)) {
+            return false;
+          }
+          bool expected = false;
+          if (!shortcut_state->pending.compare_exchange_strong(
+                  expected, true, std::memory_order_acq_rel)) {
+            return false;
+          }
+          if (!shortcut_context->CallInUIThread([this, shortcut_state, open] {
+                if (shortcut_state->alive.load(std::memory_order_acquire) &&
+                    ((menu_ != nullptr) != open)) {
+                  TogglePauseMenu("developer harness");
+                }
+                shortcut_state->pending.store(false, std::memory_order_release);
+              })) {
+            shortcut_state->pending.store(false, std::memory_order_release);
+            return false;
+          }
+          return true;
+        });
+#endif
 #if defined(__APPLE__)
     // The SDK's raw F4 settings overlay exposes every cross-platform cvar,
     // including backends and effects that don't exist in this Metal build.
@@ -301,6 +335,10 @@ class GeApp : public rex::ReXApp {
     ge::ShutdownWatchdog();
     controller_shortcut_ui_state_->alive.store(false, std::memory_order_release);
     ge::controller_shortcut::ClearToggleHandler();
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    ge::host_pause::test_harness::ClearMenuRequestHandler();
+    ge::host_pause::test_harness::PublishMenuOpen(false);
+#endif
     input_suppressed_.store(true, std::memory_order_release);
     NotifyInputActiveChanged();
     // A direct shutdown/restart can destroy the dialog without its normal
@@ -369,11 +407,37 @@ class GeApp : public rex::ReXApp {
     if (!postfx_) {
       postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
     }
+    bool refresh_capture_disk_info = !gpu_capture_disk_info_.has_value();
+    uint64_t refreshed_failure_token = 0;
+    if (runtime() && runtime()->graphics_system()) {
+      auto* graphics_system =
+          static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+      const auto live = graphics_system->GetPrivateFrameTraceStatus();
+      // A failed replacement preserves the previous latest.xtr. Refresh then
+      // so Delete Capture remains available without repeatedly parsing a large
+      // trace every time the menu opens.
+      if ((live.state == rex::graphics::FrameTraceCaptureState::kFailed ||
+           live.state == rex::graphics::FrameTraceCaptureState::kCancelled) &&
+          live.request_token != gpu_capture_disk_info_failure_token_) {
+        refresh_capture_disk_info = true;
+        refreshed_failure_token = live.request_token;
+      }
+    }
+    if (refresh_capture_disk_info) {
+      gpu_capture_disk_info_ =
+          ge::gpu_capture::InspectCompletedCapture(user_data_root());
+      if (refreshed_failure_token) {
+        gpu_capture_disk_info_failure_token_ = refreshed_failure_token;
+      }
+    }
 #endif
     GeMenuDialog::Callbacks cb;
     cb.on_closed = [this] {
       ge::host_pause::RequestPaused(false);
       menu_ = nullptr;
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+      ge::host_pause::test_harness::PublishMenuOpen(false);
+#endif
 #if defined(__APPLE__)
       SyncPostFxOverlay();
 #endif
@@ -415,6 +479,77 @@ class GeApp : public rex::ReXApp {
         }
       });
     };
+    cb.get_gpu_capture_status = [this] {
+      rex::graphics::FrameTraceCaptureStatus status;
+      if (!runtime() || !runtime()->graphics_system()) {
+        status.state = rex::graphics::FrameTraceCaptureState::kFailed;
+        status.reason = "The graphics system is unavailable.";
+        return status;
+      }
+      auto* graphics_system =
+          static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+      status = graphics_system->GetPrivateFrameTraceStatus();
+      if (status.state == rex::graphics::FrameTraceCaptureState::kIdle &&
+          gpu_capture_disk_info_ && gpu_capture_disk_info_->available) {
+        status.state = gpu_capture_disk_info_->state;
+        status.reason = gpu_capture_disk_info_->reason;
+        status.final_path = ge::gpu_capture::CaptureRoot(user_data_root()) /
+                            ge::gpu_capture::kCompletedCaptureName;
+        status.byte_count = gpu_capture_disk_info_->byte_count;
+      }
+      return status;
+    };
+    cb.has_completed_gpu_capture = [this] {
+      if (runtime() && runtime()->graphics_system()) {
+        auto* graphics_system =
+            static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+        const auto live = graphics_system->GetPrivateFrameTraceStatus();
+        if (live.state == rex::graphics::FrameTraceCaptureState::kComplete ||
+            live.state == rex::graphics::FrameTraceCaptureState::kCompleteBestEffortOnly) {
+          return true;
+        }
+      }
+      return gpu_capture_disk_info_ && gpu_capture_disk_info_->available;
+    };
+    cb.request_gpu_capture = [this] {
+      // OnClose has resumed gameplay, but the dialog removes itself after the
+      // callback returns. Defer one UI turn so the request cannot be queued
+      // until the settings dialog is fully gone from the drawer.
+      app_context().CallInUIThreadDeferred([this] {
+        if (!runtime() || !runtime()->graphics_system()) {
+          return;
+        }
+        auto* graphics_system =
+            static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+        std::filesystem::path capture_root;
+        std::string error;
+        if (!ge::gpu_capture::EnsurePrivateRoot(user_data_root(), &capture_root,
+                                                 &error)) {
+          graphics_system->ReportPrivateFrameTraceFailure(
+              error.empty() ? "Could not prepare the private GPU capture directory."
+                            : std::move(error));
+          return;
+        }
+        if (!graphics_system->RequestPrivateFrameTrace(capture_root)) {
+          REXLOG_WARN(
+              "GEUI GPU capture request was rejected because another request is active");
+        }
+      });
+    };
+    cb.delete_gpu_capture = [this](std::string* error) {
+      if (!runtime() || !runtime()->graphics_system()) {
+        if (error) *error = "The graphics system is unavailable.";
+        return false;
+      }
+      auto* graphics_system =
+          static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+      if (!graphics_system->DeletePrivateFrameTrace(
+              ge::gpu_capture::CaptureRoot(user_data_root()), error)) {
+        return false;
+      }
+      gpu_capture_disk_info_ = ge::gpu_capture::CompletedCaptureInfo{};
+      return true;
+    };
 #endif
     cb.persist_config = [this] { PersistConfig(); };
     cb.request_restart = [this] {
@@ -432,6 +567,9 @@ class GeApp : public rex::ReXApp {
     ge::SetMouselookSuppressed(true);  // freeze mouse-look while the menu is up
     ge::host_pause::RequestPaused(true);
     menu_ = new GeMenuDialog(drawer, std::move(cb));
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    ge::host_pause::test_harness::PublishMenuOpen(true);
+#endif
   }
 
 #if defined(__APPLE__)
@@ -462,4 +600,9 @@ class GeApp : public rex::ReXApp {
   std::atomic<bool> input_suppressed_{false};
   GeMenuDialog* menu_ = nullptr;               // non-owning; self-deletes via the drawer
   std::unique_ptr<ge::PostFxOverlay> postfx_;  // spatial-effect layer, attached only when needed
+#if defined(__APPLE__)
+  std::optional<ge::gpu_capture::CompletedCaptureInfo>
+      gpu_capture_disk_info_;
+  uint64_t gpu_capture_disk_info_failure_token_ = 0;
+#endif
 };

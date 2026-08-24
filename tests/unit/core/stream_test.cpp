@@ -204,6 +204,16 @@ TEST_CASE("BitStream Peek reads without advancing", "[stream][bitstream]") {
   CHECK(val1 == val2);  // Same value
 }
 
+TEST_CASE("BitStream Peek accepts an unaligned minimal buffer", "[stream][bitstream]") {
+  alignas(uint64_t) std::array<uint8_t, 2> storage = {0x00, 0xD2};
+  uint8_t* buffer = storage.data() + 1;
+  REQUIRE(reinterpret_cast<uintptr_t>(buffer) % alignof(uint64_t) != 0);
+
+  BitStream stream(buffer, 8);
+  CHECK(stream.Peek(8) == 0xD2);
+  CHECK(stream.offset_bits() == 0);
+}
+
 TEST_CASE("BitStream Read advances offset", "[stream][bitstream]") {
   std::array<uint8_t, 16> buffer = {0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A};
   BitStream stream(buffer.data(), buffer.size() * 8);
@@ -288,63 +298,80 @@ TEST_CASE("BitStream Read crossing byte boundary", "[stream][bitstream]") {
 
 // =============================================================================
 // BitStream Write Tests
-// NOTE: BitStream::Write is marked "TODO: This is totally not tested!" in source.
-// It has a bug: doesn't byte-swap when storing, but Read expects big-endian.
-// These tests are skipped until Write is fixed.
 // =============================================================================
 
-TEST_CASE("BitStream Write byte-aligned", "[stream][bitstream][!mayfail]") {
-  SKIP("BitStream::Write is broken - doesn't byte-swap on store");
-
+TEST_CASE("BitStream Write byte-aligned", "[stream][bitstream]") {
   std::array<uint8_t, 16> buffer{};
   BitStream stream(buffer.data(), buffer.size() * 8);
 
-  stream.Write(0xAB, 8);
+  REQUIRE(stream.Write(0xAB, 8));
   CHECK(stream.offset_bits() == 8);
+  CHECK(buffer[0] == 0xAB);
 
   stream.SetOffset(0);
   CHECK(stream.Read(8) == 0xAB);
 }
 
-TEST_CASE("BitStream Write 16-bit value", "[stream][bitstream][!mayfail]") {
-  SKIP("BitStream::Write is broken - doesn't byte-swap on store");
-
+TEST_CASE("BitStream Write 16-bit value", "[stream][bitstream]") {
   std::array<uint8_t, 16> buffer{};
   BitStream stream(buffer.data(), buffer.size() * 8);
 
-  stream.Write(0x1234, 16);
+  REQUIRE(stream.Write(0x1234, 16));
+  CHECK(buffer[0] == 0x12);
+  CHECK(buffer[1] == 0x34);
 
   stream.SetOffset(0);
   CHECK(stream.Read(16) == 0x1234);
 }
 
-TEST_CASE("BitStream Write non-byte-aligned", "[stream][bitstream][!mayfail]") {
-  SKIP("BitStream::Write is broken - doesn't byte-swap on store");
-
+TEST_CASE("BitStream Write non-byte-aligned", "[stream][bitstream]") {
   std::array<uint8_t, 16> buffer{};
   BitStream stream(buffer.data(), buffer.size() * 8);
 
-  // Write 4 bits, then 4 more
-  stream.Write(0xA, 4);  // 1010
-  stream.Write(0xB, 4);  // 1011
+  REQUIRE(stream.Write(0xA, 4));  // 1010
+  REQUIRE(stream.Write(0xB, 4));  // 1011
+  CHECK(buffer[0] == 0xAB);
 
   stream.SetOffset(0);
   CHECK(stream.Read(8) == 0xAB);
 }
 
-TEST_CASE("BitStream Write preserves surrounding bits", "[stream][bitstream][!mayfail]") {
-  SKIP("BitStream::Write is broken - doesn't byte-swap on store");
-
+TEST_CASE("BitStream Write preserves surrounding bits", "[stream][bitstream]") {
   std::array<uint8_t, 16> buffer = {0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   BitStream stream(buffer.data(), buffer.size() * 8);
 
   stream.Advance(4);
-  stream.Write(0x0, 4);  // Clear middle 4 bits
+  REQUIRE(stream.Write(0x0, 4));
+  CHECK(buffer[0] == 0xF0);
+  CHECK(buffer[1] == 0xFF);
 
   stream.SetOffset(0);
-  // First 4 bits should still be 1111, next 4 should be 0000
   CHECK(stream.Read(4) == 0xF);
   CHECK(stream.Read(4) == 0x0);
+}
+
+TEST_CASE("BitStream Write accepts zero bits and an exact unaligned end", "[stream][bitstream]") {
+  alignas(uint64_t) std::array<uint8_t, 2> storage = {0x00, 0xA5};
+  uint8_t* buffer = storage.data() + 1;
+  REQUIRE(reinterpret_cast<uintptr_t>(buffer) % alignof(uint64_t) != 0);
+
+  BitStream stream(buffer, 8);
+  REQUIRE(stream.Write(0, 0));
+  CHECK(stream.offset_bits() == 0);
+  CHECK(buffer[0] == 0xA5);
+
+  REQUIRE(stream.Write(0xD5, 8));
+  CHECK(stream.offset_bits() == stream.size_bits());
+  CHECK(buffer[0] == 0xD5);
+
+  REQUIRE(stream.Write(0, 0));
+  CHECK(stream.offset_bits() == stream.size_bits());
+
+  buffer[0] = 0x07;
+  BitStream partial_stream(buffer, 5);
+  REQUIRE(partial_stream.Write(0x15, 5));
+  CHECK(partial_stream.offset_bits() == partial_stream.size_bits());
+  CHECK(buffer[0] == 0xAF);
 }
 
 // =============================================================================

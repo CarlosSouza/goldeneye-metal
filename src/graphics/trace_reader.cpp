@@ -130,7 +130,12 @@ bool TraceReader::Open(const std::string_view path) {
 
   REXGPU_INFO("Mapped {}b trace from {}", trace_size_, rex::path_to_utf8(path));
   REXGPU_INFO("   Version: {}", header.version);
-  auto commit_str = std::string(header.build_commit_sha, rex::countof(header.build_commit_sha));
+  size_t commit_length = 0;
+  while (commit_length < rex::countof(header.build_commit_sha) &&
+         header.build_commit_sha[commit_length]) {
+    ++commit_length;
+  }
+  const std::string commit_str(header.build_commit_sha, commit_length);
   REXGPU_INFO("    Commit: {}", commit_str);
   REXGPU_INFO("  Title ID: {}", header.title_id);
   REXGPU_INFO("     EDRAM: {}{} (color=0x{:04X}, depth=0x{:02X}, MSAA=0x{:02X})",

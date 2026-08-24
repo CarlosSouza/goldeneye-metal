@@ -155,6 +155,9 @@ class RoutingCommandProcessor final : public rex::graphics::CommandProcessor {
     stop_worker_during_completion_wait_ = true;
   }
   void SetTraceInitializationFailure(bool fail) { fail_trace_initialization_ = fail; }
+  void SetCompletePrivateTraceContract(bool complete) {
+    complete_private_trace_contract_ = complete;
+  }
   bool OpenTraceForTest(const std::filesystem::path& path) {
     return OpenAndInitializeTrace(path, 0x584108A9);
   }
@@ -198,7 +201,18 @@ class RoutingCommandProcessor final : public rex::graphics::CommandProcessor {
   bool SetupContext() override { return true; }
   void ShutdownContext() override {}
   void InitializeTrace() override {
+    if (complete_private_trace_contract_ &&
+        !trace_writer_.BeginEdramRequirementsTracking()) {
+      MarkTraceInitializationIncomplete();
+      return;
+    }
     CommandProcessor::InitializeTrace();
+    if (complete_private_trace_contract_) {
+      std::vector<uint8_t> edram(rex::graphics::xenos::kEdramSizeBytes);
+      if (!trace_writer_.WriteEdramSnapshot(edram.data())) {
+        MarkTraceInitializationIncomplete();
+      }
+    }
     if (fail_trace_initialization_) {
       MarkTraceInitializationIncomplete();
     }
@@ -336,6 +350,7 @@ class RoutingCommandProcessor final : public rex::graphics::CommandProcessor {
   bool completed_wait_matched_ = false;
   bool stop_worker_during_completion_wait_ = false;
   bool fail_trace_initialization_ = false;
+  bool complete_private_trace_contract_ = false;
   std::mutex blocked_write_mutex_;
   std::condition_variable blocked_write_cv_;
   bool block_next_gpu_write_ = false;
@@ -370,7 +385,128 @@ void StoreWaitRegMemPacket(rex::memory::Memory& memory, uint32_t packet_address,
   StorePacketDword(memory, packet_address, 5, 0x100);
 }
 
+void StoreSwapPacket(rex::memory::Memory& memory, uint32_t packet_address) {
+  StorePacketDword(
+      memory, packet_address, 0,
+      rex::graphics::xenos::MakePacketType3(rex::graphics::xenos::PM4_XE_SWAP, 4));
+  StorePacketDword(memory, packet_address, 1, rex::graphics::xenos::kSwapSignature);
+  StorePacketDword(memory, packet_address, 2, 0x00100000);
+  StorePacketDword(memory, packet_address, 3, 640);
+  StorePacketDword(memory, packet_address, 4, 480);
+}
+
 }  // namespace
+
+TEST_CASE("Private frame trace captures exactly the frame between two swaps",
+          "[graphics][trace][trace_capture]") {
+  rex::InitLogging();
+  rex::memory::Memory memory;
+  REQUIRE(memory.Initialize());
+  TestGraphicsSystem graphics_system(memory);
+  RoutingCommandProcessor command_processor(graphics_system);
+  command_processor.AcceptCallsForTest();
+  command_processor.SetCompletePrivateTraceContract(true);
+  TemporaryDirectory temporary{
+      std::filesystem::temp_directory_path() /
+      ("rex-private-two-swap-" +
+       std::to_string(reinterpret_cast<uintptr_t>(&command_processor)))};
+  REQUIRE(std::filesystem::create_directories(temporary.path));
+
+  const uint64_t token = command_processor.RequestPrivateFrameTrace(temporary.path);
+  REQUIRE(token != 0);
+  CHECK(command_processor.GetPrivateFrameTraceStatus().state ==
+        rex::graphics::FrameTraceCaptureState::kQueued);
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  CHECK(command_processor.GetPrivateFrameTraceStatus().state ==
+        rex::graphics::FrameTraceCaptureState::kArmed);
+
+  constexpr uint32_t kPacketAddress = 0x00120000;
+  StoreSwapPacket(memory, kPacketAddress);
+  CHECK(command_processor.ExecutePacket(kPacketAddress, 5));
+  CHECK(command_processor.GetPrivateFrameTraceStatus().state ==
+        rex::graphics::FrameTraceCaptureState::kCapturing);
+  CHECK(command_processor.ExecutePacket(kPacketAddress, 5));
+
+  const auto status = command_processor.GetPrivateFrameTraceStatus();
+  REQUIRE(status.request_token == token);
+  REQUIRE(status.state == rex::graphics::FrameTraceCaptureState::kComplete);
+  CHECK(status.byte_count > rex::graphics::xenos::kEdramSizeBytes);
+  CHECK(std::filesystem::exists(status.final_path));
+  CHECK_FALSE(std::filesystem::exists(temporary.path / "latest.xtr.partial"));
+  rex::graphics::TraceReader reader;
+  REQUIRE(reader.Open(status.final_path.string()));
+  CHECK(reader.frame_count() == 1);
+  CHECK(reader.has_initial_edram_snapshot());
+  CHECK(reader.has_finalized_edram_requirements());
+  command_processor.Shutdown();
+}
+
+TEST_CASE("Private trace failure never fails the live swap packet",
+          "[graphics][trace][trace_capture]") {
+  rex::InitLogging();
+  rex::memory::Memory memory;
+  REQUIRE(memory.Initialize());
+  TestGraphicsSystem graphics_system(memory);
+  RoutingCommandProcessor command_processor(graphics_system);
+  command_processor.AcceptCallsForTest();
+  TemporaryDirectory temporary{
+      std::filesystem::temp_directory_path() /
+      ("rex-private-budget-failure-" +
+       std::to_string(reinterpret_cast<uintptr_t>(&command_processor)))};
+  REQUIRE(std::filesystem::create_directories(temporary.path));
+
+  const uint64_t token = command_processor.RequestPrivateFrameTrace(temporary.path, 256);
+  REQUIRE(token != 0);
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  constexpr uint32_t kPacketAddress = 0x00120000;
+  StoreSwapPacket(memory, kPacketAddress);
+  CHECK(command_processor.ExecutePacket(kPacketAddress, 5));
+  CHECK(command_processor.GetPrivateFrameTraceStatus().state ==
+        rex::graphics::FrameTraceCaptureState::kFailed);
+  // Gameplay remains fail-soft and later swaps continue normally.
+  CHECK(command_processor.ExecutePacket(kPacketAddress, 5));
+  CHECK(command_processor.swap_counter() == 2);
+  CHECK_FALSE(std::filesystem::exists(temporary.path / "latest.xtr.partial"));
+  CHECK_FALSE(std::filesystem::exists(temporary.path / "latest.xtr"));
+  command_processor.Shutdown();
+}
+
+TEST_CASE("Private trace reports streaming conflicts and shutdown cancellation",
+          "[graphics][trace][trace_capture]") {
+  rex::InitLogging();
+  rex::memory::Memory memory;
+  TestGraphicsSystem graphics_system(memory);
+  RoutingCommandProcessor command_processor(graphics_system);
+  command_processor.AcceptCallsForTest();
+  TemporaryDirectory temporary{
+      std::filesystem::temp_directory_path() /
+      ("rex-private-conflict-" +
+       std::to_string(reinterpret_cast<uintptr_t>(&command_processor)))};
+  REQUIRE(std::filesystem::create_directories(temporary.path));
+
+  REQUIRE(command_processor.BeginTracing(temporary.path));
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  const uint64_t conflict_token =
+      command_processor.RequestPrivateFrameTrace(temporary.path);
+  REQUIRE(conflict_token != 0);
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  CHECK(command_processor.GetPrivateFrameTraceStatus().state ==
+        rex::graphics::FrameTraceCaptureState::kFailed);
+  REQUIRE(command_processor.EndTracing());
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+
+  const uint64_t shutdown_token =
+      command_processor.RequestPrivateFrameTrace(temporary.path);
+  REQUIRE(shutdown_token != 0);
+  REQUIRE(command_processor.RunOnePendingCallForTest());
+  REQUIRE(command_processor.GetPrivateFrameTraceStatus().state ==
+          rex::graphics::FrameTraceCaptureState::kArmed);
+  command_processor.Shutdown();
+  const auto status = command_processor.GetPrivateFrameTraceStatus();
+  CHECK(status.request_token == shutdown_token);
+  CHECK(status.state == rex::graphics::FrameTraceCaptureState::kCancelled);
+  CHECK(status.reason.find("shutdown") != std::string::npos);
+}
 
 TEST_CASE("Incomplete trace initialization is discarded and disarms the request",
           "[graphics][trace]") {

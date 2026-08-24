@@ -21,11 +21,14 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <rex/graphics/command_ring_state.h>
+#include <rex/graphics/gpu_chain_profile.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/trace_capture.h>
 #include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
@@ -146,6 +149,23 @@ class CommandProcessor {
   // The return value reports whether the worker accepted the control request,
   // not whether a capture file has already been opened or finalized.
   virtual bool RequestFrameTrace(const std::filesystem::path& root_path);
+  // Bounded private one-frame capture. Returns a stable request token even for
+  // immediately failed or cancelled requests; zero means the single slot is
+  // already owned by another active request.
+  uint64_t RequestPrivateFrameTrace(
+      const std::filesystem::path& safe_root,
+      uint64_t byte_budget = FrameTraceCaptureSlot::kDefaultByteBudget);
+  uint64_t ReportPrivateFrameTraceFailure(std::string reason) {
+    return frame_trace_capture_slot_.RecordFailedRequest(std::move(reason));
+  }
+  FrameTraceCaptureStatus GetPrivateFrameTraceStatus() const {
+    return frame_trace_capture_slot_.status();
+  }
+  bool DeletePrivateFrameTrace(const std::filesystem::path& safe_root,
+                               std::string* reason_out = nullptr) {
+    return frame_trace_capture_slot_.DeletePublishedCapture(safe_root,
+                                                            reason_out);
+  }
   virtual bool BeginTracing(const std::filesystem::path& root_path);
   virtual bool EndTracing();
 
@@ -262,6 +282,10 @@ class CommandProcessor {
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index,
                                 uint32_t primary_buffer_ptr, uint32_t primary_buffer_size);
   virtual void OnPrimaryBufferEnd() {}
+  // Shadow-only query used by the GPU chain profile at primary-ring drain.
+  // Backends return their currently queued host submissions without waiting.
+  virtual uint32_t QueryPendingBackendSubmissionsForProfile() const { return 0; }
+  virtual bool IsGpuChainProfilingEnabled() const { return false; }
   bool ExecuteIndirectBuffer(uint32_t ptr, uint32_t length,
                              PacketExecutionMode mode = PacketExecutionMode::kLiveFailSoft);
   bool ExecutePacket(memory::RingBuffer* reader,
@@ -326,10 +350,13 @@ class CommandProcessor {
   // fail-closed operation. Failed initialization discards the partial file and
   // disarms the request instead of retrying every command buffer.
   bool OpenAndInitializeTrace(const std::filesystem::path& path, uint32_t title_id);
+  bool OpenAndInitializeTraceDescriptor(int descriptor,
+                                        const std::filesystem::path& display_path,
+                                        uint32_t title_id, uint64_t byte_budget);
   bool ExecutePacketSpan(uint32_t ptr, uint32_t count, PacketExecutionMode mode);
-  void RequestFrameTraceOnThread(const std::filesystem::path& root_path);
+  void RequestFrameTraceOnThread(uint64_t token);
   void BeginTracingOnThread(const std::filesystem::path& root_path);
-  void EndTracingOnThread();
+  void EndTracingOnThread(bool shutdown = false);
   void MarkTraceInitializationIncomplete() { trace_initialization_incomplete_ = true; }
   virtual void InitializeTrace();
 
@@ -351,7 +378,8 @@ class CommandProcessor {
   };
   TraceState trace_state_ = TraceState::kDisabled;
   std::filesystem::path trace_stream_path_;
-  std::filesystem::path trace_frame_path_;
+  FrameTraceCaptureSlot frame_trace_capture_slot_;
+  uint64_t active_frame_trace_token_ = 0;
   bool trace_initialization_incomplete_ = false;
   // The native GoldenEye bridge may execute direct packet spans outside the
   // command worker. Trace controls take this gate exclusively, so opening or
@@ -385,6 +413,7 @@ class CommandProcessor {
   std::atomic<uint32_t> swap_counter_{0};
 
   CommandRingState ring_state_;
+  GpuChainProfiler gpu_chain_profiler_;
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
 

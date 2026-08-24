@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -27,6 +29,12 @@ namespace rex::graphics {
 // ring reports pending work.
 class CommandRingState {
  public:
+  enum class PendingWritePointerWaitResult {
+    kPending,
+    kTimeout,
+    kReconfigured,
+  };
+
   static constexpr uint32_t kRegisterBase = 0x01C0;                // 0x700
   static constexpr uint32_t kRegisterControl = 0x01C1;             // 0x704
   static constexpr uint32_t kRegisterReadPointerAddress = 0x01C3;  // 0x70C
@@ -59,6 +67,10 @@ class CommandRingState {
 
   struct Snapshot {
     uint64_t generation = 0;
+    // Monotonic within this CommandRingState instance. Unlike generation,
+    // every accepted CP_RB_WPTR doorbell advances it, including same-value
+    // writes. It is diagnostic state and is intentionally not serialized.
+    uint64_t write_pointer_epoch = 0;
     uint32_t base = 0;
     uint32_t control = 0;
     uint32_t read_pointer_address_register = 0;
@@ -168,6 +180,7 @@ class CommandRingState {
     base_programmed_ = true;
     control_programmed_ = true;
     ++generation_;
+    write_pointer_condition_.notify_all();
   }
 
   // Atomically programs the raw BASE and CNTL register pair. This is useful
@@ -182,6 +195,7 @@ class CommandRingState {
     base_programmed_ = true;
     control_programmed_ = true;
     ++generation_;
+    write_pointer_condition_.notify_all();
   }
 
   void Reset() noexcept {
@@ -195,6 +209,7 @@ class CommandRingState {
     base_programmed_ = false;
     control_programmed_ = false;
     ++generation_;
+    write_pointer_condition_.notify_all();
   }
 
   // Restores all software-visible ring registers as one new generation. The
@@ -219,6 +234,7 @@ class CommandRingState {
       write_pointer_ = kInvalidWritePointer;
     }
     ++generation_;
+    write_pointer_condition_.notify_all();
   }
 
   void WriteBase(uint32_t value) noexcept {
@@ -258,13 +274,24 @@ class CommandRingState {
   // RB_RPTR_WR_ENA is set, the deferred RPTR_WR value is transferred first,
   // exactly as on hardware. Returns false if BASE/CNTL are not both programmed;
   // in that case the premature WPTR is discarded rather than becoming stale.
-  [[nodiscard]] bool WriteWritePointer(uint32_t value) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
+  [[nodiscard]] bool WriteWritePointer(uint32_t value,
+                                       Snapshot* accepted_snapshot = nullptr) noexcept {
+    return WriteWritePointerAndApply(value, accepted_snapshot,
+                                     [](const Snapshot&, const Snapshot&) noexcept {});
+  }
+
+  // As above, but invokes on_accept while the ring lock still orders the old
+  // and new state and before the waiter notification becomes visible.
+  template <typename AcceptedCallback>
+  [[nodiscard]] bool WriteWritePointerAndApply(uint32_t value, Snapshot* accepted_snapshot,
+                                               AcceptedCallback&& on_accept) noexcept {
+    std::unique_lock<std::mutex> lock(mutex_);
     if (!IsConfiguredLocked()) {
       write_pointer_ = kInvalidWritePointer;
       return false;
     }
 
+    const Snapshot previous = GetSnapshotLocked();
     const uint32_t capacity = DecodeCapacityDwords(control_);
     if (control_ & kControlReadPointerWriteEnable) {
       const uint32_t new_read_pointer = NormalizePointer(read_pointer_write_, capacity);
@@ -276,7 +303,43 @@ class CommandRingState {
       }
     }
     write_pointer_ = NormalizePointer(value, capacity);
+    ++write_pointer_epoch_;
+    const Snapshot accepted = GetSnapshotLocked();
+    if (accepted_snapshot) {
+      *accepted_snapshot = accepted;
+    }
+    on_accept(previous, accepted);
+    lock.unlock();
+    write_pointer_condition_.notify_all();
     return true;
+  }
+
+  // Waits for a doorbell newer than observed to expose actual pending work.
+  // The ring mutex and predicate close the check-to-sleep race, so a WPTR
+  // written just before the waiter blocks cannot be lost.
+  [[nodiscard]] PendingWritePointerWaitResult WaitForPendingWritePointerAfter(
+      const Snapshot& observed, std::chrono::microseconds timeout,
+      Snapshot* result_snapshot = nullptr) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto ready = [this, &observed]() {
+      const Snapshot current = GetSnapshotLocked();
+      return current.generation != observed.generation ||
+             (current.write_pointer_epoch != observed.write_pointer_epoch &&
+              current.has_pending_commands());
+    };
+    const bool awakened = ready() || write_pointer_condition_.wait_for(lock, timeout, ready);
+    const Snapshot current = GetSnapshotLocked();
+    if (result_snapshot) {
+      *result_snapshot = current;
+    }
+    if (awakened && current.write_pointer_epoch != observed.write_pointer_epoch &&
+        current.has_pending_commands()) {
+      return PendingWritePointerWaitResult::kPending;
+    }
+    if (current.generation != observed.generation) {
+      return PendingWritePointerWaitResult::kReconfigured;
+    }
+    return PendingWritePointerWaitResult::kTimeout;
   }
 
   // Sets the live RPTR for explicit state restoration. Normal worker progress
@@ -290,6 +353,7 @@ class CommandRingState {
     if (new_read_pointer != read_pointer_) {
       read_pointer_ = new_read_pointer;
       ++generation_;
+      write_pointer_condition_.notify_all();
     }
     return true;
   }
@@ -322,6 +386,7 @@ class CommandRingState {
     if (write_pointer_ != kInvalidWritePointer) {
       write_pointer_ = kInvalidWritePointer;
       ++generation_;
+      write_pointer_condition_.notify_all();
     }
   }
 
@@ -334,6 +399,7 @@ class CommandRingState {
   [[nodiscard]] Snapshot GetSnapshotLocked() const noexcept {
     Snapshot snapshot;
     snapshot.generation = generation_;
+    snapshot.write_pointer_epoch = write_pointer_epoch_;
     snapshot.base = base_;
     snapshot.control = control_;
     snapshot.read_pointer_address_register = read_pointer_address_register_;
@@ -354,10 +420,13 @@ class CommandRingState {
     read_pointer_ = 0;
     write_pointer_ = kInvalidWritePointer;
     ++generation_;
+    write_pointer_condition_.notify_all();
   }
 
   mutable std::mutex mutex_;
+  std::condition_variable write_pointer_condition_;
   uint64_t generation_ = 0;
+  uint64_t write_pointer_epoch_ = 0;
   uint32_t base_ = 0;
   uint32_t control_ = 0;
   uint32_t read_pointer_address_register_ = 0;
