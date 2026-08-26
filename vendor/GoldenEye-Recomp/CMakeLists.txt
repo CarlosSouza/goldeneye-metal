@@ -56,9 +56,13 @@ if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         src/ge_launcher_macos.mm
     )
 else()
-    # iOS is launcherless: game data is imported on the Mac and dropped into
-    # the app's Documents folder (see windowed_app_main_ios.mm).
-    list(APPEND GE_SOURCES src/ge_launcher_stub.cpp)
+    # iOS is launcherless: game data arrives via the app's Documents folder,
+    # either as a ready-made Game Data tree or as a raw backup package the
+    # setup screen imports on-device (see windowed_app_main_ios.mm).
+    list(APPEND GE_SOURCES
+        src/ge_game_data_import_ios.cpp
+        src/ge_launcher_stub.cpp
+    )
 endif()
 
 if(WIN32)

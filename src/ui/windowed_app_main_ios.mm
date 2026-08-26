@@ -23,7 +23,9 @@
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL_main.h>
 
+#include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <string>
@@ -36,6 +38,36 @@
 #include <rex/logging.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context.h>
+
+// Optional on-device game-data import hooks. The hosted game may define
+// strong versions of these (GoldenEye does in ge_game_data_import_ios.cpp);
+// the weak fallbacks keep the entry point game-agnostic and make the setup
+// screen simply never offer an import when the game provides none.
+extern "C" {
+typedef void (*RexGameDataImportProgressFn)(void* ctx, const char* message,
+                                            unsigned long long completed,
+                                            unsigned long long total);
+typedef bool (*RexGameDataImportCancelledFn)(void* ctx);
+
+__attribute__((weak)) bool RexGameDataIsPackage(const char* path) {
+  (void)path;
+  return false;
+}
+
+// Returns a malloc'd error message, or null on success.
+__attribute__((weak)) char* RexGameDataImportPackage(const char* package_path,
+                                                     const char* destination,
+                                                     RexGameDataImportProgressFn progress,
+                                                     RexGameDataImportCancelledFn cancelled,
+                                                     void* ctx) {
+  (void)package_path;
+  (void)destination;
+  (void)progress;
+  (void)cancelled;
+  (void)ctx;
+  return strdup("On-device import is not supported by this app.");
+}
+}  // extern "C"
 
 namespace {
 
@@ -116,6 +148,44 @@ bool GameDataPresent() {
   return [fm fileExistsAtPath:[path stringByAppendingPathComponent:@"default.xex"]];
 }
 
+// Walks Documents for a backup package the game can import on-device (the
+// user may drop either the bare LIVE/STFS file or their whole backup folder).
+// The Game Data tree itself is skipped, everything else is decided by the
+// game's own magic check.
+NSString* ScanDocumentsForPackage() {
+  NSArray<NSString*>* paths =
+      NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+  NSString* documents = [paths firstObject];
+  if (!documents) {
+    return nil;
+  }
+  NSFileManager* fm = [NSFileManager defaultManager];
+  NSDirectoryEnumerator<NSString*>* it = [fm enumeratorAtPath:documents];
+  for (NSString* relative in it) {
+    NSString* full = [documents stringByAppendingPathComponent:relative];
+    BOOL is_directory = NO;
+    if (![fm fileExistsAtPath:full isDirectory:&is_directory]) {
+      continue;
+    }
+    if (is_directory) {
+      NSString* name = [relative lastPathComponent];
+      if ([name isEqualToString:@"Game Data"] || [name isEqualToString:@"GameData"]) {
+        [it skipDescendants];
+      }
+      continue;
+    }
+    if (RexGameDataIsPackage([full fileSystemRepresentation])) {
+      return full;
+    }
+  }
+  return nil;
+}
+
+// Import-thread → main-thread progress plumbing. A single import runs at a
+// time; reports are throttled to message changes and 16 MiB steps so the
+// main queue is not flooded by per-chunk callbacks.
+std::atomic<bool> g_import_cancelled{false};
+
 }  // namespace
 
 @interface RexIOSAppDelegate : UIResponder <UIApplicationDelegate> {
@@ -125,8 +195,50 @@ bool GameDataPresent() {
   NSTimer* pending_functions_timer_;
   UIWindow* setup_window_;
   UILabel* setup_status_label_;
+  UIButton* setup_button_;
+  BOOL setup_importing_;
 }
+- (void)startImportOfPackage:(NSString*)package;
+- (void)updateImportStatus:(NSString*)status;
+- (void)importFinishedWithError:(NSString*)error package:(NSString*)package;
+- (void)tearDownSetupAndBoot;
 @end
+
+namespace {
+
+// Import-thread side of the progress relay; throttled here so the main queue
+// only sees message changes, 16 MiB steps and the final report.
+void ImportProgressTrampoline(void* ctx, const char* message, unsigned long long completed,
+                              unsigned long long total) {
+  static std::string last_message;
+  static unsigned long long last_reported = 0;
+  const bool message_changed = !message || last_message != message;
+  if (!message_changed && total != 0 && completed != total &&
+      completed < last_reported + 16ull * 1024ull * 1024ull) {
+    return;
+  }
+  last_message = message ? message : "";
+  last_reported = completed;
+  NSString* status;
+  if (total > 0) {
+    status = [NSString stringWithFormat:@"%s\n%.0f / %.0f MB", last_message.c_str(),
+                                        double(completed) / (1024.0 * 1024.0),
+                                        double(total) / (1024.0 * 1024.0)];
+  } else {
+    status = [NSString stringWithUTF8String:last_message.c_str()];
+  }
+  RexIOSAppDelegate* delegate = (RexIOSAppDelegate*)ctx;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [delegate updateImportStatus:status];
+  });
+}
+
+bool ImportCancelledTrampoline(void* ctx) {
+  (void)ctx;
+  return g_import_cancelled.load();
+}
+
+}  // namespace
 
 @implementation RexIOSAppDelegate
 
@@ -208,11 +320,12 @@ bool GameDataPresent() {
   UILabel* body = [[UILabel alloc] init];
   body.text = [NSString
       stringWithFormat:
-          @"Import your legally owned game backup with the GoldenEye Metal launcher on a Mac, "
-          @"then copy the resulting “Game Data” folder (default.xex, files, music.xwb, "
-          @"sfx.xwb) into this app's Documents folder using the Files app:\n\n"
-          @"On My iPad ▸ GoldenEye ▸ Game Data\n\n"
-          @"You can keep this screen open, copy the folder in split view, and tap Rescan."];
+          @"Drop your legally owned Xbox LIVE game backup into this app's Documents folder "
+          @"using the Files app (On My iPad ▸ GoldenEye) and it will be imported right here "
+          @"on the iPad.\n\n"
+          @"Alternatively, copy a “Game Data” folder already imported by the GoldenEye Metal "
+          @"launcher on a Mac into the same place.\n\n"
+          @"You can keep this screen open, add the files in split view, and tap Rescan."];
   body.font = [UIFont systemFontOfSize:17];
   body.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
   body.textAlignment = NSTextAlignmentCenter;
@@ -234,6 +347,7 @@ bool GameDataPresent() {
   [rescan addTarget:self
                 action:@selector(rescanTapped)
       forControlEvents:UIControlEventTouchUpInside];
+  setup_button_ = rescan;
 
   UIStackView* stack = [[UIStackView alloc]
       initWithArrangedSubviews:@[ title, body, rescan, setup_status_label_ ]];
@@ -256,20 +370,114 @@ bool GameDataPresent() {
   [title release];
   [body release];
   [setup_window_ makeKeyAndVisible];
+
+  // A backup may already be sitting in Documents (copied while the app was
+  // closed); start importing it right away instead of waiting for a tap.
+  NSString* package = ScanDocumentsForPackage();
+  if (package) {
+    [self startImportOfPackage:package];
+  }
 }
 
 - (void)rescanTapped {
-  if (!GameDataPresent()) {
-    setup_status_label_.text = [NSString
-        stringWithFormat:@"Still not found at:\n%s", DefaultGameDataRoot().c_str()];
+  if (setup_importing_) {
+    // The same button doubles as Cancel while an import runs.
+    g_import_cancelled.store(true);
+    setup_status_label_.text = @"Cancelling…";
     return;
   }
-  BootMark("rescan found game data");
+  if (GameDataPresent()) {
+    BootMark("rescan found game data");
+    [self tearDownSetupAndBoot];
+    return;
+  }
+  NSString* package = ScanDocumentsForPackage();
+  if (package) {
+    [self startImportOfPackage:package];
+    return;
+  }
+  setup_status_label_.text = [NSString
+      stringWithFormat:@"Still not found at:\n%s", DefaultGameDataRoot().c_str()];
+}
+
+- (void)tearDownSetupAndBoot {
   [setup_window_ setHidden:YES];
   [setup_window_ release];
   setup_window_ = nil;
   setup_status_label_ = nil;
+  setup_button_ = nil;
   [self bootGame];
+}
+
+// Runs the game-provided import hook on a background queue; the setup screen
+// doubles as the progress UI. Extraction can take minutes for a ~700 MB
+// package, so the idle timer is held off to keep iOS from suspending the
+// half-written staging directory (a failed import cleans up after itself).
+- (void)startImportOfPackage:(NSString*)package {
+  if (setup_importing_) {
+    return;
+  }
+  setup_importing_ = YES;
+  g_import_cancelled.store(false);
+  BootMark("importing dropped backup package");
+  [setup_button_ setTitle:@"Cancel" forState:UIControlStateNormal];
+  setup_status_label_.text =
+      [NSString stringWithFormat:@"Importing:\n%@", [package lastPathComponent]];
+  [UIApplication sharedApplication].idleTimerDisabled = YES;
+
+  NSString* destination = [NSString stringWithUTF8String:DefaultGameDataRoot().c_str()];
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    char* error = RexGameDataImportPackage([package fileSystemRepresentation],
+                                           [destination fileSystemRepresentation],
+                                           &ImportProgressTrampoline, &ImportCancelledTrampoline,
+                                           (void*)self);
+    NSString* error_text = error ? [NSString stringWithUTF8String:error] : nil;
+    free(error);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self importFinishedWithError:error_text package:package];
+    });
+  });
+}
+
+- (void)updateImportStatus:(NSString*)status {
+  if (setup_importing_ && setup_status_label_) {
+    setup_status_label_.text = status;
+  }
+}
+
+- (void)importFinishedWithError:(NSString*)error package:(NSString*)package {
+  setup_importing_ = NO;
+  [UIApplication sharedApplication].idleTimerDisabled = NO;
+  [setup_button_ setTitle:@"Rescan" forState:UIControlStateNormal];
+  if (error) {
+    BootMark("import failed");
+    setup_status_label_.text = error;
+    return;
+  }
+  BootMark("import succeeded");
+  setup_status_label_.text = @"Game data imported.";
+
+  UIAlertController* alert = [UIAlertController
+      alertControllerWithTitle:@"Game data imported"
+                       message:@"Delete the backup package to free up its space? The game no "
+                               @"longer needs it."
+                preferredStyle:UIAlertControllerStyleAlert];
+  [alert addAction:[UIAlertAction actionWithTitle:@"Delete"
+                                            style:UIAlertActionStyleDefault
+                                          handler:^(UIAlertAction* action) {
+                                            (void)action;
+                                            [[NSFileManager defaultManager]
+                                                removeItemAtPath:package
+                                                           error:nil];
+                                            [self tearDownSetupAndBoot];
+                                          }]];
+  [alert addAction:[UIAlertAction actionWithTitle:@"Keep"
+                                            style:UIAlertActionStyleCancel
+                                          handler:^(UIAlertAction* action) {
+                                            (void)action;
+                                            [self tearDownSetupAndBoot];
+                                          }]];
+  [setup_window_.rootViewController presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)applicationWillResignActive:(UIApplication*)application {
