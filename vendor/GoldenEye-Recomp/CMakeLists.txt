@@ -18,6 +18,16 @@ if(NOT DEFINED REXSDK_DIR OR REXSDK_DIR STREQUAL "")
         "Path to the GoldenEye Metal SDK source tree" FORCE)
 endif()
 
+# Keep the SDK artifacts owned by this app configuration inside its own build
+# tree. In particular, release and developer-harness builds must never share a
+# librexruntime.dylib output path, because either one may be newer while having
+# materially different compiled capabilities.
+if(NOT DEFINED REXGLUE_OUTPUT_DIRECTORY)
+    set(REXGLUE_OUTPUT_DIRECTORY
+        "${CMAKE_BINARY_DIR}/rexglue-output"
+        CACHE PATH "Build-tree-local ReXGlue artifacts")
+endif()
+
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/rexglue.cmake")
     message(FATAL_ERROR
         "generated/rexglue.cmake is missing. Put your legally-owned Xbox 360 XEX at "
@@ -41,6 +51,7 @@ set(GE_SOURCES
 
 if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(APPEND GE_SOURCES
+        src/ge_gpu_capture.cpp
         src/ge_launch_recovery.cpp
         src/ge_launcher_macos.mm
     )
@@ -105,6 +116,7 @@ add_executable(goldeneye_host_pause_test EXCLUDE_FROM_ALL
 )
 target_include_directories(goldeneye_host_pause_test PRIVATE src)
 target_compile_definitions(goldeneye_host_pause_test PRIVATE
+    REXGLUE_ENABLE_INPUT_TEST_HARNESS=1
     "GOLDENEYE_GENERATED_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/generated\"")
 rexglue_apply_target_settings(goldeneye_host_pause_test)
 if(NOT MSVC)
@@ -204,6 +216,18 @@ add_custom_target(goldeneye_crash_guard_codegen_verify
 # Filesystem-only regression for the durable run marker and one-launch Safe
 # Mode config snapshot. It is source-only and never packaged.
 if(APPLE)
+    add_executable(goldeneye_gpu_capture_test EXCLUDE_FROM_ALL
+        tests/gpu_capture_test.cpp
+        src/ge_gpu_capture.cpp
+    )
+    target_include_directories(goldeneye_gpu_capture_test PRIVATE src)
+    target_link_libraries(goldeneye_gpu_capture_test PRIVATE rex::runtime)
+    rexglue_apply_target_settings(goldeneye_gpu_capture_test)
+    target_compile_options(goldeneye_gpu_capture_test PRIVATE
+        "-ffile-prefix-map=${REXSDK_DIR}=."
+        "-fmacro-prefix-map=${REXSDK_DIR}=."
+    )
+
     add_executable(goldeneye_launch_recovery_test EXCLUDE_FROM_ALL
         tests/launch_recovery_test.cpp
         src/ge_launch_recovery.cpp
@@ -227,10 +251,36 @@ endif()
 # The staged .app, its verification suite and the launcher are macOS-only;
 # iOS packaging is a separate flow (docs/ipad/PLAN.md).
 if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    set(GOLDENEYE_VERSION "0.4.2" CACHE STRING
-        "GoldenEye Metal CFBundleShortVersionString")
-    set(GOLDENEYE_BUILD_NUMBER "10" CACHE STRING
-        "GoldenEye Metal numeric CFBundleVersion")
+    set(GOLDENEYE_RELEASE_MANIFEST
+        "${REXSDK_DIR}/config/goldeneye-release.json")
+    if(NOT EXISTS "${GOLDENEYE_RELEASE_MANIFEST}")
+        message(FATAL_ERROR
+            "GoldenEye release manifest is missing: ${GOLDENEYE_RELEASE_MANIFEST}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${GOLDENEYE_RELEASE_MANIFEST}")
+    file(READ "${GOLDENEYE_RELEASE_MANIFEST}" _goldeneye_release_json)
+    string(JSON GOLDENEYE_RELEASE_VERSION GET
+        "${_goldeneye_release_json}" version)
+    string(JSON GOLDENEYE_RELEASE_BUILD_NUMBER GET
+        "${_goldeneye_release_json}" build)
+
+    # GOLDENEYE_VERSION and GOLDENEYE_BUILD_NUMBER used to be cache entries.
+    # Remove those legacy entries on every configure so a developer build can
+    # never retain metadata from an older release. Intentional one-run build
+    # overrides are environment variables and therefore cannot become sticky.
+    unset(GOLDENEYE_VERSION CACHE)
+    unset(GOLDENEYE_BUILD_NUMBER CACHE)
+    set(GOLDENEYE_VERSION "${GOLDENEYE_RELEASE_VERSION}")
+    set(GOLDENEYE_BUILD_NUMBER "${GOLDENEYE_RELEASE_BUILD_NUMBER}")
+    if(DEFINED ENV{GOLDENEYE_VERSION_OVERRIDE} AND
+       NOT "$ENV{GOLDENEYE_VERSION_OVERRIDE}" STREQUAL "")
+        set(GOLDENEYE_VERSION "$ENV{GOLDENEYE_VERSION_OVERRIDE}")
+    endif()
+    if(DEFINED ENV{GOLDENEYE_BUILD_NUMBER_OVERRIDE} AND
+       NOT "$ENV{GOLDENEYE_BUILD_NUMBER_OVERRIDE}" STREQUAL "")
+        set(GOLDENEYE_BUILD_NUMBER "$ENV{GOLDENEYE_BUILD_NUMBER_OVERRIDE}")
+    endif()
     set(GOLDENEYE_BUNDLE_IDENTIFIER "io.github.ysrdevs.goldeneye-metal" CACHE STRING
         "GoldenEye Metal reverse-DNS bundle identifier")
     if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
@@ -243,7 +293,7 @@ if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     if(NOT GOLDENEYE_VERSION MATCHES "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$")
         message(FATAL_ERROR
             "GOLDENEYE_VERSION must contain two or three numeric components "
-            "(for example, 0.4.0)")
+            "(for example, 1.2.3)")
     endif()
     if(NOT GOLDENEYE_BUILD_NUMBER MATCHES "^[0-9]+(\\.[0-9]+)?(\\.[0-9]+)?$")
         message(FATAL_ERROR
@@ -325,6 +375,7 @@ if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         COMMAND "$<TARGET_FILE:goldeneye_watchdog_test>"
         COMMAND "$<TARGET_FILE:goldeneye_host_pause_test>"
         COMMAND "$<TARGET_FILE:goldeneye_testing_tools_test>"
+        COMMAND "$<TARGET_FILE:goldeneye_gpu_capture_test>"
         COMMAND "$<TARGET_FILE:goldeneye_launch_recovery_test>"
         COMMAND "$<TARGET_FILE:goldeneye_save_manager_test>"
         COMMAND "$<TARGET_FILE:metal_presenter_shader_test>"
@@ -335,6 +386,9 @@ if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         COMMAND
             "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/verify_app.sh"
             "${GOLDENEYE_MACOS_APP_DIR}"
+            "${GOLDENEYE_VERSION}"
+            "${GOLDENEYE_BUILD_NUMBER}"
+            "$<IF:$<BOOL:${REXGLUE_ENABLE_INPUT_TEST_HARNESS}>,on,off>"
         DEPENDS
             goldeneye_macos_app
             goldeneye_crash_guard_test
@@ -343,11 +397,13 @@ if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             goldeneye_watchdog_test
             goldeneye_host_pause_test
             goldeneye_testing_tools_test
+            goldeneye_gpu_capture_test
             goldeneye_launch_recovery_test
             goldeneye_save_manager_test
             metal_metalfx_scaler_test
             metal_presenter_shader_test
             "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/verify_pause_hook.cmake"
+            "${GOLDENEYE_RELEASE_MANIFEST}"
         COMMENT "Verifying unsigned GoldenEye Metal.app layout and linkage"
         VERBATIM
     )

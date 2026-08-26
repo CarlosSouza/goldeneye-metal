@@ -16,6 +16,11 @@
 #include <array>
 #include <cstddef>
 #include <functional>
+#include <string>
+
+#if defined(__APPLE__)
+#include "ge_gpu_capture.h"
+#endif
 
 // Briefing-folder pause / settings menu.
 //
@@ -43,6 +48,14 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
     // server / online-enable cvars so they take effect on a clean reboot (they
     // are read at startup, not live).
     std::function<void()> request_restart;
+#if defined(__APPLE__)
+    std::function<rex::graphics::FrameTraceCaptureStatus()>
+        get_gpu_capture_status;
+    std::function<bool()> has_completed_gpu_capture;
+    // Called only by OnClose, after on_closed has resumed gameplay.
+    std::function<void()> request_gpu_capture;
+    std::function<bool(std::string*)> delete_gpu_capture;
+#endif
   };
 
   GeMenuDialog(rex::ui::ImGuiDrawer* drawer, Callbacks callbacks);
@@ -97,6 +110,10 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   int testing_unlock_confirm_action_ = -1;
   bool testing_unlock_action_submitted_ = false;
   bool performance_report_pending_ = false;
+#if defined(__APPLE__)
+  ge::gpu_capture::DeferredMenuRequest deferred_gpu_capture_request_;
+  std::string gpu_capture_action_message_;
+#endif
 
   // ONLINE tab edit state, loaded from the cvars the first time the tab shows
   // (so typing doesn't fight a per-frame reload). Applied on Save & Restart.

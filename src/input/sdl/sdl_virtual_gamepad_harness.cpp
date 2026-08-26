@@ -151,6 +151,10 @@ struct SDLVirtualGamepadHarness::Impl {
   std::vector<SDL_JoystickID> instance_ids;
   std::vector<Pulse> pulses;
 
+  bool IsConnected(size_t player) const {
+    return player < pads.size() && pads[player].instance_id && pads[player].joystick;
+  }
+
   void CloseCommandPipe() {
     if (command_fd >= 0) {
       close(command_fd);
@@ -159,7 +163,7 @@ struct SDLVirtualGamepadHarness::Impl {
   }
 
   bool SetButton(size_t player, SDL_GamepadButton button, bool down) {
-    if (player >= pads.size()) {
+    if (!IsConnected(player)) {
       return false;
     }
     return SDL_SetJoystickVirtualButton(
@@ -167,7 +171,7 @@ struct SDLVirtualGamepadHarness::Impl {
   }
 
   bool SetAxis(size_t player, SDL_GamepadAxis axis, int16_t value) {
-    if (player >= pads.size()) {
+    if (!IsConnected(player)) {
       return false;
     }
     return SDL_SetJoystickVirtualAxis(
@@ -175,7 +179,7 @@ struct SDLVirtualGamepadHarness::Impl {
   }
 
   bool ResetPlayer(size_t player) {
-    if (player >= pads.size()) {
+    if (!IsConnected(player)) {
       return false;
     }
     bool success = true;
@@ -193,6 +197,73 @@ struct SDLVirtualGamepadHarness::Impl {
                 success;
     }
     return success;
+  }
+
+  bool AttachPlayer(size_t player) {
+    if (player >= pads.size() || IsConnected(player)) {
+      return false;
+    }
+
+    SDL_VirtualJoystickDesc description{};
+    SDL_INIT_INTERFACE(&description);
+    description.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    description.vendor_id = kVirtualVendorId;
+    description.product_id = kVirtualProductId;
+    description.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    description.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    description.name = "GoldenEye integration-test gamepad";
+
+    auto& pad = pads[player];
+    pad.instance_id = SDL_AttachVirtualJoystick(&description);
+    if (!pad.instance_id) {
+      return false;
+    }
+    pad.joystick = SDL_OpenJoystick(pad.instance_id);
+    if (!pad.joystick) {
+      SDL_DetachVirtualJoystick(pad.instance_id);
+      pad.instance_id = 0;
+      return false;
+    }
+    instance_ids[player] = pad.instance_id;
+    if (!ResetPlayer(player)) {
+      SDL_CloseJoystick(pad.joystick);
+      pad.joystick = nullptr;
+      SDL_DetachVirtualJoystick(pad.instance_id);
+      pad.instance_id = 0;
+      instance_ids[player] = 0;
+      return false;
+    }
+    return true;
+  }
+
+  bool DisconnectPlayer(size_t player) {
+    if (!IsConnected(player) || !ResetPlayer(player)) {
+      return false;
+    }
+
+    // Publish neutral state before removal so neither SDL nor the guest can
+    // retain a pressed control while the device is disappearing.
+    SDL_UpdateJoysticks();
+    pulses.erase(std::remove_if(pulses.begin(), pulses.end(),
+                                [player](const Pulse& pulse) { return pulse.player == player; }),
+                 pulses.end());
+
+    auto& pad = pads[player];
+    const SDL_JoystickID instance_id = pad.instance_id;
+    SDL_CloseJoystick(pad.joystick);
+    pad.joystick = nullptr;
+    if (!SDL_DetachVirtualJoystick(instance_id)) {
+      // Keep the harness internally usable if SDL refuses the detach.
+      pad.joystick = SDL_OpenJoystick(instance_id);
+      if (pad.joystick) {
+        ResetPlayer(player);
+        SDL_UpdateJoysticks();
+      }
+      return false;
+    }
+    pad.instance_id = 0;
+    instance_ids[player] = 0;
+    return true;
   }
 
   void Reject(std::string_view reason, std::string_view line) {
@@ -228,10 +299,9 @@ struct SDLVirtualGamepadHarness::Impl {
     }
 
     const std::string& operation = tokens[0];
-    const size_t expected_tokens =
-        operation == "RESET"
-            ? 3
-            : (operation == "PULSE_AXIS" ? 6 : 5);
+    const bool player_only_operation =
+        operation == "RESET" || operation == "DISCONNECT" || operation == "CONNECT";
+    const size_t expected_tokens = player_only_operation ? 3 : (operation == "PULSE_AXIS" ? 6 : 5);
     if (tokens.size() != expected_tokens) {
       Reject("invalid argument count", line);
       return false;
@@ -244,16 +314,41 @@ struct SDLVirtualGamepadHarness::Impl {
     }
 
     bool changed = false;
-    if (operation == "RESET") {
+    if (operation == "DISCONNECT" || operation == "CONNECT") {
+      size_t player = 0;
+      if (!ParsePlayer(tokens[2], &player)) {
+        Reject("invalid player", line);
+        return false;
+      }
+      if (operation == "DISCONNECT") {
+        if (!IsConnected(player)) {
+          Reject("player is already disconnected", line);
+          return false;
+        }
+        changed = DisconnectPlayer(player);
+      } else {
+        if (IsConnected(player)) {
+          Reject("player is already connected", line);
+          return false;
+        }
+        changed = AttachPlayer(player);
+      }
+    } else if (operation == "RESET") {
       if (tokens[2] == "ALL") {
         changed = true;
         for (size_t player = 0; player < pads.size(); ++player) {
-          changed = ResetPlayer(player) && changed;
+          if (IsConnected(player)) {
+            changed = ResetPlayer(player) && changed;
+          }
         }
       } else {
         size_t player = 0;
         if (!ParsePlayer(tokens[2], &player)) {
           Reject("invalid player", line);
+          return false;
+        }
+        if (!IsConnected(player)) {
+          Reject("player is disconnected", line);
           return false;
         }
         changed = ResetPlayer(player);
@@ -262,6 +357,10 @@ struct SDLVirtualGamepadHarness::Impl {
       size_t player = 0;
       if (!ParsePlayer(tokens[2], &player)) {
         Reject("invalid player", line);
+        return false;
+      }
+      if (!IsConnected(player)) {
+        Reject("player is disconnected", line);
         return false;
       }
 
@@ -473,8 +572,7 @@ SDLVirtualGamepadHarness::CreateFromEnvironment() {
   }
 
   uint32_t pad_count = 0;
-  if (!ParseInteger(pad_count_text, &pad_count) || pad_count < 2 ||
-      pad_count > 4) {
+  if (!ParseInteger(pad_count_text, &pad_count) || pad_count < 1 || pad_count > 4) {
     REXLOG_ERROR("[vpad] disabled: invalid pad count");
     return nullptr;
   }
@@ -530,39 +628,12 @@ bool SDLVirtualGamepadHarness::Attach() {
     return false;
   }
 
-  impl_->pads.reserve(impl_->pad_count);
-  impl_->instance_ids.reserve(impl_->pad_count);
+  impl_->pads.resize(impl_->pad_count);
+  impl_->instance_ids.resize(impl_->pad_count);
   for (uint32_t player = 0; player < impl_->pad_count; ++player) {
-    SDL_VirtualJoystickDesc description{};
-    SDL_INIT_INTERFACE(&description);
-    description.type = SDL_JOYSTICK_TYPE_GAMEPAD;
-    description.vendor_id = kVirtualVendorId;
-    description.product_id = kVirtualProductId;
-    description.naxes = SDL_GAMEPAD_AXIS_COUNT;
-    description.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
-    description.name = "GoldenEye integration-test gamepad";
-
-    Impl::Pad pad;
-    pad.instance_id = SDL_AttachVirtualJoystick(&description);
-    if (!pad.instance_id) {
+    if (!impl_->AttachPlayer(player)) {
       REXLOG_ERROR("[vpad] attach failed for player {}: {}", player + 1,
                    SDL_GetError());
-      Shutdown();
-      return false;
-    }
-    pad.joystick = SDL_OpenJoystick(pad.instance_id);
-    if (!pad.joystick) {
-      REXLOG_ERROR("[vpad] open failed for player {}: {}", player + 1,
-                   SDL_GetError());
-      SDL_DetachVirtualJoystick(pad.instance_id);
-      Shutdown();
-      return false;
-    }
-    impl_->pads.push_back(std::move(pad));
-    impl_->instance_ids.push_back(impl_->pads.back().instance_id);
-    if (!impl_->ResetPlayer(impl_->pads.size() - 1)) {
-      REXLOG_ERROR("[vpad] neutral-state setup failed for player {}: {}",
-                   player + 1, SDL_GetError());
       Shutdown();
       return false;
     }

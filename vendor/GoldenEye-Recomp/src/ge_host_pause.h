@@ -3,6 +3,10 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+#include <functional>
+#include <utility>
+#endif
 
 struct PPCContext;
 
@@ -170,7 +174,375 @@ class RetryLogGate {
   uint32_t failed_attempts_ = 0;
 };
 
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+enum class LiveTestPhase : uint8_t {
+  kWaitingForGameplay,
+  kWaitingForPause,
+  kObservingPause,
+  kWaitingForResume,
+  kObservingResume,
+  kComplete,
+  kFailed,
+};
+
+enum class LiveTestRequest : uint8_t {
+  kNone,
+  kOpenHostSettings,
+  kCloseHostSettings,
+};
+
+struct LiveTestObservation {
+  uint64_t monotonic_ms = 0;
+  bool dam_gameplay_ready = false;
+  bool ui_open = false;
+  bool world_valid = false;
+  bool ammo_valid = false;
+  bool input_neutral = false;
+  uint32_t player = 0;
+  uint32_t coordinates = 0;
+  uint32_t guest_frame = 0;
+  uint32_t present = 0;
+  uint32_t pause_value = 0;
+  float position_x = 0.0f;
+  float position_y = 0.0f;
+  float position_z = 0.0f;
+  float camera_yaw = 0.0f;
+  float camera_pitch = 0.0f;
+  int32_t weapon = 0;
+  int32_t ammo = 0;
+  Snapshot pause;
+};
+
+struct LiveTestProof {
+  uint64_t open_generation = 0;
+  uint64_t resume_generation = 0;
+  uint32_t frozen_samples = 0;
+  uint64_t frozen_duration_ms = 0;
+  uint32_t paused_frame_delta = 0;
+  uint32_t paused_present_delta = 0;
+  uint32_t resumed_samples = 0;
+  uint64_t resumed_duration_ms = 0;
+  uint32_t resumed_frame_delta = 0;
+  uint32_t resumed_present_delta = 0;
+};
+
+struct LiveTestUpdate {
+  LiveTestRequest request = LiveTestRequest::kNone;
+  bool frozen_proven = false;
+  bool completed = false;
+  const char* failure_reason = nullptr;
+};
+
+// Deterministic, read-only classifier for the developer-only live Host
+// Settings test. The runtime wrapper performs the requested UI action; this
+// state machine only decides when the evidence is sufficient or contradictory.
+class LiveTestGate {
+ public:
+  static constexpr uint32_t kRequiredReadySamples = 2;
+  static constexpr uint32_t kRequiredFrozenSamples = 3;
+  static constexpr uint64_t kRequiredFrozenDurationMs = 1000;
+  static constexpr uint32_t kRequiredResumedSamples = 2;
+  static constexpr uint64_t kRequiredResumedDurationMs = 500;
+  static constexpr uint64_t kPhaseTimeoutMs = 5000;
+
+  LiveTestUpdate Observe(const LiveTestObservation& observation) noexcept {
+    if (phase_ == LiveTestPhase::kComplete) {
+      return {.completed = true};
+    }
+    if (phase_ == LiveTestPhase::kFailed) {
+      return {.failure_reason = failure_reason_};
+    }
+    if (has_observation_time_ && observation.monotonic_ms < last_observation_ms_) {
+      return Fail("clock-regressed");
+    }
+    has_observation_time_ = true;
+    last_observation_ms_ = observation.monotonic_ms;
+
+    if (phase_ != LiveTestPhase::kWaitingForGameplay &&
+        (!observation.dam_gameplay_ready || !SameWorldIdentity(observation))) {
+      return Fail("mission-state-lost");
+    }
+    if (phase_ != LiveTestPhase::kWaitingForGameplay &&
+        observation.monotonic_ms - phase_started_ms_ > kPhaseTimeoutMs) {
+      return Fail("phase-timeout");
+    }
+
+    switch (phase_) {
+      case LiveTestPhase::kWaitingForGameplay:
+        return ObserveReadiness(observation);
+      case LiveTestPhase::kWaitingForPause:
+        return ObservePauseAcquisition(observation);
+      case LiveTestPhase::kObservingPause:
+        return ObserveFrozenWorld(observation);
+      case LiveTestPhase::kWaitingForResume:
+        return ObservePauseRelease(observation);
+      case LiveTestPhase::kObservingResume:
+        return ObserveResumedWorld(observation);
+      case LiveTestPhase::kComplete:
+        return {.completed = true};
+      case LiveTestPhase::kFailed:
+        return {.failure_reason = failure_reason_};
+    }
+    return Fail("invalid-phase");
+  }
+
+  LiveTestUpdate Fail(const char* reason) noexcept {
+    if (phase_ != LiveTestPhase::kFailed) {
+      phase_ = LiveTestPhase::kFailed;
+      failure_reason_ = reason ? reason : "unknown";
+    }
+    return {.failure_reason = failure_reason_};
+  }
+
+  LiveTestPhase phase() const noexcept { return phase_; }
+  const LiveTestProof& proof() const noexcept { return proof_; }
+  const char* failure_reason() const noexcept { return failure_reason_; }
+
+ private:
+  static constexpr bool CounterAdvanced(uint32_t previous, uint32_t current) noexcept {
+    const uint32_t delta = current - previous;
+    return delta != 0 && delta < 0x80000000u;
+  }
+
+  static constexpr bool CounterRegressed(uint32_t previous, uint32_t current) noexcept {
+    return current != previous && !CounterAdvanced(previous, current);
+  }
+
+  static constexpr float Absolute(float value) noexcept {
+    return value < 0.0f ? -value : value;
+  }
+
+  static bool RunningAndUnowned(const LiveTestObservation& observation) noexcept {
+    return observation.dam_gameplay_ready && observation.world_valid &&
+           observation.pause_value == 0 && !observation.ui_open &&
+           !observation.pause.requested && observation.pause.request_applied &&
+           !observation.pause.gameplay_paused && !observation.pause.host_owned;
+  }
+
+  static bool FullyHostPaused(const LiveTestObservation& observation) noexcept {
+    return observation.ui_open && observation.pause_value == kHostPauseToken &&
+           observation.pause.requested && observation.pause.request_applied &&
+           observation.pause.available && observation.pause.gameplay_paused &&
+           observation.pause.host_owned &&
+           observation.pause.generation == observation.pause.applied_generation;
+  }
+
+  bool SameWorldIdentity(const LiveTestObservation& observation) const noexcept {
+    return observation.world_valid && observation.player == identity_player_ &&
+           observation.coordinates == identity_coordinates_;
+  }
+
+  static bool SameWorldState(const LiveTestObservation& first,
+                             const LiveTestObservation& second) noexcept {
+    constexpr float kPositionTolerance = 0.0001f;
+    constexpr float kCameraTolerance = 0.0001f;
+    return first.player == second.player && first.coordinates == second.coordinates &&
+           Absolute(first.position_x - second.position_x) <= kPositionTolerance &&
+           Absolute(first.position_y - second.position_y) <= kPositionTolerance &&
+           Absolute(first.position_z - second.position_z) <= kPositionTolerance &&
+           Absolute(first.camera_yaw - second.camera_yaw) <= kCameraTolerance &&
+           Absolute(first.camera_pitch - second.camera_pitch) <= kCameraTolerance &&
+           first.weapon == second.weapon && first.ammo_valid == second.ammo_valid &&
+           (!first.ammo_valid || first.ammo == second.ammo);
+  }
+
+  void CaptureIdentity(const LiveTestObservation& observation) noexcept {
+    identity_player_ = observation.player;
+    identity_coordinates_ = observation.coordinates;
+  }
+
+  LiveTestUpdate ObserveReadiness(const LiveTestObservation& observation) noexcept {
+    if (!RunningAndUnowned(observation) || !observation.input_neutral) {
+      ready_samples_ = 0;
+      return {};
+    }
+    if (ready_samples_ == 0 || observation.player != identity_player_ ||
+        observation.coordinates != identity_coordinates_ ||
+        CounterRegressed(ready_baseline_.guest_frame, observation.guest_frame) ||
+        CounterRegressed(ready_baseline_.present, observation.present)) {
+      ready_samples_ = 1;
+      ready_baseline_ = observation;
+      CaptureIdentity(observation);
+      return {};
+    }
+    if (!CounterAdvanced(ready_baseline_.guest_frame, observation.guest_frame) ||
+        !CounterAdvanced(ready_baseline_.present, observation.present)) {
+      return {};
+    }
+    if (++ready_samples_ < kRequiredReadySamples) {
+      return {};
+    }
+    phase_ = LiveTestPhase::kWaitingForPause;
+    phase_started_ms_ = observation.monotonic_ms;
+    return {.request = LiveTestRequest::kOpenHostSettings};
+  }
+
+  LiveTestUpdate ObservePauseAcquisition(const LiveTestObservation& observation) noexcept {
+    if (observation.ui_open && !observation.pause.requested) {
+      return Fail("ui-open-without-pause-request");
+    }
+    if (!FullyHostPaused(observation)) {
+      return {};
+    }
+    if (!SameWorldIdentity(observation)) {
+      return Fail("world-identity-changed");
+    }
+    proof_.open_generation = observation.pause.generation;
+    if (proof_.open_generation == 0) {
+      return Fail("pause-generation-missing");
+    }
+    frozen_baseline_ = observation;
+    proof_.frozen_samples = 1;
+    phase_ = LiveTestPhase::kObservingPause;
+    phase_started_ms_ = observation.monotonic_ms;
+    return {};
+  }
+
+  LiveTestUpdate ObserveFrozenWorld(const LiveTestObservation& observation) noexcept {
+    if (!FullyHostPaused(observation)) {
+      return Fail(observation.ui_open ? "pause-ownership-lost" : "ui-closed-early");
+    }
+    if (observation.pause.generation != proof_.open_generation) {
+      return Fail("pause-generation-changed");
+    }
+    if (!SameWorldState(frozen_baseline_, observation)) {
+      return Fail("world-advanced-while-paused");
+    }
+    if (CounterRegressed(frozen_baseline_.guest_frame, observation.guest_frame) ||
+        CounterRegressed(frozen_baseline_.present, observation.present)) {
+      return Fail("progress-counter-regressed");
+    }
+    ++proof_.frozen_samples;
+    proof_.frozen_duration_ms = observation.monotonic_ms - frozen_baseline_.monotonic_ms;
+    proof_.paused_frame_delta = observation.guest_frame - frozen_baseline_.guest_frame;
+    proof_.paused_present_delta = observation.present - frozen_baseline_.present;
+    if (proof_.frozen_duration_ms < kRequiredFrozenDurationMs ||
+        proof_.frozen_samples < kRequiredFrozenSamples) {
+      return {};
+    }
+    if (proof_.paused_present_delta == 0) {
+      return Fail("paused-presentation-stalled");
+    }
+    phase_ = LiveTestPhase::kWaitingForResume;
+    phase_started_ms_ = observation.monotonic_ms;
+    return {.request = LiveTestRequest::kCloseHostSettings, .frozen_proven = true};
+  }
+
+  LiveTestUpdate ObservePauseRelease(const LiveTestObservation& observation) noexcept {
+    if (observation.ui_open || observation.pause.requested ||
+        !observation.pause.request_applied || observation.pause.gameplay_paused ||
+        observation.pause.host_owned || observation.pause_value != 0) {
+      return {};
+    }
+    proof_.resume_generation = observation.pause.generation;
+    if (proof_.resume_generation != proof_.open_generation + 1) {
+      return Fail("resume-generation-mismatch");
+    }
+    if (!observation.input_neutral) {
+      return Fail("resume-input-not-neutral");
+    }
+    resumed_baseline_ = observation;
+    proof_.resumed_samples = 1;
+    phase_ = LiveTestPhase::kObservingResume;
+    phase_started_ms_ = observation.monotonic_ms;
+    return {};
+  }
+
+  LiveTestUpdate ObserveResumedWorld(const LiveTestObservation& observation) noexcept {
+    if (!RunningAndUnowned(observation)) {
+      return Fail("pause-not-released");
+    }
+    if (!observation.input_neutral) {
+      return Fail("resume-input-not-neutral");
+    }
+    if (CounterRegressed(resumed_baseline_.guest_frame, observation.guest_frame) ||
+        CounterRegressed(resumed_baseline_.present, observation.present)) {
+      return Fail("progress-counter-regressed");
+    }
+    ++proof_.resumed_samples;
+    proof_.resumed_duration_ms = observation.monotonic_ms - resumed_baseline_.monotonic_ms;
+    proof_.resumed_frame_delta = observation.guest_frame - resumed_baseline_.guest_frame;
+    proof_.resumed_present_delta = observation.present - resumed_baseline_.present;
+    if (proof_.resumed_duration_ms < kRequiredResumedDurationMs ||
+        proof_.resumed_samples < kRequiredResumedSamples) {
+      return {};
+    }
+    if (proof_.resumed_frame_delta == 0 || proof_.resumed_present_delta == 0) {
+      return Fail("resume-progress-stalled");
+    }
+    phase_ = LiveTestPhase::kComplete;
+    return {.completed = true};
+  }
+
+  LiveTestPhase phase_ = LiveTestPhase::kWaitingForGameplay;
+  const char* failure_reason_ = nullptr;
+  bool has_observation_time_ = false;
+  uint64_t last_observation_ms_ = 0;
+  uint64_t phase_started_ms_ = 0;
+  uint32_t ready_samples_ = 0;
+  uint32_t identity_player_ = 0;
+  uint32_t identity_coordinates_ = 0;
+  LiveTestObservation ready_baseline_;
+  LiveTestObservation frozen_baseline_;
+  LiveTestObservation resumed_baseline_;
+  LiveTestProof proof_;
+};
+#endif
+
 }  // namespace detail
+
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+namespace test_harness {
+
+using MenuRequestHandler = std::function<bool(bool open)>;
+
+// The game thread requests an exact desired menu state; GeApp owns the only
+// handler and schedules the real TogglePauseMenu path on the UI thread.
+class MenuRequestBridge {
+ public:
+  void SetHandler(MenuRequestHandler handler) {
+    std::lock_guard lock(mutex_);
+    handler_ = std::move(handler);
+  }
+
+  void ClearHandler() {
+    std::lock_guard lock(mutex_);
+    handler_ = {};
+  }
+
+  bool Request(bool open) {
+    std::lock_guard lock(mutex_);
+    return handler_ && handler_(open);
+  }
+
+  void PublishOpen(bool open) noexcept {
+    open_.store(open, std::memory_order_release);
+  }
+
+  bool open() const noexcept { return open_.load(std::memory_order_acquire); }
+
+ private:
+  std::mutex mutex_;
+  MenuRequestHandler handler_;
+  std::atomic<bool> open_{false};
+};
+
+inline MenuRequestBridge& Bridge() {
+  static MenuRequestBridge bridge;
+  return bridge;
+}
+
+inline void SetMenuRequestHandler(MenuRequestHandler handler) {
+  Bridge().SetHandler(std::move(handler));
+}
+
+inline void ClearMenuRequestHandler() { Bridge().ClearHandler(); }
+inline bool RequestMenuState(bool open) { return Bridge().Request(open); }
+inline void PublishMenuOpen(bool open) noexcept { Bridge().PublishOpen(open); }
+inline bool MenuOpen() noexcept { return Bridge().open(); }
+
+}  // namespace test_harness
+#endif
 
 // Thread-safe request bridge between the host UI and GoldenEye's game thread.
 // Only ProcessGameThread (or a test standing in for it) may call Process.

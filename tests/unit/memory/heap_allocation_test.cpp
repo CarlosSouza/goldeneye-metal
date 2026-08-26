@@ -18,18 +18,16 @@
 
 namespace {
 
-// Shared memory instance - expensive to create, reuse across tests
-rex::memory::Memory& GetTestMemory() {
-  static rex::memory::Memory memory;
-  static bool initialized = false;
-  if (!initialized) {
+// Memory owns the process-wide MMIO handler, so it must not outlive the test
+// case that requested it. A function-static instance makes unrelated Memory
+// tests order-dependent when multiple Catch2 cases run in one process.
+class ScopedTestMemory final : public rex::memory::Memory {
+ public:
+  ScopedTestMemory() {
     rex::InitLogging();
-    bool result = memory.Initialize();
-    REQUIRE(result);
-    initialized = true;
+    REQUIRE(Initialize());
   }
-  return memory;
-}
+};
 
 // Helper to cast away const for heap operations
 rex::memory::BaseHeap* MutableHeap(const rex::memory::BaseHeap* heap) {
@@ -43,7 +41,7 @@ rex::memory::BaseHeap* MutableHeap(const rex::memory::BaseHeap* heap) {
 // =============================================================================
 
 TEST_CASE("Heap allocation rounds size up to page size", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));  // v00000000, 4KB pages
   REQUIRE(heap != nullptr);
 
@@ -110,7 +108,7 @@ TEST_CASE("Heap allocation rounds size up to page size", "[memory][heap]") {
 }
 
 TEST_CASE("Heap allocation rounds alignment up to page size", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -147,7 +145,7 @@ TEST_CASE("Heap allocation rounds alignment up to page size", "[memory][heap]") 
 // =============================================================================
 
 TEST_CASE("Bottom-up allocation starts after reserved first 64KB", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -166,7 +164,7 @@ TEST_CASE("Bottom-up allocation starts after reserved first 64KB", "[memory][hea
 }
 
 TEST_CASE("Top-down allocation returns high addresses", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -199,7 +197,7 @@ TEST_CASE("Top-down allocation returns high addresses", "[memory][heap]") {
 // =============================================================================
 
 TEST_CASE("AllocFixed allocates at exact address", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -222,7 +220,7 @@ TEST_CASE("AllocFixed allocates at exact address", "[memory][heap]") {
 }
 
 TEST_CASE("AllocFixed reserve-only fails on already-reserved region", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -245,7 +243,7 @@ TEST_CASE("AllocFixed reserve-only fails on already-reserved region", "[memory][
 }
 
 TEST_CASE("AllocFixed commit on reserved region succeeds", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -272,7 +270,7 @@ TEST_CASE("AllocFixed commit on reserved region succeeds", "[memory][heap]") {
 // =============================================================================
 
 TEST_CASE("Protect changes page protection and returns old value", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -309,7 +307,7 @@ TEST_CASE("Protect changes page protection and returns old value", "[memory][hea
 // =============================================================================
 
 TEST_CASE("QueryRegionInfo returns correct allocation info", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -352,7 +350,7 @@ TEST_CASE("QueryRegionInfo returns correct allocation info", "[memory][heap]") {
 // =============================================================================
 
 TEST_CASE("Release frees memory for reallocation", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x22000000));  // Use a different region
   REQUIRE(heap != nullptr);
 
@@ -386,7 +384,7 @@ TEST_CASE("Release frees memory for reallocation", "[memory][heap]") {
 // =============================================================================
 
 TEST_CASE("LookupHeap returns correct heap for address", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
 
   SECTION("Address in v00000000 range") {
     auto* heap = memory.LookupHeap(0x10000000);
@@ -416,7 +414,7 @@ TEST_CASE("LookupHeap returns correct heap for address", "[memory][heap]") {
 // =============================================================================
 
 TEST_CASE("64KB page heap rounds to 64KB boundaries", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x50000000));  // v40000000 heap
   REQUIRE(heap != nullptr);
 
@@ -445,7 +443,7 @@ TEST_CASE("64KB page heap rounds to 64KB boundaries", "[memory][heap]") {
 // =============================================================================
 
 TEST_CASE("Decommit removes commit flag but keeps reservation", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -475,7 +473,7 @@ TEST_CASE("Decommit removes commit flag but keeps reservation", "[memory][heap]"
 }
 
 TEST_CASE("Decommit partial region", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
 
@@ -511,7 +509,7 @@ TEST_CASE("Decommit partial region", "[memory][heap]") {
 TEST_CASE("Decommit-recommit cycle on 64KB heap (real usage pattern)", "[memory][heap]") {
   // This pattern observed in real app: NtFreeVirtualMemory(MEM_DECOMMIT)
   // followed by NtAllocateVirtualMemory at same address
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x50000000));  // v40000000 heap, 64KB pages
   REQUIRE(heap != nullptr);
 
@@ -548,7 +546,7 @@ TEST_CASE("Decommit-recommit cycle on 64KB heap (real usage pattern)", "[memory]
 
 TEST_CASE("Repeated decommit of same page succeeds (idempotent)", "[memory][heap]") {
   // Real app decommits same address multiple times in sequence
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x50000000));  // v40000000 heap
   REQUIRE(heap != nullptr);
 
@@ -575,7 +573,7 @@ TEST_CASE("Repeated decommit of same page succeeds (idempotent)", "[memory][heap
 
 TEST_CASE("Decommit on 64KB heap uses 64KB granularity", "[memory][heap]") {
   // On v40000000 heap, even small decommit requests affect whole 64KB page
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0x50000000));
   REQUIRE(heap != nullptr);
 
@@ -604,7 +602,7 @@ TEST_CASE("Decommit on 64KB heap uses 64KB granularity", "[memory][heap]") {
 // =============================================================================
 
 TEST_CASE("TranslateVirtual returns valid host pointer", "[memory][translation]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
 
   // Allocate some memory first
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
@@ -628,7 +626,7 @@ TEST_CASE("TranslateVirtual returns valid host pointer", "[memory][translation]"
 }
 
 TEST_CASE("HostToGuestVirtual roundtrip", "[memory][translation]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
 
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
   REQUIRE(heap != nullptr);
@@ -649,7 +647,7 @@ TEST_CASE("HostToGuestVirtual roundtrip", "[memory][translation]") {
 }
 
 TEST_CASE("TranslatePhysical masks to 29 bits", "[memory][translation]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
 
   // Physical addresses are masked with 0x1FFFFFFF (29 bits)
   // So 0xA0000000 and 0x00000000 should map to same physical offset
@@ -666,7 +664,7 @@ TEST_CASE("TranslatePhysical masks to 29 bits", "[memory][translation]") {
 // =============================================================================
 
 TEST_CASE("Physical heap vA0000000 (64KB pages, cached)", "[memory][physical]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0xA0000000));
   REQUIRE(heap != nullptr);
 
@@ -688,7 +686,7 @@ TEST_CASE("Physical heap vA0000000 (64KB pages, cached)", "[memory][physical]") 
 }
 
 TEST_CASE("Physical heap vC0000000 (16MB pages, uncached)", "[memory][physical]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0xC0000000));
   REQUIRE(heap != nullptr);
 
@@ -710,7 +708,7 @@ TEST_CASE("Physical heap vC0000000 (16MB pages, uncached)", "[memory][physical]"
 }
 
 TEST_CASE("Physical heap vE0000000 (4KB pages, write-combine)", "[memory][physical]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
   auto* heap = MutableHeap(memory.LookupHeap(0xE0000000));
   REQUIRE(heap != nullptr);
 
@@ -744,7 +742,7 @@ TEST_CASE("Physical heap vE0000000 (4KB pages, write-combine)", "[memory][physic
 }
 
 TEST_CASE("LookupHeapByType selects correct heap", "[memory][heap]") {
-  auto& memory = GetTestMemory();
+  ScopedTestMemory memory;
 
   SECTION("Virtual heap with 4KB pages") {
     auto* heap = memory.LookupHeapByType(false, 4096);

@@ -1,0 +1,86 @@
+name: Source CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    name: macOS ARM64 source build and tests
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Install Metal shader dependency
+        run: brew install spirv-cross
+
+      - name: Configure
+        run: cmake --preset macos-arm64-multiplayer-test
+
+      - name: Verify critical automation tests were discovered
+        shell: bash
+        run: |
+          set -euo pipefail
+          discovered="$(ctest --preset macos-arm64-multiplayer-test -N)"
+          for test_name in \
+            tools.metal_profile_parser_test \
+            tools.diagnostic_privacy_test \
+            tools.gameplay_scenario_test \
+            tools.local_multiplayer_scenario_test \
+            tools.release_version_test \
+            tools.stability_cycle_test \
+            tools.benchmark_dam_test; do
+            if [[ "$discovered" != *"$test_name"* ]]; then
+              printf 'Required test was not discovered: %s\n' "$test_name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Build
+        run: cmake --build --preset macos-arm64-multiplayer-test --parallel 2
+
+      - name: Test source-only suite
+        shell: bash
+        run: |
+          # These tests execute real Metal commands and fail when no MTLDevice is
+          # available. Keep the remaining CPU-only and self-skipping Metal tests
+          # in the source gate.
+          gpu_tests=(
+            'metal_presenter_shader_test'
+            'metal_metalfx_scaler_test'
+            'metal_resolve_test'
+            'metal_pipeline_probe_test'
+            'unit\.Metal compiles both float24 depth-only fragment modes'
+            'unit\.Metal ordered completion staging is recycled only after GPU completion'
+            'unit\.Metal completion wait permanently falls back after a host event failure'
+            'unit\.Metal guest CPU writes wait for older GPU alias writes'
+            'unit\.Shared-memory global watches distinguish CPU fence changes from GPU invalidations'
+            'unit\.Metal texture cache untiles packed depth into scalar float'
+          )
+          gpu_regex=$(printf '%s|' "${gpu_tests[@]}")
+          gpu_regex="^(${gpu_regex%|})$"
+
+          ctest \
+            --preset macos-arm64-multiplayer-test \
+            --output-on-failure \
+            --no-tests=error \
+            --parallel 1 \
+            --exclude-regex "$gpu_regex"

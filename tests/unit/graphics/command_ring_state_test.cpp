@@ -8,8 +8,11 @@
  ******************************************************************************
  */
 
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <limits>
+#include <thread>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -45,6 +48,105 @@ TEST_CASE("Command ring initialization uses byte base and invalid WPTR",
   CHECK((snapshot.control & CommandRingState::kControlNoUpdate) != 0);
   CHECK_FALSE(snapshot.write_pointer_valid());
   CHECK(snapshot.pending_dword_count() == 0);
+}
+
+TEST_CASE("Command ring WPTR epoch counts accepted doorbells only", "[graphics][command_ring]") {
+  CommandRingState state;
+  CommandRingState::Snapshot accepted;
+  CHECK_FALSE(state.WriteWritePointer(7, &accepted));
+  CHECK(state.GetSnapshot().write_pointer_epoch == 0);
+
+  state.Initialize(0x00100000, 3);
+  REQUIRE(state.WriteWritePointer(7, &accepted));
+  CHECK(accepted.write_pointer == 7);
+  CHECK(accepted.write_pointer_epoch == 1);
+  REQUIRE(state.WriteWritePointer(7, &accepted));
+  CHECK(accepted.write_pointer_epoch == 2);
+
+  state.WriteBase(0x00200000);
+  CHECK(state.GetSnapshot().write_pointer_epoch == 2);
+  REQUIRE(state.WriteWritePointer(3, &accepted));
+  CHECK(accepted.write_pointer_epoch == 3);
+}
+
+TEST_CASE("Command ring handoff wait cannot lose a WPTR doorbell", "[graphics][command_ring]") {
+  using namespace std::chrono_literals;
+  CommandRingState state;
+  state.Initialize(0x00100000, 3);
+  REQUIRE(state.WriteWritePointer(4));
+  const auto batch = state.GetSnapshot();
+  REQUIRE(state.CommitReadPointer(batch.generation, batch.write_pointer));
+  const auto drained = state.GetSnapshot();
+  REQUIRE_FALSE(drained.has_pending_commands());
+
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  auto wait_future = std::async(std::launch::async, [&]() {
+    entered.set_value();
+    return state.WaitForPendingWritePointerAfter(drained, 250ms);
+  });
+  entered_future.wait();
+  std::this_thread::sleep_for(1ms);
+  REQUIRE(state.WriteWritePointer(7));
+  REQUIRE(wait_future.wait_for(100ms) == std::future_status::ready);
+  CHECK(wait_future.get() == CommandRingState::PendingWritePointerWaitResult::kPending);
+}
+
+TEST_CASE("Command ring handoff wait sees pending work written before entry",
+          "[graphics][command_ring]") {
+  using namespace std::chrono_literals;
+  CommandRingState state;
+  state.Initialize(0x00100000, 3);
+  REQUIRE(state.WriteWritePointer(4));
+  const auto batch = state.GetSnapshot();
+  REQUIRE(state.CommitReadPointer(batch.generation, batch.write_pointer));
+  const auto drained = state.GetSnapshot();
+
+  REQUIRE(state.WriteWritePointer(7));
+  CHECK(state.WaitForPendingWritePointerAfter(drained, 250ms) ==
+        CommandRingState::PendingWritePointerWaitResult::kPending);
+}
+
+TEST_CASE("Command ring handoff wait ignores zero-work WPTR doorbells",
+          "[graphics][command_ring]") {
+  using namespace std::chrono_literals;
+  CommandRingState state;
+  state.Initialize(0x00100000, 3);
+  REQUIRE(state.WriteWritePointer(4));
+  const auto batch = state.GetSnapshot();
+  REQUIRE(state.CommitReadPointer(batch.generation, batch.write_pointer));
+  const auto drained = state.GetSnapshot();
+
+  REQUIRE(state.WriteWritePointer(drained.read_pointer));
+  CHECK(state.WaitForPendingWritePointerAfter(drained, 1ms) ==
+        CommandRingState::PendingWritePointerWaitResult::kTimeout);
+}
+
+TEST_CASE("Command ring handoff wait prioritizes pending work after reconfiguration",
+          "[graphics][command_ring]") {
+  using namespace std::chrono_literals;
+  CommandRingState state;
+  state.Initialize(0x00100000, 3);
+  const auto observed = state.GetSnapshot();
+
+  state.WriteBase(0x00200000);
+  REQUIRE(state.WriteWritePointer(3));
+  CHECK(state.WaitForPendingWritePointerAfter(observed, 1ms) ==
+        CommandRingState::PendingWritePointerWaitResult::kPending);
+}
+
+TEST_CASE("Command ring handoff wait distinguishes timeout and reconfiguration",
+          "[graphics][command_ring]") {
+  using namespace std::chrono_literals;
+  CommandRingState state;
+  state.Initialize(0x00100000, 3);
+  const auto observed = state.GetSnapshot();
+  CHECK(state.WaitForPendingWritePointerAfter(observed, 1ms) ==
+        CommandRingState::PendingWritePointerWaitResult::kTimeout);
+
+  state.WriteBase(0x00200000);
+  CHECK(state.WaitForPendingWritePointerAfter(observed, 1ms) ==
+        CommandRingState::PendingWritePointerWaitResult::kReconfigured);
 }
 
 TEST_CASE("Command ring reprogramming cannot consume a stale WPTR", "[graphics][command_ring]") {

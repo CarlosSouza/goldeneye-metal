@@ -26,9 +26,18 @@ from typing import Any, Mapping, Sequence
 PROFILE = "[metal-profile]"
 KV = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*)=([^\s]+)")
 RANGE = re.compile(r"(?:swaps|attempts)=(\d+)-(\d+)")
+RESOLVE_MODE_FIELDS = (
+    "async",
+    "sync",
+    "missing_snapshot",
+    "verbose",
+    "missing_alias",
+    "exact_snapshot",
+)
 STAGES = ("draw", "copy", "swap", "wait_reg_mem")
+REQUIRED_ZERO_STAGES = ("texture_fallback_decode",)
 SAMPLED_STAGES = ("draw_probe_sample", "draw_render_sample")
-EXPORTED_STAGES = STAGES + SAMPLED_STAGES
+EXPORTED_STAGES = STAGES + REQUIRED_ZERO_STAGES + SAMPLED_STAGES
 PROFILE_WINDOW_SIZE = 64
 WINDOW_FIELDS = ("elapsed_ns", "avg_frame_ns", "fps")
 COMMAND_FIELDS = (
@@ -38,6 +47,71 @@ COMMAND_FIELDS = (
     "avg_ns_per_swap",
     "max_call_ns",
     "max_swap_ns",
+)
+GPU_CHAIN_MAX_FIELDS = (
+    "wptr_pending_dwords_max",
+    "wptr_to_worker_max_ns",
+    "isr_max_ns",
+    "interrupt_to_wptr_max_ns",
+    "metal_pending_max",
+    "throttle_max_ns",
+)
+GPU_CHAIN_LIVE_FIELDS = ("interrupt_outstanding",)
+PROBE_QUEUE_SUM_FIELDS = (
+    "commits",
+    "backpressure_checks",
+    "nonblocking_reclaims",
+    "blocking_waits",
+    "blocking_wait_ns",
+    "wait_reg_mem_signals",
+    "wait_reg_mem_timeouts",
+    "wait_reg_mem_unavailable",
+)
+PROBE_QUEUE_MAX_FIELDS = (
+    "contexts",
+    "lifetime_peak_committed_per_context",
+    "lifetime_peak_pending_per_context",
+)
+PROBE_QUEUE_CONFIG_FIELDS = (
+    "draws_per_command_buffer",
+    "committed_command_buffer_cap",
+)
+PROBE_QUEUE_FLAG_FIELDS = ("counter_reset", "configuration_mismatch")
+PROBE_QUEUE_FIELDS = (
+    PROBE_QUEUE_SUM_FIELDS
+    + PROBE_QUEUE_MAX_FIELDS
+    + PROBE_QUEUE_CONFIG_FIELDS
+    + PROBE_QUEUE_FLAG_FIELDS
+)
+EXACT_OM_SUM_FIELDS = (
+    "attempts",
+    "enqueued",
+    "completed",
+    "rejected",
+    "terminal_failures",
+    "materializations",
+    "full_uploads",
+    "full_upload_bytes",
+    "full_downloads",
+    "full_download_bytes",
+    "commits",
+    "backpressure_checks",
+    "nonblocking_reclaims",
+    "blocking_waits",
+    "blocking_wait_ns",
+)
+EXACT_OM_GAUGE_FIELDS = ("pending",)
+EXACT_OM_MAX_FIELDS = ("lifetime_peak_committed", "lifetime_peak_pending")
+EXACT_OM_CONFIG_FIELDS = ("draws_per_command_buffer", "command_buffer_cap")
+EXACT_OM_FLAG_FIELDS = ("enabled", "counter_reset")
+EXACT_OM_FIELDS = (
+    EXACT_OM_FLAG_FIELDS[:1]
+    + EXACT_OM_SUM_FIELDS[:10]
+    + EXACT_OM_GAUGE_FIELDS
+    + EXACT_OM_SUM_FIELDS[10:]
+    + EXACT_OM_MAX_FIELDS
+    + EXACT_OM_CONFIG_FIELDS
+    + EXACT_OM_FLAG_FIELDS[1:]
 )
 
 
@@ -76,7 +150,9 @@ def swap_range(line: str) -> tuple[int, int] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def empty_window(start: int, end: int, data: dict[str, Any]) -> dict[str, Any]:
+def empty_window(
+    start: int, end: int, data: dict[str, Any], source_line: int
+) -> dict[str, Any]:
     return {
         "swap_start": start,
         "swap_end": end,
@@ -87,11 +163,20 @@ def empty_window(start: int, end: int, data: dict[str, Any]) -> dict[str, Any]:
         "stages": {},
         "wait_reasons": {},
         "wait_reg_mem": [],
+        "gpu_chain": None,
+        "probe_queue": None,
+        "exact_output_merger": None,
+        "resolve_mode": None,
         "presenter": [],
+        "source_line": source_line,
         "complete": False,
         "validation_errors": [],
         "_header_count": 1,
         "_stage_counts": defaultdict(int),
+        "_presenter_summary_count": 0,
+        "_probe_queue_count": 0,
+        "_exact_om_count": 0,
+        "_resolve_mode_count": 0,
         "dam_candidate": False,
         "selected": False,
     }
@@ -134,23 +219,233 @@ def validate_window(window: dict[str, Any]) -> list[str]:
                     f"{label}: swap command ledger must contain {PROFILE_WINDOW_SIZE} calls, "
                     f"got {ledger['calls']}"
                 )
+    for stage in REQUIRED_ZERO_STAGES:
+        count = window.get("_stage_counts", {}).get(stage, 0)
+        if count != 1:
+            qualifier = "missing" if count == 0 else f"duplicated {count} times"
+            errors.append(f"{label}: command ledger {stage} is {qualifier}")
+            continue
+        ledger = window["stages"].get(stage, {})
+        missing = [
+            name for name in COMMAND_FIELDS if not is_finite_number(ledger.get(name))
+        ]
+        if missing:
+            errors.append(
+                f"{label}: command ledger {stage} has missing or non-finite fields: "
+                + ", ".join(missing)
+            )
+        elif any(ledger[name] < 0 for name in COMMAND_FIELDS):
+            errors.append(f"{label}: command ledger {stage} contains a negative metric")
+        elif float(ledger["calls"]) != 0:
+            errors.append(
+                f"{label}: command ledger {stage} must contain zero calls, "
+                f"got {ledger['calls']}"
+            )
+
+    presenter_count = window.get("_presenter_summary_count", 0)
+    if presenter_count != 1:
+        qualifier = "missing" if presenter_count == 0 else f"duplicated {presenter_count} times"
+        errors.append(f"{label}: presenter summary is {qualifier}")
+    else:
+        presenter = window["presenter"][0]
+        required_presenter = ("sources", "commits", "drawable_nil", "uploads", "upload_bytes")
+        missing = [
+            name
+            for name in required_presenter
+            if not is_finite_number(presenter.get(name))
+        ]
+        if missing:
+            errors.append(
+                f"{label}: presenter summary has missing or non-finite fields: "
+                + ", ".join(missing)
+            )
+        elif float(presenter["sources"]) <= 0 or float(presenter["commits"]) <= 0:
+            errors.append(
+                f"{label}: presenter made no source/commit progress "
+                f"(sources={presenter['sources']} commits={presenter['commits']})"
+            )
+
+    gpu_chain = window.get("gpu_chain")
+    if gpu_chain is None:
+        errors.append(f"{label}: GPU-chain ledger is missing")
+    else:
+        required_chain = (
+            "wptr_attempts",
+            "wptr_accepted",
+            "wptr_rejected",
+            "ring_batches",
+            "ring_commit_rejected",
+        )
+        missing = [
+            name for name in required_chain if not is_finite_number(gpu_chain.get(name))
+        ]
+        if missing:
+            errors.append(
+                f"{label}: GPU-chain ledger has missing or non-finite fields: "
+                + ", ".join(missing)
+            )
+        else:
+            if float(gpu_chain["wptr_accepted"]) <= 0 or float(gpu_chain["ring_batches"]) <= 0:
+                errors.append(
+                    f"{label}: GPU-chain made no WPTR/ring progress "
+                    f"(accepted={gpu_chain['wptr_accepted']} "
+                    f"batches={gpu_chain['ring_batches']})"
+                )
+            if float(gpu_chain["wptr_attempts"]) < float(gpu_chain["wptr_accepted"]):
+                errors.append(
+                    f"{label}: GPU-chain accepted more WPTR writes than attempted"
+                )
+            for name in ("wptr_rejected", "ring_commit_rejected"):
+                if float(gpu_chain[name]) != 0:
+                    errors.append(f"{label}: GPU-chain {name}={gpu_chain[name]}")
+    probe_queue = window.get("probe_queue")
+    if probe_queue is not None:
+        missing = [
+            name
+            for name in PROBE_QUEUE_FIELDS
+            if not is_finite_number(probe_queue.get(name))
+        ]
+        if missing:
+            errors.append(
+                f"{label}: probe queue ledger has missing or non-finite fields: "
+                + ", ".join(missing)
+            )
+        elif any(
+            float(probe_queue[name]) < 0
+            or not float(probe_queue[name]).is_integer()
+            for name in PROBE_QUEUE_FIELDS
+        ):
+            errors.append(
+                f"{label}: probe queue ledger contains a negative or non-integer metric"
+            )
+        else:
+            if int(probe_queue["contexts"]) <= 0:
+                errors.append(f"{label}: probe queue ledger has no contexts")
+            if int(probe_queue["draws_per_command_buffer"]) not in (64, 128, 256):
+                errors.append(
+                    f"{label}: probe queue draw batch must be 64, 128, or 256"
+                )
+            if int(probe_queue["committed_command_buffer_cap"]) != 4:
+                errors.append(
+                    f"{label}: probe queue committed command-buffer cap must be exactly 4"
+                )
+            for name in PROBE_QUEUE_FLAG_FIELDS:
+                if int(probe_queue[name]) not in (0, 1):
+                    errors.append(f"{label}: probe queue {name} must be 0 or 1")
+    exact_om_count = window.get("_exact_om_count", 0)
+    if exact_om_count > 1:
+        errors.append(
+            f"{label}: exact output-merger ledger is duplicated {exact_om_count} times"
+        )
+    exact_om = window.get("exact_output_merger")
+    if exact_om is not None:
+        missing = [
+            name
+            for name in EXACT_OM_FIELDS
+            if not is_finite_number(exact_om.get(name))
+        ]
+        if missing:
+            errors.append(
+                f"{label}: exact output-merger ledger has missing or non-finite fields: "
+                + ", ".join(missing)
+            )
+        elif any(
+            float(exact_om[name]) < 0
+            or not float(exact_om[name]).is_integer()
+            for name in EXACT_OM_FIELDS
+        ):
+            errors.append(
+                f"{label}: exact output-merger ledger contains a negative or non-integer metric"
+            )
+        else:
+            for name in EXACT_OM_FLAG_FIELDS:
+                if int(exact_om[name]) not in (0, 1):
+                    errors.append(f"{label}: exact output-merger {name} must be 0 or 1")
+            if int(exact_om["enabled"]) == 1:
+                outcomes = sum(
+                    int(exact_om[name])
+                    for name in (
+                        "enqueued",
+                        "completed",
+                        "rejected",
+                        "terminal_failures",
+                    )
+                )
+                if int(exact_om["attempts"]) != outcomes:
+                    errors.append(
+                        f"{label}: exact output-merger attempts must equal "
+                        "enqueued + completed + rejected + terminal_failures"
+                    )
+                if int(exact_om["draws_per_command_buffer"]) != 128:
+                    errors.append(
+                        f"{label}: exact output-merger draw batch must be exactly 128"
+                    )
+                if int(exact_om["command_buffer_cap"]) != 4:
+                    errors.append(
+                        f"{label}: exact output-merger command-buffer cap must be exactly 4"
+                    )
+            if int(exact_om["pending"]) > int(exact_om["lifetime_peak_pending"]):
+                errors.append(
+                    f"{label}: exact output-merger pending exceeds its lifetime peak"
+                )
+            if int(exact_om["lifetime_peak_committed"]) > int(
+                exact_om["command_buffer_cap"]
+            ) and int(exact_om["command_buffer_cap"]) > 0:
+                errors.append(
+                    f"{label}: exact output-merger committed lifetime peak exceeds its cap"
+                )
+            for count_name, bytes_name in (
+                ("full_uploads", "full_upload_bytes"),
+                ("full_downloads", "full_download_bytes"),
+            ):
+                if int(exact_om[count_name]) == 0 and int(exact_om[bytes_name]) != 0:
+                    errors.append(
+                        f"{label}: exact output-merger {bytes_name} is nonzero without "
+                        f"a matching {count_name} operation"
+                    )
     return errors
 
 
-def parse_log(path: Path) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
+def window_is_structurally_closed(window: dict[str, Any]) -> bool:
+    """Return whether every required ledger marker for a window has arrived."""
+    stage_counts = window.get("_stage_counts", {})
+    return (
+        all(stage_counts.get(stage, 0) >= 1 for stage in STAGES + REQUIRED_ZERO_STAGES)
+        and window.get("_presenter_summary_count", 0) >= 1
+        and window.get("gpu_chain") is not None
+    )
+
+
+def parse_log(
+    path: Path, *, defer_open_window: bool = False
+) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
     windows: dict[tuple[int, int], dict[str, Any]] = {}
     ordered: list[tuple[int, int]] = []
     violations: list[str] = []
     counts: dict[str, int] = defaultdict(int)
+    presenter_summaries: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
 
     with path.open("r", encoding="utf-8", errors="replace") as log:
-        for line_number, line in enumerate(log, 1):
+        lines = log.readlines()
+    # A polling reader may observe the writer in the middle of one physical
+    # line. That byte fragment is not evidence and will be parsed on the next
+    # poll once its newline has arrived.
+    if defer_open_window and lines and not lines[-1].endswith(("\n", "\r")):
+        lines.pop()
+    for line_number, line in enumerate(lines, 1):
             # Fallback counters are emitted by the resolver outside the profile ledger.
             values = fields(line)
             fallback = values.get("fallbacks")
             if isinstance(fallback, (int, float)) and fallback > 0:
                 violations.append(f"line {line_number}: fallbacks={fallback}")
                 counts["fallbacks"] += int(fallback)
+            for field_name in ("depth_fallbacks", "host_fallback", "ps_fallback"):
+                fallback_value = values.get(field_name)
+                if isinstance(fallback_value, (int, float)) and fallback_value > 0:
+                    violations.append(
+                        f"line {line_number}: {field_name}={fallback_value}"
+                    )
+                    counts[field_name] += int(fallback_value)
 
             if PROFILE not in line:
                 if re.search(r"drawable[^\n]*(?:nil|fail(?:ed|ure)?)", line, re.I):
@@ -173,7 +468,7 @@ def parse_log(path: Path) -> tuple[list[dict[str, Any]], list[str], dict[str, in
                     counts["malformed_profile_lines"] += 1
                     continue
                 if key not in windows:
-                    windows[key] = empty_window(*key, values)
+                    windows[key] = empty_window(*key, values, line_number)
                     ordered.append(key)
                 else:
                     windows[key]["_header_count"] += 1
@@ -189,12 +484,151 @@ def parse_log(path: Path) -> tuple[list[dict[str, Any]], list[str], dict[str, in
                     event = str(values.get("event", "unknown"))
                     window["stages"][event] = values
                     window["_stage_counts"][event] += 1
+                    if event == "texture_fallback_decode":
+                        calls = values.get("calls", 0)
+                        if isinstance(calls, (int, float)) and calls > 0:
+                            violations.append(
+                                f"line {line_number}: texture fallback decode calls={calls}"
+                            )
+                            counts["texture_fallback_decodes"] += int(calls)
                 elif str(values.get("event", "unknown")) in EXPORTED_STAGES:
                     violations.append(
                         f"line {line_number}: command ledger has no matching window: "
                         f"swaps {key[0]}-{key[1]}"
                     )
                     counts["orphan_command_ledgers"] += 1
+                continue
+
+            if " gpu-chain " in f" {line} ":
+                if not key:
+                    violations.append(f"line {line_number}: malformed GPU chain ledger range")
+                    counts["malformed_profile_lines"] += 1
+                    continue
+                window = windows.get(key)
+                if not window:
+                    violations.append(
+                        f"line {line_number}: GPU chain ledger has no matching window: "
+                        f"swaps {key[0]}-{key[1]}"
+                    )
+                    counts["orphan_gpu_chain_ledgers"] += 1
+                    continue
+                if window["gpu_chain"] is not None:
+                    violations.append(
+                        f"line {line_number}: duplicate GPU chain ledger: "
+                        f"swaps {key[0]}-{key[1]}"
+                    )
+                    counts["duplicate_gpu_chain_ledgers"] += 1
+                    continue
+                ledger = {name: value for name, value in values.items() if name != "swaps"}
+                invalid = [
+                    name
+                    for name, value in ledger.items()
+                    if not is_finite_number(value) or value < 0
+                ]
+                if invalid:
+                    violations.append(
+                        f"line {line_number}: GPU chain ledger has invalid fields: "
+                        + ", ".join(invalid)
+                    )
+                    counts["invalid_gpu_chain_ledgers"] += 1
+                window["gpu_chain"] = ledger
+                continue
+
+            if " probe-queue " in f" {line} ":
+                if not key:
+                    violations.append(
+                        f"line {line_number}: malformed probe queue ledger range"
+                    )
+                    counts["malformed_profile_lines"] += 1
+                    continue
+                window = windows.get(key)
+                if not window:
+                    violations.append(
+                        f"line {line_number}: probe queue ledger has no matching window: "
+                        f"swaps {key[0]}-{key[1]}"
+                    )
+                    counts["orphan_probe_queue_ledgers"] += 1
+                    continue
+                window["_probe_queue_count"] += 1
+                if window["_probe_queue_count"] > 1:
+                    violations.append(
+                        f"line {line_number}: duplicate probe queue ledger: "
+                        f"swaps {key[0]}-{key[1]}"
+                    )
+                    counts["duplicate_probe_queue_ledgers"] += 1
+                    continue
+                window["probe_queue"] = {
+                    name: values.get(name) for name in PROBE_QUEUE_FIELDS
+                }
+                continue
+
+            if " exact-om " in f" {line} ":
+                if not key:
+                    violations.append(
+                        f"line {line_number}: malformed exact output-merger ledger range"
+                    )
+                    counts["malformed_profile_lines"] += 1
+                    continue
+                window = windows.get(key)
+                if not window:
+                    violations.append(
+                        f"line {line_number}: exact output-merger ledger has no matching window: "
+                        f"swaps {key[0]}-{key[1]}"
+                    )
+                    counts["orphan_exact_output_merger_ledgers"] += 1
+                    continue
+                window["_exact_om_count"] += 1
+                if window["_exact_om_count"] > 1:
+                    violations.append(
+                        f"line {line_number}: duplicate exact output-merger ledger: "
+                        f"swaps {key[0]}-{key[1]}"
+                    )
+                    counts["duplicate_exact_output_merger_ledgers"] += 1
+                    continue
+                window["exact_output_merger"] = {
+                    name: values.get(name) for name in EXACT_OM_FIELDS
+                }
+                continue
+
+            if " resolve-mode " in f" {line} ":
+                if not key:
+                    violations.append(
+                        f"line {line_number}: malformed resolve-mode ledger range"
+                    )
+                    counts["malformed_profile_lines"] += 1
+                    continue
+                window = windows.get(key)
+                if not window:
+                    violations.append(
+                        f"line {line_number}: resolve-mode ledger has no matching window: "
+                        f"swaps {key[0]}-{key[1]}"
+                    )
+                    counts["orphan_resolve_mode_ledgers"] += 1
+                    continue
+                window["_resolve_mode_count"] += 1
+                if window["_resolve_mode_count"] > 1:
+                    violations.append(
+                        f"line {line_number}: duplicate resolve-mode ledger: "
+                        f"swaps {key[0]}-{key[1]}"
+                    )
+                    counts["duplicate_resolve_mode_ledgers"] += 1
+                    continue
+                ledger = {name: values.get(name) for name in RESOLVE_MODE_FIELDS}
+                invalid = [
+                    name
+                    for name, value in ledger.items()
+                    if not is_finite_number(value) or value < 0
+                ]
+                if invalid:
+                    violations.append(
+                        f"line {line_number}: resolve-mode ledger has invalid fields: "
+                        + ", ".join(invalid)
+                    )
+                    counts["invalid_resolve_mode_ledgers"] += 1
+                    continue
+                window["resolve_mode"] = {
+                    name: int(ledger[name]) for name in RESOLVE_MODE_FIELDS
+                }
                 continue
 
             if " wait swaps=" in line and key:
@@ -225,14 +659,25 @@ def parse_log(path: Path) -> tuple[list[dict[str, Any]], list[str], dict[str, in
                         f"line {line_number}: presenter full-frame upload_bytes={upload_bytes}"
                     )
                     counts["presenter_upload_bytes"] += int(upload_bytes)
+                if "event" not in values:
+                    presenter_summaries[key].append(values)
                 continue
 
     result = [windows[key] for key in ordered]
-    for window in result:
+    for index, window in enumerate(result):
+        key = (int(window["swap_start"]), int(window["swap_end"]))
+        window["presenter"] = presenter_summaries.get(key, [])
+        window["_presenter_summary_count"] = len(window["presenter"])
         errors = validate_window(window)
         window["validation_errors"] = errors
         window["complete"] = not errors
-        if errors:
+        is_open_tail = (
+            defer_open_window
+            and index == len(result) - 1
+            and not window_is_structurally_closed(window)
+        )
+        window["pending_ledgers"] = is_open_tail
+        if errors and not is_open_tail:
             violations.extend(errors)
             counts["invalid_profile_windows"] += 1
         copy = window["stages"].get("copy", {})
@@ -243,6 +688,10 @@ def parse_log(path: Path) -> tuple[list[dict[str, Any]], list[str], dict[str, in
         # Internal parser bookkeeping should not leak into JSON/CSV consumers.
         window.pop("_header_count", None)
         window.pop("_stage_counts", None)
+        window.pop("_presenter_summary_count", None)
+        window.pop("_probe_queue_count", None)
+        window.pop("_exact_om_count", None)
+        window.pop("_resolve_mode_count", None)
     return result, violations, dict(counts)
 
 
@@ -406,6 +855,10 @@ def aggregate(selected: list[dict[str, Any]]) -> dict[str, Any]:
         "stages": {},
         "sampled_stages": {},
         "wait_reasons": {},
+        "gpu_chain": None,
+        "probe_queue": None,
+        "exact_output_merger": None,
+        "resolve_mode": None,
     }
     fps = finite_values([window.get("fps") for window in selected])
     output["metric_samples"]["fps"] = len(fps)
@@ -460,7 +913,7 @@ def aggregate(selected: list[dict[str, Any]]) -> dict[str, Any]:
     else:
         output["frame_pacing"] = None
 
-    for stage in STAGES:
+    for stage in STAGES + REQUIRED_ZERO_STAGES:
         metrics = [w["stages"].get(stage, {}) for w in selected]
         calls = finite_values([metric.get("calls") for metric in metrics])
         total_ns = finite_values([metric.get("total_ns") for metric in metrics])
@@ -525,8 +978,215 @@ def aggregate(selected: list[dict[str, Any]]) -> dict[str, Any]:
                 finite_values([metric.get("max_call_ns") for metric in metrics]), default=0
             ),
         }
+
+    gpu_chain_ledgers = [
+        window["gpu_chain"] for window in selected if window.get("gpu_chain") is not None
+    ]
+    if gpu_chain_ledgers:
+        names = sorted({name for ledger in gpu_chain_ledgers for name in ledger})
+        gpu_chain: dict[str, Any] = {}
+        for name in names:
+            values = finite_values([ledger.get(name) for ledger in gpu_chain_ledgers])
+            if not values:
+                continue
+            if name in GPU_CHAIN_MAX_FIELDS:
+                gpu_chain[name] = max(values)
+            elif name in GPU_CHAIN_LIVE_FIELDS:
+                gpu_chain[name] = values[-1]
+            else:
+                gpu_chain[name] = sum(values)
+        worker_samples = gpu_chain.get("wptr_to_worker_samples", 0)
+        interrupt_samples = gpu_chain.get("interrupt_to_wptr_samples", 0)
+        metal_samples = gpu_chain.get("metal_pending_samples", 0)
+        throttle_calls = gpu_chain.get("throttle_calls", 0)
+        gpu_chain["wptr_to_worker_mean_ns"] = (
+            gpu_chain.get("wptr_to_worker_total_ns", 0) / worker_samples
+            if worker_samples
+            else None
+        )
+        gpu_chain["interrupt_to_wptr_mean_ns"] = (
+            gpu_chain.get("interrupt_to_wptr_total_ns", 0) / interrupt_samples
+            if interrupt_samples
+            else None
+        )
+        gpu_chain["metal_pending_mean"] = (
+            gpu_chain.get("metal_pending_total", 0) / metal_samples
+            if metal_samples
+            else None
+        )
+        gpu_chain["throttle_actual_mean_ns"] = (
+            gpu_chain.get("throttle_actual_ns", 0) / throttle_calls
+            if throttle_calls
+            else None
+        )
+        output["gpu_chain"] = gpu_chain
+    probe_queue_ledgers = [
+        window["probe_queue"]
+        for window in selected
+        if window.get("probe_queue") is not None
+    ]
+    if probe_queue_ledgers:
+        probe_queue: dict[str, Any] = {
+            "windows_reported": len(probe_queue_ledgers),
+        }
+        for name in PROBE_QUEUE_SUM_FIELDS:
+            probe_queue[name] = int(
+                sum(finite_values([ledger.get(name) for ledger in probe_queue_ledgers]))
+            )
+        for name in PROBE_QUEUE_MAX_FIELDS:
+            probe_queue[name] = int(
+                max(
+                    finite_values([ledger.get(name) for ledger in probe_queue_ledgers]),
+                    default=0,
+                )
+            )
+        for name in PROBE_QUEUE_CONFIG_FIELDS:
+            values = sorted(
+                {
+                    int(value)
+                    for value in finite_values(
+                        [ledger.get(name) for ledger in probe_queue_ledgers]
+                    )
+                }
+            )
+            probe_queue[name] = values[0] if len(values) == 1 else None
+            probe_queue[f"{name}_values"] = values
+        probe_queue["counter_reset_windows"] = int(
+            sum(
+                finite_values(
+                    [ledger.get("counter_reset") for ledger in probe_queue_ledgers]
+                )
+            )
+        )
+        probe_queue["configuration_mismatch_windows"] = int(
+            sum(
+                finite_values(
+                    [
+                        ledger.get("configuration_mismatch")
+                        for ledger in probe_queue_ledgers
+                    ]
+                )
+            )
+        )
+        blocking_waits = probe_queue["blocking_waits"]
+        probe_queue["blocking_wait_mean_ns"] = (
+            probe_queue["blocking_wait_ns"] / blocking_waits
+            if blocking_waits
+            else None
+        )
+        output["probe_queue"] = probe_queue
+    exact_om_ledgers = [
+        window["exact_output_merger"]
+        for window in selected
+        if window.get("exact_output_merger") is not None
+    ]
+    if exact_om_ledgers:
+        exact_om: dict[str, Any] = {
+            "windows_reported": len(exact_om_ledgers),
+            "enabled_windows": sum(
+                int(ledger["enabled"]) for ledger in exact_om_ledgers
+            ),
+        }
+        exact_om["disabled_windows"] = (
+            exact_om["windows_reported"] - exact_om["enabled_windows"]
+        )
+        for name in EXACT_OM_SUM_FIELDS:
+            exact_om[name] = int(
+                sum(finite_values([ledger.get(name) for ledger in exact_om_ledgers]))
+            )
+        pending_values = finite_values(
+            [ledger.get("pending") for ledger in exact_om_ledgers]
+        )
+        exact_om["pending"] = int(pending_values[-1]) if pending_values else None
+        exact_om["pending_max"] = (
+            int(max(pending_values)) if pending_values else None
+        )
+        for name in EXACT_OM_MAX_FIELDS:
+            exact_om[name] = int(
+                max(
+                    finite_values([ledger.get(name) for ledger in exact_om_ledgers]),
+                    default=0,
+                )
+            )
+        enabled_ledgers = [
+            ledger for ledger in exact_om_ledgers if int(ledger["enabled"]) == 1
+        ]
+        configuration_ledgers = enabled_ledgers or exact_om_ledgers
+        for name in EXACT_OM_CONFIG_FIELDS:
+            values = sorted(
+                {
+                    int(value)
+                    for value in finite_values(
+                        [ledger.get(name) for ledger in configuration_ledgers]
+                    )
+                }
+            )
+            exact_om[name] = values[0] if len(values) == 1 else None
+            exact_om[f"{name}_values"] = values
+        exact_om["counter_reset_windows"] = int(
+            sum(
+                finite_values(
+                    [ledger.get("counter_reset") for ledger in exact_om_ledgers]
+                )
+            )
+        )
+        blocking_waits = exact_om["blocking_waits"]
+        exact_om["blocking_wait_mean_ns"] = (
+            exact_om["blocking_wait_ns"] / blocking_waits
+            if blocking_waits
+            else None
+        )
+        output["exact_output_merger"] = exact_om
+    resolve_modes = [
+        window["resolve_mode"]
+        for window in selected
+        if window.get("resolve_mode") is not None
+    ]
+    if resolve_modes:
+        resolve_mode = {
+            name: int(sum(mode[name] for mode in resolve_modes))
+            for name in RESOLVE_MODE_FIELDS
+        }
+        resolve_mode["windows_reported"] = len(resolve_modes)
+        total = resolve_mode["async"] + resolve_mode["sync"]
+        resolve_mode["async_percent"] = (
+            resolve_mode["async"] / total * 100.0 if total else None
+        )
+        output["resolve_mode"] = resolve_mode
     output["wait_reg_mem"] = aggregate_wait_reg_mem(selected, elapsed_ns)
     return output
+
+
+def probe_queue_comparison_violations(
+    aggregate_data: Mapping[str, Any],
+) -> list[str]:
+    """Reject incomplete or reset queue telemetry before an A/B comparison."""
+    expected = int(aggregate_data.get("windows", 0))
+    queue = aggregate_data.get("probe_queue")
+    if not isinstance(queue, Mapping):
+        return ["probe queue telemetry is missing"]
+    problems: list[str] = []
+    if int(queue.get("windows_reported", 0)) != expected:
+        problems.append(
+            "probe queue telemetry has incomplete windows: "
+            f"expected {expected}, got {queue.get('windows_reported', 0)}"
+        )
+    if int(queue.get("counter_reset_windows", 0)):
+        problems.append(
+            "probe queue cumulative counters reset or the context cohort changed "
+            f"in {queue['counter_reset_windows']} selected window(s)"
+        )
+    if int(queue.get("configuration_mismatch_windows", 0)):
+        problems.append(
+            "probe queue configuration differed between contexts in "
+            f"{queue['configuration_mismatch_windows']} selected window(s)"
+        )
+    if queue.get("draws_per_command_buffer") not in (64, 128, 256):
+        problems.append("probe queue draw-batch configuration is missing or invalid")
+    cap = queue.get("committed_command_buffer_cap")
+    if not is_finite_number(cap) or int(cap) != 4:
+        problems.append("probe queue command-buffer cap must be exactly 4")
+    return problems
 
 
 def performance_violations(
@@ -625,6 +1285,9 @@ def write_outputs(
         "status": "pass" if not issues else "fail",
         "requirements": {
             "dam_copy_avg_calls_per_swap_at_least": 10,
+            "presenter_sources_and_commits_positive": True,
+            "gpu_chain_required_and_rejects_zero": True,
+            "texture_fallback_decode_calls": 0,
             "discard_dam_windows": warmup,
             "measure_dam_windows": measure,
             "min_mean_fps": min_mean_fps,
@@ -644,7 +1307,7 @@ def write_outputs(
     with (output / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    reported_stages = STAGES + tuple(
+    reported_stages = STAGES + REQUIRED_ZERO_STAGES + tuple(
         stage
         for stage in SAMPLED_STAGES
         if any(stage in window.get("stages", {}) for window in windows)
@@ -652,6 +1315,9 @@ def write_outputs(
     columns = ["swap_start", "swap_end", "dam_candidate", "selected", "fps", "elapsed_ns", "avg_frame_ns"]
     for stage in reported_stages:
         columns += [f"{stage}_{field}" for field in ("calls", "avg_calls_per_swap", "total_ns", "avg_ns_per_swap", "max_call_ns", "max_swap_ns")]
+    columns += [f"probe_queue_{name}" for name in PROBE_QUEUE_FIELDS]
+    columns += [f"exact_om_{name}" for name in EXACT_OM_FIELDS]
+    columns += [f"resolve_{name}" for name in RESOLVE_MODE_FIELDS]
     with (output / "windows.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
@@ -660,6 +1326,15 @@ def write_outputs(
             for stage in reported_stages:
                 for field in ("calls", "avg_calls_per_swap", "total_ns", "avg_ns_per_swap", "max_call_ns", "max_swap_ns"):
                     row[f"{stage}_{field}"] = stage_value(window, stage, field)
+            probe_queue = window.get("probe_queue") or {}
+            for name in PROBE_QUEUE_FIELDS:
+                row[f"probe_queue_{name}"] = probe_queue.get(name, "")
+            exact_om = window.get("exact_output_merger") or {}
+            for name in EXACT_OM_FIELDS:
+                row[f"exact_om_{name}"] = exact_om.get(name, "")
+            resolve_mode = window.get("resolve_mode") or {}
+            for name in RESOLVE_MODE_FIELDS:
+                row[f"resolve_{name}"] = resolve_mode.get(name, "")
             writer.writerow(row)
     with (output / "summary.txt").open("w", encoding="utf-8") as handle:
         handle.write(f"status: {summary['status']}\nDam windows: {summary['observed']['dam_windows']} (selected {len(selected)}/{measure})\n")
@@ -679,6 +1354,66 @@ def write_outputs(
                 f"p95={format_metric(pacing.get('window_p95_frame_ms'), suffix='ms')} "
                 f"p99={format_metric(pacing.get('window_p99_frame_ms'), suffix='ms')} "
                 f"window-1%-low={format_metric(pacing.get('window_one_percent_low_fps'), suffix='fps')}\n"
+            )
+        if summary["aggregate"]["gpu_chain"]:
+            chain = summary["aggregate"]["gpu_chain"]
+            handle.write(
+                "GPU chain: "
+                f"WPTR={int(chain.get('wptr_accepted', 0))} "
+                f"batches={int(chain.get('ring_batches', 0))} "
+                f"coalesced={int(chain.get('wptr_coalesced', 0))} "
+                f"concurrent={int(chain.get('ring_concurrent_wptr', 0))} "
+                f"interrupt-pairs={int(chain.get('interrupt_to_wptr_samples', 0))} "
+                f"mean-handoff={format_metric(chain.get('interrupt_to_wptr_mean_ns') / 1_000.0 if is_finite_number(chain.get('interrupt_to_wptr_mean_ns')) else None, suffix='us')} "
+                f"mean-handoff-wait={format_metric(chain.get('throttle_actual_mean_ns') / 1_000.0 if is_finite_number(chain.get('throttle_actual_mean_ns')) else None, suffix='us')} "
+                f"handoff-wakes={int(chain.get('throttle_wptr_wakes', 0))} "
+                f"handoff-timeouts={int(chain.get('throttle_timeouts', 0))} "
+                f"Metal-pending-max={int(chain.get('metal_pending_max', 0))}\n"
+            )
+        if summary["aggregate"]["probe_queue"]:
+            queue = summary["aggregate"]["probe_queue"]
+            blocking_wait_ns = queue.get("blocking_wait_ns")
+            handle.write(
+                "probe queue: "
+                f"draw-batch={queue.get('draws_per_command_buffer', 'n/a')} "
+                f"command-buffer-cap={queue.get('committed_command_buffer_cap', 'n/a')} "
+                f"commits={int(queue.get('commits', 0))} "
+                f"blocking-waits={int(queue.get('blocking_waits', 0))} "
+                f"blocking-time={format_metric(float(blocking_wait_ns) / 1_000_000.0 if is_finite_number(blocking_wait_ns) else None, suffix='ms')} "
+                f"WAIT_REG_MEM-signals={int(queue.get('wait_reg_mem_signals', 0))} "
+                f"timeouts={int(queue.get('wait_reg_mem_timeouts', 0))} "
+                f"resets={int(queue.get('counter_reset_windows', 0))}\n"
+            )
+        if summary["aggregate"]["exact_output_merger"]:
+            exact_om = summary["aggregate"]["exact_output_merger"]
+            blocking_wait_ns = exact_om.get("blocking_wait_ns")
+            handle.write(
+                "exact output merger: "
+                f"enabled-windows={int(exact_om.get('enabled_windows', 0))} "
+                f"attempts={int(exact_om.get('attempts', 0))} "
+                f"enqueued={int(exact_om.get('enqueued', 0))} "
+                f"completed={int(exact_om.get('completed', 0))} "
+                f"rejected={int(exact_om.get('rejected', 0))} "
+                f"terminal-failures={int(exact_om.get('terminal_failures', 0))} "
+                f"materializations={int(exact_om.get('materializations', 0))} "
+                f"pending={exact_om.get('pending', 'n/a')} "
+                f"commits={int(exact_om.get('commits', 0))} "
+                f"blocking-waits={int(exact_om.get('blocking_waits', 0))} "
+                f"blocking-time={format_metric(float(blocking_wait_ns) / 1_000_000.0 if is_finite_number(blocking_wait_ns) else None, suffix='ms')} "
+                f"draw-batch={exact_om.get('draws_per_command_buffer', 'n/a')} "
+                f"command-buffer-cap={exact_om.get('command_buffer_cap', 'n/a')} "
+                f"resets={int(exact_om.get('counter_reset_windows', 0))}\n"
+            )
+        if summary["aggregate"]["resolve_mode"]:
+            resolve_mode = summary["aggregate"]["resolve_mode"]
+            handle.write(
+                "tiled resolve mode: "
+                f"async={resolve_mode['async']} sync={resolve_mode['sync']} "
+                f"async-share={format_metric(resolve_mode.get('async_percent'), digits=2, suffix='%')} "
+                f"missing-snapshot={resolve_mode['missing_snapshot']} "
+                f"verbose={resolve_mode['verbose']} "
+                f"missing-alias={resolve_mode['missing_alias']} "
+                f"exact-snapshot={resolve_mode['exact_snapshot']}\n"
             )
         for stage, values in summary["aggregate"]["sampled_stages"].items():
             median_window_ns = values.get("median_window_mean_ns_per_sample")
@@ -728,15 +1463,24 @@ def command_text(argv: list[str]) -> str:
 
 
 def tracked_build_sources(repo: Path) -> dict[str, list[Path]]:
-    """Return tracked sources which can affect the runtime or GoldenEye app build.
+    """Return worktree sources which can affect the runtime or app build.
 
-    Tests, documentation, release prose, and untracked/generated local files are
-    intentionally excluded so freshness checks only react to build inputs under
-    version control.
+    Both tracked and non-ignored untracked files are considered. This matters
+    during development: a newly added header or release manifest can already be
+    compiled into (or required by) the app before its first commit.
     """
     repo = repo.resolve()
     result = subprocess.run(
-        ["git", "-C", str(repo), "ls-files", "-z"],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -744,7 +1488,7 @@ def tracked_build_sources(repo: Path) -> dict[str, list[Path]]:
     if result.returncode:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"cannot enumerate tracked build sources: {detail or 'git failed'}")
-    tracked = [
+    candidates = [
         Path(value.decode("utf-8", errors="surrogateescape"))
         for value in result.stdout.split(b"\0")
         if value
@@ -758,6 +1502,11 @@ def tracked_build_sources(repo: Path) -> dict[str, list[Path]]:
         Path("CMakePresets.json"),
         Path("ge_config.toml"),
         Path("ge_manifest.toml"),
+    }
+    release_manifest = Path("config/goldeneye-release.json")
+    root_app_build_inputs = {
+        Path("launcher/build-app.sh"),
+        Path("tools/sign-notarize.sh"),
     }
 
     def excluded(relative: Path) -> bool:
@@ -799,7 +1548,7 @@ def tracked_build_sources(repo: Path) -> dict[str, list[Path]]:
             ".s",
         }
 
-    for relative in tracked:
+    for relative in candidates:
         parts = relative.parts
         if not parts or excluded(relative):
             continue
@@ -809,6 +1558,12 @@ def tracked_build_sources(repo: Path) -> dict[str, list[Path]]:
         if parts[0] == "thirdparty" and thirdparty_build_input(relative):
             runtime.append(repo / relative)
             continue
+        if relative == release_manifest:
+            app.append(repo / relative)
+            continue
+        if relative in root_app_build_inputs:
+            app.append(repo / relative)
+            continue
         try:
             app_relative = relative.relative_to(app_root)
         except ValueError:
@@ -816,9 +1571,20 @@ def tracked_build_sources(repo: Path) -> dict[str, list[Path]]:
         app_parts = app_relative.parts
         if not app_parts:
             continue
-        if app_relative in app_configs or app_parts[0] in {"src", "generated"}:
+        if (
+            app_relative in app_configs
+            or app_parts[0] in {"src", "generated", "packaging"}
+            or (
+                app_parts[0] == "assets"
+                and relative.suffix.lower()
+                in {".icns", ".json", ".metal", ".png", ".plist", ".xcassets"}
+            )
+        ):
             app.append(repo / relative)
-    return {"runtime": sorted(runtime), "goldeneye_app": sorted(app)}
+    return {
+        "runtime": sorted(set(runtime)),
+        "goldeneye_app": sorted(set(app)),
+    }
 
 
 def build_freshness_report(repo: Path, dylib: Path, executable: Path) -> dict[str, Any]:
@@ -861,6 +1627,9 @@ def build_freshness_report(repo: Path, dylib: Path, executable: Path) -> dict[st
         results[name] = {
             "artifact": str(artifact),
             "artifact_mtime_ns": artifact_mtime_ns,
+            "source_count": len(sources),
+            # Retained for downstream readers written before untracked
+            # build-critical inputs were included.
             "tracked_source_count": len(sources),
             "newest_source": str(newest.relative_to(repo)) if newest else None,
             "newest_source_mtime_ns": newest.stat().st_mtime_ns if newest else None,

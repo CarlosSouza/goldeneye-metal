@@ -32,6 +32,8 @@ REXCVAR_DEFINE_BOOL(gpu_debug_markers, false, "GPU",
                     "Insert debug markers into GPU command streams for tools "
                     "like PIX and RenderDoc. Automatically enabled when "
                     "RenderDoc is detected.");
+REXCVAR_DEFINE_BOOL(metal_exact_output_merger, false, "GPU/Metal",
+                    "Enable the experimental exact Xenos EDRAM output merger");
 
 bool IsGpuDebugMarkersEnabled() {
   static bool cached = false;

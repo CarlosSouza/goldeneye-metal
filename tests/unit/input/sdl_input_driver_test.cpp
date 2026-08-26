@@ -237,13 +237,14 @@ class SDLDriverFixture {
 
 class ScopedHarnessEnvironment {
  public:
-  explicit ScopedHarnessEnvironment(int command_fd) {
+  explicit ScopedHarnessEnvironment(int command_fd, uint32_t pad_count = 2) {
     Save("REX_INPUT_TEST_HARNESS");
     Save("REX_TEST_VIRTUAL_GAMEPADS");
     Save("REX_TEST_VIRTUAL_GAMEPAD_FD");
     const std::string descriptor = std::to_string(command_fd);
     setenv("REX_INPUT_TEST_HARNESS", "1", 1);
-    setenv("REX_TEST_VIRTUAL_GAMEPADS", "2", 1);
+    const std::string count = std::to_string(pad_count);
+    setenv("REX_TEST_VIRTUAL_GAMEPADS", count.c_str(), 1);
     setenv("REX_TEST_VIRTUAL_GAMEPAD_FD", descriptor.c_str(), 1);
   }
 
@@ -271,6 +272,40 @@ class ScopedHarnessEnvironment {
 }  // namespace
 
 #if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+
+TEST_CASE("SDL developer harness drives one gameplay pad through the normal input path",
+          "[input][sdl][gameplay][harness]") {
+  int command_pipe[2] = {-1, -1};
+  REQUIRE(pipe(command_pipe) == 0);
+  struct ClosePipe {
+    int* descriptors;
+    ~ClosePipe() {
+      for (size_t index = 0; index < 2; ++index) {
+        if (descriptors[index] >= 0) {
+          close(descriptors[index]);
+        }
+      }
+    }
+  } close_pipe{command_pipe};
+  ScopedHarnessEnvironment environment(command_pipe[0], 1);
+
+  {
+    SDLDriverFixture fixture;
+    command_pipe[0] = -1;
+    // SDL's vertical axes are negative when the stick is pushed up. The input
+    // driver converts that to the positive Xbox Y convention used by the game.
+    const std::string command = "SET_AXIS 1 1 LY -24000\n";
+    REQUIRE(write(command_pipe[1], command.data(), command.size()) ==
+            static_cast<ssize_t>(command.size()));
+
+    X_INPUT_STATE state = {};
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    CHECK(static_cast<int16_t>(state.gamepad.thumb_ly) == 23999);
+    CHECK(fixture.Poll(1, state) == X_ERROR_DEVICE_NOT_CONNECTED);
+  }
+}
 
 TEST_CASE("SDL developer harness drives two pads through the normal input path",
           "[input][sdl][multiplayer][harness]") {
@@ -344,6 +379,90 @@ TEST_CASE("SDL developer harness drives two pads through the normal input path",
     fixture.context.ExecutePendingFunctionsFromUIThread();
     REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
     CHECK(static_cast<int16_t>(state.gamepad.thumb_lx) == 22222);
+  }
+}
+
+TEST_CASE("SDL developer harness hotplugs a pad into its vacant guest slot",
+          "[input][sdl][multiplayer][harness][hotplug]") {
+  int command_pipe[2] = {-1, -1};
+  REQUIRE(pipe(command_pipe) == 0);
+  struct ClosePipe {
+    int* descriptors;
+    ~ClosePipe() {
+      for (size_t index = 0; index < 2; ++index) {
+        if (descriptors[index] >= 0) {
+          close(descriptors[index]);
+        }
+      }
+    }
+  } close_pipe{command_pipe};
+  ScopedHarnessEnvironment environment(command_pipe[0]);
+
+  {
+    SDLDriverFixture fixture;
+    command_pipe[0] = -1;
+
+    const std::string initial_input =
+        "SET_BUTTON 1 1 SOUTH 1\n"
+        "SET_BUTTON 2 2 EAST 1\n";
+    REQUIRE(write(command_pipe[1], initial_input.data(), initial_input.size()) ==
+            static_cast<ssize_t>(initial_input.size()));
+
+    X_INPUT_STATE state = {};
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_A) != 0);
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_B) != 0);
+
+    const std::string disconnect = "DISCONNECT 3 1\n";
+    REQUIRE(write(command_pipe[1], disconnect.data(), disconnect.size()) ==
+            static_cast<ssize_t>(disconnect.size()));
+    REQUIRE(fixture.PollDisconnected(0, state) == X_ERROR_DEVICE_NOT_CONNECTED);
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_B) != 0);
+
+    // Input cannot be applied to a detached pad, and a rejected command must
+    // not consume its sequence number.
+    const std::string rejected_input = "SET_AXIS 4 1 LX 18000\n";
+    REQUIRE(write(command_pipe[1], rejected_input.data(), rejected_input.size()) ==
+            static_cast<ssize_t>(rejected_input.size()));
+    REQUIRE(fixture.PollDisconnected(0, state) == X_ERROR_DEVICE_NOT_CONNECTED);
+
+    const std::string reconnect = "CONNECT 4 1\n";
+    REQUIRE(write(command_pipe[1], reconnect.data(), reconnect.size()) ==
+            static_cast<ssize_t>(reconnect.size()));
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    CHECK(state.gamepad.buttons == 0);
+    CHECK(state.gamepad.left_trigger == 0);
+    CHECK(state.gamepad.right_trigger == 0);
+    CHECK(state.gamepad.thumb_lx == 0);
+    CHECK(state.gamepad.thumb_ly >= -1);
+    CHECK(state.gamepad.thumb_ly <= 1);
+    CHECK(state.gamepad.thumb_rx == 0);
+    CHECK(state.gamepad.thumb_ry >= -1);
+    CHECK(state.gamepad.thumb_ry <= 1);
+
+    // The reattached logical player reclaims the original vacancy without
+    // renumbering the surviving player, then accepts fresh input normally.
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_B) != 0);
+    const std::string reconnected_input =
+        "SET_AXIS 5 1 LX 18000\n"
+        "SET_BUTTON 6 1 NORTH 1\n";
+    REQUIRE(write(command_pipe[1], reconnected_input.data(), reconnected_input.size()) ==
+            static_cast<ssize_t>(reconnected_input.size()));
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    fixture.context.ExecutePendingFunctionsFromUIThread();
+    REQUIRE(fixture.Poll(0, state) == X_ERROR_SUCCESS);
+    CHECK(static_cast<int16_t>(state.gamepad.thumb_lx) == 18000);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_Y) != 0);
+    REQUIRE(fixture.Poll(1, state) == X_ERROR_SUCCESS);
+    CHECK((static_cast<uint16_t>(state.gamepad.buttons) & X_INPUT_GAMEPAD_B) != 0);
   }
 }
 

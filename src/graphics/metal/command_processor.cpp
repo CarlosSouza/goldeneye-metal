@@ -25,6 +25,9 @@
 #include <sys/stat.h>
 
 #include <rex/graphics/flags.h>
+#include <rex/graphics/resolve_route.h>
+#include <rex/graphics/metal/exact_output_merger_state.h>
+#include <rex/graphics/metal/mrt_route.h>
 #include <rex/graphics/metal/msl_compiler.h>
 #include <rex/graphics/metal/sampler_util.h>
 #include <rex/graphics/metal/texture_decode_validation.h>
@@ -64,31 +67,6 @@ constexpr uint32_t kMaxAsyncProbeSubmissionsBetweenGlobalWaits = 2048;
 // pipeline discovery so a long session eventually reaches disk.
 constexpr uint64_t kPipelineArchiveQuietSwaps = 120;
 constexpr uint64_t kPipelineArchiveMaximumDirtySwaps = 600;
-
-uint64_t GetCompatibleExactResolvedSurfaceFetchKey(const xenos::xe_gpu_texture_fetch_t& fetch) {
-  if (fetch.type != xenos::FetchConstantType::kTexture || !fetch.tiled ||
-      fetch.format != xenos::TextureFormat::k_8_8_8_8 ||
-      fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked || fetch.packed_mips ||
-      fetch.mip_address || fetch.mip_min_level || fetch.mip_max_level ||
-      texture_util::IsAnySignSigned(texture_util::SwizzleSigns(fetch))) {
-    return 0;
-  }
-  uint32_t width_minus_1 = 0;
-  uint32_t height_minus_1 = 0;
-  uint32_t depth_or_array_size_minus_1 = 0;
-  uint32_t base_page = 0;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, &width_minus_1, &height_minus_1,
-                                                 &depth_or_array_size_minus_1, &base_page, nullptr,
-                                                 nullptr, nullptr);
-  uint32_t width = width_minus_1 + 1;
-  uint32_t height = height_minus_1 + 1;
-  uint32_t pitch = uint32_t(fetch.pitch) << 5;
-  if (!base_page || depth_or_array_size_minus_1 || !width || width != pitch || !height) {
-    return 0;
-  }
-  return uint64_t(base_page) | (uint64_t(pitch) << 17) | (uint64_t(height) << 31) |
-         (uint64_t(fetch.endianness) << 45);
-}
 
 constexpr uint32_t GetMetalSampleCount(xenos::MsaaSamples msaa_samples) {
   return uint32_t(1) << std::min(uint32_t(msaa_samples), uint32_t(2));
@@ -1474,11 +1452,11 @@ void MetalCommandProcessor::InitializeShaderStorage(const std::filesystem::path&
     return;
   }
 
-  // v1 covers the current translated-MSL entry-point contract and render
-  // descriptor layout. Device identity is part of the name because Metal
+  // v2 covers the four-slot color-attachment descriptor and key contract.
+  // Device identity is part of the name because Metal
   // binary archives cannot be shared across different GPUs.
   pipeline_binary_archive_path_ =
-      archive_directory / fmt::format("pipeline-v1-{:016X}.metalarc", device_key);
+      archive_directory / fmt::format("pipeline-v2-{:016X}.metalarc", device_key);
   bool loaded_existing = false;
   std::string archive_message;
   pipeline_binary_archive_ = CreateMetalPipelineBinaryArchive(
@@ -1500,7 +1478,7 @@ void MetalCommandProcessor::InitializeShaderStorage(const std::filesystem::path&
 
 void* MetalCommandProcessor::CreateCachedRenderPipelineState(
     void* vertex_library, void* fragment_library, std::string* error_out,
-    const ProbeColorTargetState* color_target_state, uint32_t sample_count) {
+    const ProbeRenderPipelineDescription* pipeline_description, uint32_t sample_count) {
   // Archive serialization runs off the render thread. Never make a new game
   // pipeline wait for it: if the worker owns the archive, compile through
   // Metal's ordinary path and leave that one entry for a later run. Normal
@@ -1519,7 +1497,7 @@ void* MetalCommandProcessor::CreateCachedRenderPipelineState(
 
   RenderPipelineCacheTelemetry telemetry;
   void* pipeline_state = rex::graphics::metal::CreateRenderPipelineState(
-      metal_device_, vertex_library, fragment_library, error_out, color_target_state,
+      metal_device_, vertex_library, fragment_library, error_out, pipeline_description,
       archive_lock.owns_lock() ? pipeline_binary_archive_ : nullptr, &telemetry, sample_count);
 
   pipeline_build_ns_ += telemetry.pipeline_build_ns;
@@ -1801,10 +1779,20 @@ void MetalCommandProcessor::ShutdownPipelineArchive() {
 void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   uint64_t profile_start_ns = profile_enabled_ ? profiling::NowNs() : 0;
+  std::string exact_materialization_error;
+  const bool exact_edram_materialized =
+      MaterializeExactOutputMergerEdram("swap", &exact_materialization_error);
+  if (!exact_edram_materialized) {
+    ++pipeline_probe_failure_count_;
+    REXGPU_ERROR(
+        "Metal swap could not materialize exact EDRAM: {}",
+        exact_materialization_error.empty() ? "unknown error" : exact_materialization_error);
+  }
   if (!FlushGpuCompletionMemoryWrites()) {
     ++pipeline_probe_failure_count_;
   }
   bool swap_synchronized = WaitForPipelineProbeSubmissions("swap");
+  swap_synchronized &= exact_edram_materialized;
   if (!swap_synchronized) {
     ++pipeline_probe_failure_count_;
   }
@@ -1846,6 +1834,8 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                  "[metal] async probe summary#%u submitted=%llu waits=%llu waited=%llu "
                  "max_pending=%u gpu_tiled_resolves=%llu pixels=%llu fallbacks=%llu "
                  "alias_mirrors=%llu mirror_bytes=%llu "
+                 "resolve_mode(async=%llu sync=%llu missing_snapshot=%llu verbose=%llu "
+                 "missing_alias=%llu exact_snapshot=%llu) "
                  "depth_resolves=%llu depth_pixels=%llu depth_fallbacks=%llu "
                  "direct_resolved_texture_draws=%llu bindings=%llu "
                  "depth_bindings=%llu "
@@ -1862,16 +1852,20 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                  static_cast<unsigned long long>(gpu_tiled_resolve_fallback_count_),
                  static_cast<unsigned long long>(gpu_tiled_resolve_mirror_count_),
                  static_cast<unsigned long long>(gpu_tiled_resolve_mirror_byte_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_async_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_sync_readback_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_sync_missing_snapshot_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_sync_verbose_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_sync_missing_alias_count_),
+                 static_cast<unsigned long long>(gpu_tiled_resolve_exact_snapshot_count_),
                  static_cast<unsigned long long>(gpu_depth_resolve_count_),
                  static_cast<unsigned long long>(gpu_depth_resolve_pixel_count_),
                  static_cast<unsigned long long>(gpu_depth_resolve_fallback_count_),
                  static_cast<unsigned long long>(gpu_resolved_texture_draw_count_),
                  static_cast<unsigned long long>(gpu_resolved_texture_binding_count_),
                  static_cast<unsigned long long>(gpu_depth_snapshot_binding_count_),
-                 static_cast<unsigned long long>(
-                     gpu_goldeneye_postprocess_snapshot_count_),
-                 static_cast<unsigned long long>(
-                     gpu_goldeneye_postprocess_binding_count_),
+                 static_cast<unsigned long long>(gpu_goldeneye_postprocess_snapshot_count_),
+                 static_cast<unsigned long long>(gpu_goldeneye_postprocess_binding_count_),
                  static_cast<unsigned long long>(gpu_publication_event_count_),
                  static_cast<unsigned long long>(gpu_publication_input_range_count_),
                  static_cast<unsigned long long>(gpu_publication_merged_range_count_),
@@ -1890,26 +1884,19 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                    static_cast<unsigned long long>(staging_stats.reuses),
                    staging_stats.idle_buffers, staging_stats.in_flight_buffers,
                    staging_stats.peak_in_flight_buffers,
-                   static_cast<unsigned long long>(
-                       staging_stats.completion_wait_unavailable),
-                   static_cast<unsigned long long>(
-                       staging_stats.completion_wait_pending),
-                   static_cast<unsigned long long>(
-                       staging_stats.completion_wait_completed),
-                   static_cast<unsigned long long>(
-                       staging_stats.completion_event_wakeups),
-                   static_cast<unsigned long long>(
-                       staging_stats.completion_event_timeouts));
+                   static_cast<unsigned long long>(staging_stats.completion_wait_unavailable),
+                   static_cast<unsigned long long>(staging_stats.completion_wait_pending),
+                   static_cast<unsigned long long>(staging_stats.completion_wait_completed),
+                   static_cast<unsigned long long>(staging_stats.completion_event_wakeups),
+                   static_cast<unsigned long long>(staging_stats.completion_event_timeouts));
     }
-    std::fprintf(
-        stderr,
-        "[metal] WAIT_REG_MEM wakeups#%u signals=%llu timeouts=%llu "
-        "unavailable=%llu\n",
-        metal_swap_index,
-        static_cast<unsigned long long>(wait_reg_mem_event_signal_count_),
-        static_cast<unsigned long long>(wait_reg_mem_event_timeout_count_),
-        static_cast<unsigned long long>(
-            wait_reg_mem_event_unavailable_count_));
+    std::fprintf(stderr,
+                 "[metal] WAIT_REG_MEM wakeups#%u signals=%llu timeouts=%llu "
+                 "unavailable=%llu\n",
+                 metal_swap_index,
+                 static_cast<unsigned long long>(wait_reg_mem_event_signal_count_),
+                 static_cast<unsigned long long>(wait_reg_mem_event_timeout_count_),
+                 static_cast<unsigned long long>(wait_reg_mem_event_unavailable_count_));
     std::fflush(stderr);
   }
   bool log_draw_route_summary = ShouldLogMetalDiagnostic(metal_swap_index, 32, 0x3F);
@@ -1917,11 +1904,20 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     std::fprintf(stderr,
                  "[metal] draw route summary#%u total=%u color_depth=%u "
                  "shader_color_candidates=%u register_color_candidates=%u "
-                 "register_color_unrouted=%u owned_rt_draws=%u owned_rt_targets=%u "
+                 "register_color_unrouted=%u unsupported_mrt=%u "
+                 "mrt(attempts=%u successes=%u rejected=%u targets=%u draws=%u "
+                 "completed=%u vs_memexport=%u ps_memexport=%u) "
+                 "owned_rt_draws=%u owned_rt_targets=%u "
                  "host_pixel=%u host_fallback=%u host_rt_cpu=%u skipped_vertices=%u\n",
                  metal_swap_index, draw_calls_this_swap_, color_depth_draws_this_swap_,
                  color_target_candidate_draws_this_swap_, register_color_candidate_draws_this_swap_,
-                 register_color_unrouted_draws_this_swap_, owned_rt_routed_draws_this_swap_,
+                 register_color_unrouted_draws_this_swap_, unsupported_mrt_draws_this_swap_,
+                 production_mrt_attempts_this_swap_, production_mrt_successes_this_swap_,
+                 production_mrt_rejections_this_swap_, production_mrt_targets_this_swap_,
+                 production_mrt_encoded_draws_this_swap_,
+                 production_mrt_completed_commands_this_swap_,
+                 production_mrt_vertex_memexport_draws_this_swap_,
+                 production_mrt_pixel_memexport_draws_this_swap_, owned_rt_routed_draws_this_swap_,
                  owned_rt_routed_targets_this_swap_, host_pixel_draws_this_swap_,
                  host_fallback_pixel_draws_this_swap_, host_rt_cpu_draws_this_swap_,
                  host_pixel_skipped_vertices_this_swap_);
@@ -1932,6 +1928,15 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   color_target_candidate_draws_this_swap_ = 0;
   register_color_candidate_draws_this_swap_ = 0;
   register_color_unrouted_draws_this_swap_ = 0;
+  unsupported_mrt_draws_this_swap_ = 0;
+  production_mrt_attempts_this_swap_ = 0;
+  production_mrt_successes_this_swap_ = 0;
+  production_mrt_rejections_this_swap_ = 0;
+  production_mrt_targets_this_swap_ = 0;
+  production_mrt_encoded_draws_this_swap_ = 0;
+  production_mrt_completed_commands_this_swap_ = 0;
+  production_mrt_vertex_memexport_draws_this_swap_ = 0;
+  production_mrt_pixel_memexport_draws_this_swap_ = 0;
   owned_rt_routed_draws_this_swap_ = 0;
   owned_rt_routed_targets_this_swap_ = 0;
   collect_draw_route_summary_ = MetalVerboseDiagnosticsEnabled() || metal_swap_index < 32;
@@ -1941,7 +1946,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (MetalHostRenderTargetDebugEnabled()) {
     RefreshHostRenderTargetBacking(fallback_output_width_, fallback_output_height_);
   }
-  if (graphics_system_) {
+  if (exact_edram_materialized && graphics_system_) {
     if (auto* presenter = graphics_system_->presenter()) {
       bool refreshed = false;
       auto* metal_presenter = dynamic_cast<ui::metal::MetalPresenter*>(presenter);
@@ -2497,6 +2502,334 @@ void MetalCommandProcessor::ReportProfileWindow() {
       static_cast<unsigned long long>(
           profile_window_.swap_count() ? window_elapsed_ns / profile_window_.swap_count() : 0),
       window_fps);
+
+  std::unordered_set<void*> probe_contexts;
+  auto add_probe_context = [&](void* context) {
+    if (context) {
+      probe_contexts.insert(context);
+    }
+  };
+  add_probe_context(pipeline_probe_context_);
+  add_probe_context(host_pixel_probe_context_);
+  add_probe_context(host_render_target_context_);
+  add_probe_context(host_render_target_context_override_);
+  for (const auto& target_entry : host_render_targets_) {
+    add_probe_context(target_entry.second.context);
+  }
+  for (const auto& depth_entry : host_depth_stencil_targets_) {
+    add_probe_context(depth_entry.second.context);
+  }
+
+  PipelineProbeSubmissionStats probe_submission_snapshot = {};
+  std::vector<uint64_t> probe_context_identities;
+  probe_context_identities.reserve(probe_contexts.size());
+  bool probe_configuration_mismatch = false;
+  bool probe_configuration_observed = false;
+  for (void* context : probe_contexts) {
+    PipelineProbeSubmissionStats context_stats;
+    if (!GetPipelineProbeContextSubmissionStats(context, &context_stats)) {
+      continue;
+    }
+    if (!context_stats.context_identity) {
+      probe_configuration_mismatch = true;
+    } else {
+      probe_context_identities.push_back(context_stats.context_identity);
+    }
+    probe_submission_snapshot.draw_command_buffer_commit_count +=
+        context_stats.draw_command_buffer_commit_count;
+    probe_submission_snapshot.auxiliary_command_buffer_commit_count +=
+        context_stats.auxiliary_command_buffer_commit_count;
+    probe_submission_snapshot.backpressure_check_count += context_stats.backpressure_check_count;
+    probe_submission_snapshot.nonblocking_completed_command_buffer_reclamation_count +=
+        context_stats.nonblocking_completed_command_buffer_reclamation_count;
+    probe_submission_snapshot.blocking_backpressure_wait_count +=
+        context_stats.blocking_backpressure_wait_count;
+    probe_submission_snapshot.blocking_backpressure_wait_ns +=
+        context_stats.blocking_backpressure_wait_ns;
+    probe_submission_snapshot.peak_committed_draw_command_buffer_count =
+        std::max(probe_submission_snapshot.peak_committed_draw_command_buffer_count,
+                 context_stats.peak_committed_draw_command_buffer_count);
+    probe_submission_snapshot.peak_pending_submission_count =
+        std::max(probe_submission_snapshot.peak_pending_submission_count,
+                 context_stats.peak_pending_submission_count);
+    if (!probe_configuration_observed) {
+      probe_submission_snapshot.max_draws_per_command_buffer =
+          context_stats.max_draws_per_command_buffer;
+      probe_submission_snapshot.max_committed_draw_command_buffer_count =
+          context_stats.max_committed_draw_command_buffer_count;
+      probe_configuration_observed = true;
+    } else if (probe_submission_snapshot.max_draws_per_command_buffer !=
+                   context_stats.max_draws_per_command_buffer ||
+               probe_submission_snapshot.max_committed_draw_command_buffer_count !=
+                   context_stats.max_committed_draw_command_buffer_count) {
+      probe_configuration_mismatch = true;
+    }
+  }
+  std::sort(probe_context_identities.begin(), probe_context_identities.end());
+  if (std::adjacent_find(probe_context_identities.begin(), probe_context_identities.end()) !=
+      probe_context_identities.end()) {
+    probe_configuration_mismatch = true;
+  }
+
+  bool probe_counter_reset = !last_profiled_probe_context_identities_.empty() &&
+                             last_profiled_probe_context_identities_ != probe_context_identities;
+  auto profile_delta = [&](uint64_t current, uint64_t previous) {
+    if (current < previous) {
+      probe_counter_reset = true;
+      return current;
+    }
+    return current - previous;
+  };
+  const uint64_t probe_commits =
+      profile_delta(probe_submission_snapshot.draw_command_buffer_commit_count,
+                    last_profiled_probe_submission_stats_.draw_command_buffer_commit_count);
+  const uint64_t probe_backpressure_checks =
+      profile_delta(probe_submission_snapshot.backpressure_check_count,
+                    last_profiled_probe_submission_stats_.backpressure_check_count);
+  const uint64_t probe_nonblocking_reclaims = profile_delta(
+      probe_submission_snapshot.nonblocking_completed_command_buffer_reclamation_count,
+      last_profiled_probe_submission_stats_.nonblocking_completed_command_buffer_reclamation_count);
+  const uint64_t probe_blocking_waits =
+      profile_delta(probe_submission_snapshot.blocking_backpressure_wait_count,
+                    last_profiled_probe_submission_stats_.blocking_backpressure_wait_count);
+  const uint64_t probe_blocking_wait_ns =
+      profile_delta(probe_submission_snapshot.blocking_backpressure_wait_ns,
+                    last_profiled_probe_submission_stats_.blocking_backpressure_wait_ns);
+  const uint64_t wait_reg_mem_signals =
+      profile_delta(wait_reg_mem_event_signal_count_, profiled_wait_reg_mem_event_signal_count_);
+  const uint64_t wait_reg_mem_timeouts =
+      profile_delta(wait_reg_mem_event_timeout_count_, profiled_wait_reg_mem_event_timeout_count_);
+  const uint64_t wait_reg_mem_unavailable = profile_delta(
+      wait_reg_mem_event_unavailable_count_, profiled_wait_reg_mem_event_unavailable_count_);
+  last_profiled_probe_submission_stats_ = probe_submission_snapshot;
+  last_profiled_probe_context_identities_ = probe_context_identities;
+  profiled_wait_reg_mem_event_signal_count_ = wait_reg_mem_event_signal_count_;
+  profiled_wait_reg_mem_event_timeout_count_ = wait_reg_mem_event_timeout_count_;
+  profiled_wait_reg_mem_event_unavailable_count_ = wait_reg_mem_event_unavailable_count_;
+
+  std::fprintf(stderr,
+               "[metal-profile] probe-queue swaps=%llu-%llu contexts=%zu "
+               "commits=%llu backpressure_checks=%llu nonblocking_reclaims=%llu "
+               "blocking_waits=%llu blocking_wait_ns=%llu "
+               "lifetime_peak_committed_per_context=%u "
+               "lifetime_peak_pending_per_context=%u draws_per_command_buffer=%u "
+               "committed_command_buffer_cap=%u counter_reset=%u "
+               "configuration_mismatch=%u wait_reg_mem_signals=%llu "
+               "wait_reg_mem_timeouts=%llu wait_reg_mem_unavailable=%llu\n",
+               static_cast<unsigned long long>(first_swap),
+               static_cast<unsigned long long>(profiled_swap_count_),
+               probe_context_identities.size(), static_cast<unsigned long long>(probe_commits),
+               static_cast<unsigned long long>(probe_backpressure_checks),
+               static_cast<unsigned long long>(probe_nonblocking_reclaims),
+               static_cast<unsigned long long>(probe_blocking_waits),
+               static_cast<unsigned long long>(probe_blocking_wait_ns),
+               probe_submission_snapshot.peak_committed_draw_command_buffer_count,
+               probe_submission_snapshot.peak_pending_submission_count,
+               probe_submission_snapshot.max_draws_per_command_buffer,
+               probe_submission_snapshot.max_committed_draw_command_buffer_count,
+               probe_counter_reset ? 1u : 0u, probe_configuration_mismatch ? 1u : 0u,
+               static_cast<unsigned long long>(wait_reg_mem_signals),
+               static_cast<unsigned long long>(wait_reg_mem_timeouts),
+               static_cast<unsigned long long>(wait_reg_mem_unavailable));
+
+  PipelineProbeSubmissionStats exact_submission_snapshot = {};
+  const bool exact_submission_observed = GetExactOutputMergerSubmissionStats(
+      exact_output_merger_resources_, &exact_submission_snapshot);
+  const uint64_t exact_context_identity =
+      exact_submission_observed ? exact_submission_snapshot.context_identity : 0;
+  bool exact_counter_reset =
+      last_profiled_exact_output_merger_context_identity_ && exact_context_identity &&
+      last_profiled_exact_output_merger_context_identity_ != exact_context_identity;
+  auto exact_submission_delta = [&](uint64_t current, uint64_t previous) {
+    if (exact_counter_reset || current < previous) {
+      exact_counter_reset = exact_counter_reset || current < previous;
+      return current;
+    }
+    return current - previous;
+  };
+  const uint64_t exact_commits = exact_submission_delta(
+      exact_submission_snapshot.draw_command_buffer_commit_count,
+      last_profiled_exact_output_merger_submission_stats_.draw_command_buffer_commit_count);
+  const uint64_t exact_backpressure_checks = exact_submission_delta(
+      exact_submission_snapshot.backpressure_check_count,
+      last_profiled_exact_output_merger_submission_stats_.backpressure_check_count);
+  const uint64_t exact_nonblocking_reclaims = exact_submission_delta(
+      exact_submission_snapshot.nonblocking_completed_command_buffer_reclamation_count,
+      last_profiled_exact_output_merger_submission_stats_
+          .nonblocking_completed_command_buffer_reclamation_count);
+  const uint64_t exact_blocking_waits = exact_submission_delta(
+      exact_submission_snapshot.blocking_backpressure_wait_count,
+      last_profiled_exact_output_merger_submission_stats_.blocking_backpressure_wait_count);
+  const uint64_t exact_blocking_wait_ns = exact_submission_delta(
+      exact_submission_snapshot.blocking_backpressure_wait_ns,
+      last_profiled_exact_output_merger_submission_stats_.blocking_backpressure_wait_ns);
+  last_profiled_exact_output_merger_submission_stats_ = exact_submission_snapshot;
+  last_profiled_exact_output_merger_context_identity_ = exact_context_identity;
+
+  auto exact_counter_delta = [](uint64_t current, uint64_t previous) {
+    return current >= previous ? current - previous : current;
+  };
+  const ExactOutputMergerProfileCounters exact_window = {
+      exact_counter_delta(exact_output_merger_profile_counters_.attempts,
+                          profiled_exact_output_merger_counters_.attempts),
+      exact_counter_delta(exact_output_merger_profile_counters_.enqueued,
+                          profiled_exact_output_merger_counters_.enqueued),
+      exact_counter_delta(exact_output_merger_profile_counters_.completed,
+                          profiled_exact_output_merger_counters_.completed),
+      exact_counter_delta(exact_output_merger_profile_counters_.rejected,
+                          profiled_exact_output_merger_counters_.rejected),
+      exact_counter_delta(exact_output_merger_profile_counters_.terminal_failures,
+                          profiled_exact_output_merger_counters_.terminal_failures),
+      exact_counter_delta(exact_output_merger_profile_counters_.materializations,
+                          profiled_exact_output_merger_counters_.materializations),
+      exact_counter_delta(exact_output_merger_profile_counters_.full_uploads,
+                          profiled_exact_output_merger_counters_.full_uploads),
+      exact_counter_delta(exact_output_merger_profile_counters_.full_upload_bytes,
+                          profiled_exact_output_merger_counters_.full_upload_bytes),
+      exact_counter_delta(exact_output_merger_profile_counters_.full_downloads,
+                          profiled_exact_output_merger_counters_.full_downloads),
+      exact_counter_delta(exact_output_merger_profile_counters_.full_download_bytes,
+                          profiled_exact_output_merger_counters_.full_download_bytes),
+  };
+  profiled_exact_output_merger_counters_ = exact_output_merger_profile_counters_;
+  const uint32_t exact_pending =
+      GetExactOutputMergerPendingDrawCount(exact_output_merger_resources_);
+  const bool exact_enabled = REXCVAR_GET(metal_exact_output_merger);
+  const uint32_t exact_draws_per_command_buffer =
+      exact_submission_observed ? exact_submission_snapshot.max_draws_per_command_buffer
+      : exact_enabled           ? kExactOutputMergerDrawsPerCommandBuffer
+                                : 0;
+  const uint32_t exact_command_buffer_cap =
+      exact_submission_observed ? exact_submission_snapshot.max_committed_draw_command_buffer_count
+      : exact_enabled           ? kExactOutputMergerCommandBufferCap
+                                : 0;
+  std::fprintf(stderr,
+               "[metal-profile] exact-om swaps=%llu-%llu enabled=%u attempts=%llu "
+               "enqueued=%llu completed=%llu rejected=%llu terminal_failures=%llu "
+               "materializations=%llu full_uploads=%llu full_upload_bytes=%llu "
+               "full_downloads=%llu full_download_bytes=%llu pending=%u commits=%llu "
+               "backpressure_checks=%llu nonblocking_reclaims=%llu blocking_waits=%llu "
+               "blocking_wait_ns=%llu lifetime_peak_committed=%u lifetime_peak_pending=%u "
+               "draws_per_command_buffer=%u command_buffer_cap=%u counter_reset=%u\n",
+               static_cast<unsigned long long>(first_swap),
+               static_cast<unsigned long long>(profiled_swap_count_), exact_enabled ? 1u : 0u,
+               static_cast<unsigned long long>(exact_window.attempts),
+               static_cast<unsigned long long>(exact_window.enqueued),
+               static_cast<unsigned long long>(exact_window.completed),
+               static_cast<unsigned long long>(exact_window.rejected),
+               static_cast<unsigned long long>(exact_window.terminal_failures),
+               static_cast<unsigned long long>(exact_window.materializations),
+               static_cast<unsigned long long>(exact_window.full_uploads),
+               static_cast<unsigned long long>(exact_window.full_upload_bytes),
+               static_cast<unsigned long long>(exact_window.full_downloads),
+               static_cast<unsigned long long>(exact_window.full_download_bytes), exact_pending,
+               static_cast<unsigned long long>(exact_commits),
+               static_cast<unsigned long long>(exact_backpressure_checks),
+               static_cast<unsigned long long>(exact_nonblocking_reclaims),
+               static_cast<unsigned long long>(exact_blocking_waits),
+               static_cast<unsigned long long>(exact_blocking_wait_ns),
+               exact_submission_snapshot.peak_committed_draw_command_buffer_count,
+               exact_submission_snapshot.peak_pending_submission_count,
+               exact_draws_per_command_buffer, exact_command_buffer_cap,
+               exact_counter_reset ? 1u : 0u);
+  GpuChainProfileSnapshot gpu_chain_snapshot = gpu_chain_profiler_.Snapshot();
+  GpuChainProfileSnapshot gpu_chain =
+      GpuChainProfileSnapshot::Delta(gpu_chain_snapshot, last_gpu_chain_profile_snapshot_);
+  last_gpu_chain_profile_snapshot_ = gpu_chain_snapshot;
+  std::fprintf(stderr,
+               "[metal-profile] gpu-chain swaps=%llu-%llu "
+               "wptr_attempts=%llu wptr_accepted=%llu wptr_rejected=%llu "
+               "wptr_same=%llu wptr_with_work=%llu wptr_zero_work=%llu "
+               "wptr_coalesced=%llu wptr_pending_dwords_total=%llu "
+               "wptr_pending_dwords_max=%llu wptr_to_worker_samples=%llu "
+               "wptr_to_worker_total_ns=%llu wptr_to_worker_max_ns=%llu "
+               "pm4_interrupts=%llu isr_dispatches=%llu isr_total_ns=%llu "
+               "isr_max_ns=%llu interrupt_to_wptr_samples=%llu "
+               "interrupt_to_wptr_total_ns=%llu interrupt_to_wptr_max_ns=%llu "
+               "interrupt_unpaired=%llu interrupt_outstanding=%llu "
+               "ring_batches=%llu ring_commit_rejected=%llu "
+               "ring_concurrent_wptr=%llu ring_pending_after_commit=%llu "
+               "metal_pending_samples=%llu metal_pending_total=%llu "
+               "metal_pending_max=%llu metal_pending_nonzero=%llu "
+               "throttle_calls=%llu throttle_requested_ns=%llu "
+               "throttle_actual_ns=%llu throttle_max_ns=%llu "
+               "throttle_overshoot_ns=%llu throttle_ring_pending=%llu "
+               "throttle_metal_pending=%llu throttle_wptr_wakes=%llu "
+               "throttle_timeouts=%llu throttle_reconfigured=%llu "
+               "throttle_skipped_pending=%llu\n",
+               static_cast<unsigned long long>(first_swap),
+               static_cast<unsigned long long>(profiled_swap_count_),
+               static_cast<unsigned long long>(gpu_chain.wptr_attempts),
+               static_cast<unsigned long long>(gpu_chain.wptr_accepted),
+               static_cast<unsigned long long>(gpu_chain.wptr_rejected),
+               static_cast<unsigned long long>(gpu_chain.wptr_same),
+               static_cast<unsigned long long>(gpu_chain.wptr_with_work),
+               static_cast<unsigned long long>(gpu_chain.wptr_zero_work),
+               static_cast<unsigned long long>(gpu_chain.wptr_coalesced),
+               static_cast<unsigned long long>(gpu_chain.wptr_pending_dwords_total),
+               static_cast<unsigned long long>(gpu_chain.wptr_pending_dwords_max),
+               static_cast<unsigned long long>(gpu_chain.wptr_to_worker_samples),
+               static_cast<unsigned long long>(gpu_chain.wptr_to_worker_total_ns),
+               static_cast<unsigned long long>(gpu_chain.wptr_to_worker_max_ns),
+               static_cast<unsigned long long>(gpu_chain.pm4_interrupts),
+               static_cast<unsigned long long>(gpu_chain.isr_dispatches),
+               static_cast<unsigned long long>(gpu_chain.isr_total_ns),
+               static_cast<unsigned long long>(gpu_chain.isr_max_ns),
+               static_cast<unsigned long long>(gpu_chain.interrupt_to_wptr_samples),
+               static_cast<unsigned long long>(gpu_chain.interrupt_to_wptr_total_ns),
+               static_cast<unsigned long long>(gpu_chain.interrupt_to_wptr_max_ns),
+               static_cast<unsigned long long>(gpu_chain.interrupt_unpaired),
+               static_cast<unsigned long long>(gpu_chain.interrupt_outstanding),
+               static_cast<unsigned long long>(gpu_chain.ring_batches),
+               static_cast<unsigned long long>(gpu_chain.ring_commit_rejected),
+               static_cast<unsigned long long>(gpu_chain.ring_concurrent_wptr),
+               static_cast<unsigned long long>(gpu_chain.ring_pending_after_commit),
+               static_cast<unsigned long long>(gpu_chain.metal_pending_samples),
+               static_cast<unsigned long long>(gpu_chain.metal_pending_total),
+               static_cast<unsigned long long>(gpu_chain.metal_pending_max),
+               static_cast<unsigned long long>(gpu_chain.metal_pending_nonzero),
+               static_cast<unsigned long long>(gpu_chain.throttle_calls),
+               static_cast<unsigned long long>(gpu_chain.throttle_requested_ns),
+               static_cast<unsigned long long>(gpu_chain.throttle_actual_ns),
+               static_cast<unsigned long long>(gpu_chain.throttle_max_ns),
+               static_cast<unsigned long long>(gpu_chain.throttle_overshoot_ns),
+               static_cast<unsigned long long>(gpu_chain.throttle_ring_pending),
+               static_cast<unsigned long long>(gpu_chain.throttle_metal_pending),
+               static_cast<unsigned long long>(gpu_chain.throttle_wptr_wakes),
+               static_cast<unsigned long long>(gpu_chain.throttle_timeouts),
+               static_cast<unsigned long long>(gpu_chain.throttle_reconfigured),
+               static_cast<unsigned long long>(gpu_chain.throttle_skipped_pending));
+  const uint64_t resolve_async =
+      gpu_tiled_resolve_async_count_ - profiled_gpu_tiled_resolve_async_count_;
+  const uint64_t resolve_sync =
+      gpu_tiled_resolve_sync_readback_count_ - profiled_gpu_tiled_resolve_sync_readback_count_;
+  const uint64_t resolve_missing_snapshot = gpu_tiled_resolve_sync_missing_snapshot_count_ -
+                                            profiled_gpu_tiled_resolve_sync_missing_snapshot_count_;
+  const uint64_t resolve_verbose =
+      gpu_tiled_resolve_sync_verbose_count_ - profiled_gpu_tiled_resolve_sync_verbose_count_;
+  const uint64_t resolve_missing_alias = gpu_tiled_resolve_sync_missing_alias_count_ -
+                                         profiled_gpu_tiled_resolve_sync_missing_alias_count_;
+  const uint64_t resolve_exact_snapshot =
+      gpu_tiled_resolve_exact_snapshot_count_ - profiled_gpu_tiled_resolve_exact_snapshot_count_;
+  profiled_gpu_tiled_resolve_async_count_ = gpu_tiled_resolve_async_count_;
+  profiled_gpu_tiled_resolve_sync_readback_count_ = gpu_tiled_resolve_sync_readback_count_;
+  profiled_gpu_tiled_resolve_sync_missing_snapshot_count_ =
+      gpu_tiled_resolve_sync_missing_snapshot_count_;
+  profiled_gpu_tiled_resolve_sync_verbose_count_ = gpu_tiled_resolve_sync_verbose_count_;
+  profiled_gpu_tiled_resolve_sync_missing_alias_count_ =
+      gpu_tiled_resolve_sync_missing_alias_count_;
+  profiled_gpu_tiled_resolve_exact_snapshot_count_ = gpu_tiled_resolve_exact_snapshot_count_;
+  std::fprintf(stderr,
+               "[metal-profile] resolve-mode swaps=%llu-%llu async=%llu sync=%llu "
+               "missing_snapshot=%llu verbose=%llu missing_alias=%llu exact_snapshot=%llu\n",
+               static_cast<unsigned long long>(first_swap),
+               static_cast<unsigned long long>(profiled_swap_count_),
+               static_cast<unsigned long long>(resolve_async),
+               static_cast<unsigned long long>(resolve_sync),
+               static_cast<unsigned long long>(resolve_missing_snapshot),
+               static_cast<unsigned long long>(resolve_verbose),
+               static_cast<unsigned long long>(resolve_missing_alias),
+               static_cast<unsigned long long>(resolve_exact_snapshot));
   auto report_event = [&](profiling::CommandEvent event) {
     const profiling::DurationWindow& metric = profile_window_.event(event);
     std::fprintf(
@@ -2650,17 +2983,26 @@ void MetalCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t
 }
 
 bool MetalCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
-  if (!snapshot || !EnsureEdramBgraBacking()) {
+  return ReplaceCanonicalEdramSnapshot(snapshot, false);
+}
+
+bool MetalCommandProcessor::ReplaceCanonicalEdramSnapshot(const void* snapshot,
+                                                          bool from_exact_output_merger) {
+  if (!snapshot ||
+      (from_exact_output_merger && !exact_output_merger_residency_.exact_gpu_current()) ||
+      !EnsureEdramBgraBacking()) {
     return false;
   }
-  if (!WaitForPipelineProbeSubmissions("canonical-edram-restore")) {
-    REXGPU_ERROR("Metal failed to drain private targets before restoring canonical EDRAM");
+  if (!WaitForPipelineProbeSubmissions(from_exact_output_merger
+                                           ? "canonical-edram-exact-publication"
+                                           : "canonical-edram-restore")) {
+    REXGPU_ERROR("Metal failed to drain private targets before replacing canonical EDRAM");
     return false;
   }
-  // A trace snapshot replaces the complete physical EDRAM allocation. Drop
-  // every private alias so no target created before the restore can later
-  // overwrite the new raw contents. Targets are recreated and hydrated lazily
-  // with the exact dimensions of their first replay operation.
+  // A trace restore and a completed exact draw both replace the complete
+  // physical EDRAM allocation. Drop every private alias so no older target can
+  // later overwrite the new raw contents. Targets are recreated and hydrated
+  // lazily with the exact dimensions of their first subsequent operation.
   host_render_target_context_override_ = nullptr;
   for (auto& [key, target] : host_render_targets_) {
     (void)key;
@@ -2676,13 +3018,175 @@ bool MetalCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
   host_depth_stencil_targets_.clear();
   std::memcpy(edram_bgra_.data(), snapshot, xenos::kEdramSizeBytes);
   canonical_edram_ownership_.Reset();
-  canonical_edram_state_.RecordRestore();
+  if (from_exact_output_merger) {
+    if (!exact_output_merger_residency_.RecordMaterialized()) {
+      return false;
+    }
+    canonical_edram_state_.RecordExactDraw();
+  } else {
+    exact_output_merger_residency_.RecordCanonicalReplacement();
+    canonical_edram_state_.RecordRestore();
+  }
   canonical_edram_transfer_active_ = false;
   canonical_edram_unsupported_state_ = false;
+  canonical_edram_unexportable_native_alias_ = false;
   latest_host_render_target_bgra_.clear();
   latest_host_render_target_width_ = 0;
   latest_host_render_target_height_ = 0;
   last_host_render_target_probe_read_ = false;
+  return true;
+}
+
+void MetalCommandProcessor::InvalidateCanonicalEdramAfterExactFailure() {
+  // An exact submission failure may be reported by a later asynchronous
+  // fence. Drain the independent native contexts, then discard both the raw
+  // image and every native alias: the shader may have changed an unknown
+  // subset, so no representation is safe to reuse or replay.
+  WaitForPipelineProbeSubmissions("canonical-edram-exact-terminal-failure");
+  host_render_target_context_override_ = nullptr;
+  for (auto& [key, target] : host_render_targets_) {
+    (void)key;
+    ReleasePipelineProbeContext(target.context);
+    target.context = nullptr;
+  }
+  host_render_targets_.clear();
+  for (auto& [key, target] : host_depth_stencil_targets_) {
+    (void)key;
+    ReleasePipelineProbeContext(target.context);
+    target.context = nullptr;
+  }
+  host_depth_stencil_targets_.clear();
+  edram_bgra_.clear();
+  canonical_edram_ownership_.Reset();
+  canonical_edram_state_.Reset();
+  canonical_edram_transfer_active_ = false;
+  canonical_edram_unsupported_state_ = true;
+  canonical_edram_unexportable_native_alias_ = false;
+  latest_host_render_target_bgra_.clear();
+  latest_host_render_target_width_ = 0;
+  latest_host_render_target_height_ = 0;
+  last_host_render_target_probe_read_ = false;
+  exact_output_merger_residency_.Invalidate();
+  if (trace_writer_.is_open()) {
+    trace_writer_.InvalidateEdramRequirementsTracking();
+  }
+}
+
+void MetalCommandProcessor::PublishExactOutputMergerCopyDestination(uint32_t start,
+                                                                    uint32_t length) {
+  if (!length) {
+    return;
+  }
+  // This path mirrors into guest memory in the exact command buffer itself.
+  // Drop any older deferred publication for the same pages so a later event or
+  // swap fence can't overwrite the newer bytes.
+  for (auto it = pending_gpu_tiled_resolve_publication_ranges_.begin();
+       it != pending_gpu_tiled_resolve_publication_ranges_.end();) {
+    if (RangesOverlap(start, length, it->first, it->second)) {
+      it = pending_gpu_tiled_resolve_publication_ranges_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  pending_readback_resolve_slices_.clear();
+  pending_texture_resolve_bgra_.clear();
+  pending_texture_resolve_width_ = 0;
+  pending_texture_resolve_height_ = 0;
+  if (shared_memory_) {
+    shared_memory_->RangeWrittenByGpu(start, length);
+  }
+  InvalidateRetainedResolvedFrames(start, length);
+  InvalidateExactResolvedSurfaceCache(start, length);
+  InvalidateResolvedDepthSnapshot(start, length);
+  InvalidateGoldenEyePostprocessAliases(start, length);
+}
+
+void MetalCommandProcessor::RevokeExactOutputMergerCopyDestination(uint32_t start,
+                                                                   uint32_t length) {
+  if (length && shared_memory_) {
+    // Revoke the RangeWrittenByGpu publication. The command may have modified
+    // only the resident allocation or only part of the guest alias.
+    shared_memory_->MemoryInvalidationCallback(start, length, true);
+  }
+  for (auto it = pending_gpu_tiled_resolve_publication_ranges_.begin();
+       it != pending_gpu_tiled_resolve_publication_ranges_.end();) {
+    if (RangesOverlap(start, length, it->first, it->second)) {
+      it = pending_gpu_tiled_resolve_publication_ranges_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  pending_readback_resolve_slices_.clear();
+  pending_texture_resolve_bgra_.clear();
+  pending_texture_resolve_width_ = 0;
+  pending_texture_resolve_height_ = 0;
+  InvalidateRetainedResolvedFrames(start, length);
+  InvalidateExactResolvedSurfaceCache(start, length);
+  InvalidateResolvedDepthSnapshot(start, length);
+  InvalidateGoldenEyePostprocessAliases(start, length);
+  InvalidateCanonicalEdramAfterExactFailure();
+}
+
+bool MetalCommandProcessor::MaterializeExactOutputMergerEdram(const char* reason,
+                                                              std::string* error_out) {
+  auto fail = [&](std::string error) {
+    if (reason && *reason) {
+      error.append(" at ");
+      error.append(reason);
+    }
+    if (error_out) {
+      *error_out = std::move(error);
+    }
+    InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+    InvalidateCanonicalEdramAfterExactFailure();
+    return false;
+  };
+
+  if (exact_output_merger_residency_.invalid()) {
+    if (error_out) {
+      *error_out = "exact EDRAM authority is invalid after a submitted failure";
+    }
+    return false;
+  }
+  if (!exact_output_merger_residency_.exact_gpu_current()) {
+    if (error_out) {
+      error_out->clear();
+    }
+    return true;
+  }
+  if (!exact_output_merger_resources_) {
+    return fail("exact output-merger resources disappeared while GPU EDRAM was authoritative");
+  }
+  // Exact draws may have consumed shared-memory uploads submitted before
+  // their command buffers. Metal queue order doesn't propagate a predecessor
+  // upload error into a later draw's status, so detect it before publishing a
+  // CPU materialization of potentially corrupted exact EDRAM.
+  if (!shared_memory_ || !shared_memory_->WaitForPendingUploads()) {
+    return fail("a predecessor shared-memory upload failed before exact EDRAM materialization");
+  }
+  std::string wait_error;
+  if (!WaitExactOutputMergerDraws(exact_output_merger_resources_, &wait_error, nullptr)) {
+    return fail(wait_error.empty() ? "exact output-merger asynchronous wait failed"
+                                   : std::move(wait_error));
+  }
+  if (exact_output_merger_edram_transfer_.size() != kExactOutputMergerEdramSizeBytes) {
+    exact_output_merger_edram_transfer_.resize(kExactOutputMergerEdramSizeBytes);
+  }
+  if (!DownloadExactOutputMergerEdram(exact_output_merger_resources_,
+                                      exact_output_merger_edram_transfer_.data(),
+                                      exact_output_merger_edram_transfer_.size(), error_out)) {
+    return fail(error_out && !error_out->empty() ? *error_out : "exact EDRAM download failed");
+  }
+  ++exact_output_merger_profile_counters_.full_downloads;
+  exact_output_merger_profile_counters_.full_download_bytes +=
+      exact_output_merger_edram_transfer_.size();
+  if (!ReplaceCanonicalEdramSnapshot(exact_output_merger_edram_transfer_.data(), true)) {
+    return fail("exact EDRAM canonical publication failed");
+  }
+  ++exact_output_merger_profile_counters_.materializations;
+  if (error_out) {
+    error_out->clear();
+  }
   return true;
 }
 
@@ -2722,6 +3226,7 @@ bool MetalCommandProcessor::SetupContext() {
   if (!CommandProcessor::SetupContext()) {
     return false;
   }
+  exact_output_merger_residency_.RecordCanonicalReplacement();
   fallback_output_width_ =
       uint32_t(std::clamp(REXCVAR_GET(video_mode_width), int32_t(1), int32_t(8192)));
   fallback_output_height_ =
@@ -2776,10 +3281,40 @@ bool MetalCommandProcessor::SetupContext() {
       REXLOG_WARN("Metal host render-target debug context unavailable: {}", host_rt_context_error);
     }
     if (shared_memory_) {
-      shared_memory_->SetHostResourceMutationCallback(
-          [this]() { return WaitForPipelineProbeSubmissions("resource-mutation"); });
-      shared_memory_->SetGpuResourceMutationCallback(
-          [this]() { return FinalizePipelineProbeSubmissions(); });
+      shared_memory_->SetHostResourceMutationCallback([this]() {
+        bool exact_synchronized = !exact_output_merger_residency_.invalid();
+        if (exact_synchronized && exact_output_merger_resources_) {
+          std::string exact_error;
+          exact_synchronized =
+              WaitExactOutputMergerDraws(exact_output_merger_resources_, &exact_error, nullptr);
+          if (!exact_synchronized) {
+            ++pipeline_probe_failure_count_;
+            REXGPU_ERROR("Metal exact output-merger host resource fence failed: {}",
+                         exact_error.empty() ? "unknown error" : exact_error);
+            InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+            InvalidateCanonicalEdramAfterExactFailure();
+          }
+        }
+        const bool native_synchronized = WaitForPipelineProbeSubmissions("resource-mutation");
+        return exact_synchronized && native_synchronized;
+      });
+      shared_memory_->SetGpuResourceMutationCallback([this]() {
+        bool exact_finalized = !exact_output_merger_residency_.invalid();
+        if (exact_finalized && exact_output_merger_resources_) {
+          std::string exact_error;
+          exact_finalized =
+              FinalizeExactOutputMergerDraws(exact_output_merger_resources_, &exact_error);
+          if (!exact_finalized) {
+            ++pipeline_probe_failure_count_;
+            REXGPU_ERROR("Metal exact output-merger shared-memory ordering fence failed: {}",
+                         exact_error.empty() ? "unknown error" : exact_error);
+            InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+            InvalidateCanonicalEdramAfterExactFailure();
+          }
+        }
+        const bool native_finalized = FinalizePipelineProbeSubmissions();
+        return exact_finalized && native_finalized;
+      });
     }
   }
   if (!draw_renderer_) {
@@ -2789,7 +3324,541 @@ bool MetalCommandProcessor::SetupContext() {
   return true;
 }
 
+bool MetalCommandProcessor::EnsureExactOutputMergerInitialized() {
+  if (exact_output_merger_resources_) {
+    if (exact_output_merger_edram_transfer_.size() != kExactOutputMergerEdramSizeBytes) {
+      exact_output_merger_edram_transfer_.resize(kExactOutputMergerEdramSizeBytes);
+    }
+    return true;
+  }
+  if (!REXCVAR_GET(metal_exact_output_merger) || !metal_device_ || !shared_memory_ ||
+      !shared_memory_->command_queue() || !EnsureExactOutputMergerShaderTranslator()) {
+    return false;
+  }
+  std::string error;
+  void* resources = CreateExactOutputMergerResources(metal_device_, &error);
+  if (!resources ||
+      !SetExactOutputMergerCommandQueue(resources, shared_memory_->command_queue(), &error)) {
+    ReleaseExactOutputMergerResources(resources);
+    REXGPU_ERROR("Metal exact output-merger initialization failed: {}",
+                 error.empty() ? "unknown error" : error);
+    return false;
+  }
+  exact_output_merger_resources_ = resources;
+  exact_output_merger_edram_transfer_.resize(kExactOutputMergerEdramSizeBytes);
+  return true;
+}
+
+ExactOutputMergerExecutionResult MetalCommandProcessor::TryExecuteExactOutputMergerDraw(
+    MetalShader& vertex_shader, MetalShader& pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    bool primitive_polygonal, std::string* error_out) {
+  auto reject = [&](std::string reason) {
+    if (error_out) {
+      *error_out = std::move(reason);
+    }
+    return ExactOutputMergerExecutionResult::kRejectedBeforeSubmit;
+  };
+  auto fail_after_submit = [&](std::string reason) {
+    if (error_out) {
+      *error_out = std::move(reason);
+    }
+    InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+    InvalidateCanonicalEdramAfterExactFailure();
+    return ExactOutputMergerExecutionResult::kFailedAfterSubmit;
+  };
+
+  if (exact_output_merger_residency_.invalid()) {
+    return reject("exact EDRAM authority is invalid after a submitted failure");
+  }
+
+  if (!register_file_ || !shared_memory_ || !texture_cache_ ||
+      !EnsureExactOutputMergerInitialized()) {
+    return reject("exact output-merger runtime resources are unavailable");
+  }
+  if (!primitive_processing_result.host_draw_vertex_count ||
+      primitive_processing_result.IsTessellated() ||
+      (primitive_processing_result.host_primitive_reset_enabled &&
+       (primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kLineStrip &&
+        primitive_processing_result.host_primitive_type != xenos::PrimitiveType::kTriangleStrip))) {
+    return reject("exact output-merger primitive or index route is unsupported");
+  }
+  switch (primitive_processing_result.index_buffer_type) {
+    case PrimitiveProcessor::ProcessedIndexBufferType::kNone:
+    case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA:
+    case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
+    case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto:
+    case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA:
+      break;
+    default:
+      return reject("exact output-merger processed index route is unsupported");
+  }
+  switch (primitive_processing_result.host_primitive_type) {
+    case xenos::PrimitiveType::kPointList:
+    case xenos::PrimitiveType::kLineList:
+    case xenos::PrimitiveType::kLineStrip:
+    case xenos::PrimitiveType::kTriangleList:
+    case xenos::PrimitiveType::kTriangleStrip:
+      break;
+    default:
+      return reject("exact output-merger host topology is unsupported");
+  }
+
+  const reg::RB_SURFACE_INFO surface_info = register_file_->Get<reg::RB_SURFACE_INFO>();
+  const uint32_t coverage_width = std::max<uint32_t>(fallback_output_width_, 1);
+  const uint32_t coverage_height = std::max<uint32_t>(fallback_output_height_, 1);
+  if (!surface_info.surface_pitch || coverage_width > surface_info.surface_pitch) {
+    return reject("exact output-merger coverage is wider than the guest surface pitch");
+  }
+  const uint32_t sample_count = GetMetalSampleCount(surface_info.msaa_samples);
+
+  uint64_t vertex_modification = 0;
+  uint64_t pixel_modification = 0;
+  GetCurrentExactOutputMergerShaderModifications(&vertex_shader, &pixel_shader, vertex_modification,
+                                                 pixel_modification);
+  MetalShader::MetalTranslation* vertex_translation =
+      GetExactOutputMergerTranslatedShader(vertex_shader, vertex_modification);
+  MetalShader::MetalTranslation* fragment_translation =
+      GetExactOutputMergerTranslatedShader(pixel_shader, pixel_modification);
+  if (!vertex_translation || !fragment_translation || !vertex_translation->metal_library() ||
+      !fragment_translation->metal_library()) {
+    return reject("exact output-merger shader translations are unavailable");
+  }
+  const bool vertex_memexport = HasMemExportSideEffects(vertex_shader, vertex_translation);
+  const bool pixel_memexport = HasMemExportSideEffects(pixel_shader, fragment_translation);
+  if (vertex_memexport || pixel_memexport) {
+    return reject("exact output-merger does not route memexport draws");
+  }
+
+  const std::array<uint64_t, 5> pipeline_key = {
+      uint64_t(reinterpret_cast<uintptr_t>(vertex_translation)),
+      vertex_translation->msl_source_generation(),
+      uint64_t(reinterpret_cast<uintptr_t>(fragment_translation)),
+      fragment_translation->msl_source_generation(), sample_count};
+  ExactOutputMergerPipeline* pipeline = nullptr;
+  auto pipeline_it = exact_output_merger_pipeline_states_.find(pipeline_key);
+  if (pipeline_it != exact_output_merger_pipeline_states_.end()) {
+    pipeline = pipeline_it->second;
+  } else {
+    std::string pipeline_error;
+    pipeline = CreateExactOutputMergerPipelineFromTranslations(
+        exact_output_merger_resources_, *vertex_translation, *fragment_translation, sample_count,
+        &pipeline_error);
+    if (!pipeline) {
+      return reject(pipeline_error.empty() ? "exact output-merger pipeline creation failed"
+                                           : std::move(pipeline_error));
+    }
+    exact_output_merger_pipeline_states_.emplace(pipeline_key, pipeline);
+  }
+
+  ExactOutputMergerPipelineLayout pipeline_layout;
+  if (!GetExactOutputMergerPipelineLayout(pipeline, pipeline_layout) ||
+      pipeline_layout.vertex.vertex_data_buffer_index != UINT32_MAX) {
+    return reject("exact output-merger pipeline layout needs unsupported host vertex data");
+  }
+
+  ExactOutputMergerDrawState exact_state;
+  std::string state_error;
+  if (!BuildExactOutputMergerDrawStateFromRegisters(
+          *register_file_, system_constants_, coverage_width, coverage_height,
+          uint32_t(pixel_shader.writes_color_targets()), primitive_polygonal, vertex_memexport,
+          pixel_memexport, false, exact_state, &state_error)) {
+    return reject(state_error.empty() ? "exact output-merger register state is unsupported"
+                                      : std::move(state_error));
+  }
+  if (!exact_state.active_color_target_mask && !exact_state.depth_stencil_enabled) {
+    return reject("exact output-merger draw has no active color or depth-stencil output");
+  }
+
+  enum class DirectTextureKind : uint8_t {
+    kNone,
+    kResolvedColor,
+    kResolvedDepth,
+    kGoldenEyePostprocess,
+  };
+  std::array<DirectTextureKind, 32> direct_texture_kinds = {};
+  std::array<void*, 32> direct_textures = {};
+  std::array<uint32_t, 32> direct_texture_widths = {};
+  std::array<uint32_t, 32> direct_texture_heights = {};
+  std::array<uint32_t, 32> direct_texture_swizzles = {};
+  std::array<uint8_t, 32> direct_texture_signs = {};
+  uint32_t direct_texture_mask = 0;
+  const uint32_t used_texture_mask = vertex_shader.GetUsedTextureMaskAfterTranslation() |
+                                     pixel_shader.GetUsedTextureMaskAfterTranslation();
+  const GoldenEyePostprocessBand goldeneye_postprocess_band = GetGoldenEyePostprocessBand();
+  std::array<std::array<uint32_t, 6>, 3> goldeneye_postprocess_fetches = {};
+  for (uint32_t fetch_index = 0; fetch_index < goldeneye_postprocess_fetches.size();
+       ++fetch_index) {
+    const xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(fetch_index);
+    goldeneye_postprocess_fetches[fetch_index] = {
+        fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5,
+    };
+  }
+  const bool goldeneye_postprocess_draw = IsGoldenEyePostprocessConsumerDraw(
+      vertex_shader.ucode_data_hash(), pixel_shader.ucode_data_hash(),
+      primitive_processing_result.guest_primitive_type,
+      primitive_processing_result.guest_draw_vertex_count, goldeneye_postprocess_band, bin_mask_,
+      goldeneye_postprocess_fetches);
+  uint32_t textures_to_classify = used_texture_mask;
+  uint32_t texture_index = 0;
+  while (rex::bit_scan_forward(textures_to_classify, &texture_index)) {
+    textures_to_classify &= ~(UINT32_C(1) << texture_index);
+    const xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(texture_index);
+    void*& texture = direct_textures[texture_index];
+    uint32_t& width = direct_texture_widths[texture_index];
+    uint32_t& height = direct_texture_heights[texture_index];
+    uint32_t& swizzle = direct_texture_swizzles[texture_index];
+    uint8_t& signs = direct_texture_signs[texture_index];
+    if (GetExactResolvedSurfaceTextureForFetch(fetch, texture, width, height, swizzle, signs)) {
+      direct_texture_kinds[texture_index] = DirectTextureKind::kResolvedColor;
+    } else if (GetResolvedDepthSnapshotTextureForFetch(fetch, texture, width, height, swizzle,
+                                                       signs)) {
+      direct_texture_kinds[texture_index] = DirectTextureKind::kResolvedDepth;
+    } else if (goldeneye_postprocess_draw &&
+               GetGoldenEyePostprocessTextureForFetch(pixel_shader.ucode_data_hash(), fetch,
+                                                      texture, width, height, swizzle, signs)) {
+      direct_texture_kinds[texture_index] = DirectTextureKind::kGoldenEyePostprocess;
+    }
+    if (direct_texture_kinds[texture_index] != DirectTextureKind::kNone) {
+      direct_texture_mask |= UINT32_C(1) << texture_index;
+    }
+  }
+
+  const uint32_t cached_texture_mask = used_texture_mask & ~direct_texture_mask;
+  if (cached_texture_mask) {
+    texture_cache_->RequestTextures(cached_texture_mask);
+  }
+
+  uint32_t direct_textures_to_revalidate = direct_texture_mask;
+  texture_index = 0;
+  while (rex::bit_scan_forward(direct_textures_to_revalidate, &texture_index)) {
+    direct_textures_to_revalidate &= ~(UINT32_C(1) << texture_index);
+    const xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(texture_index);
+    void* texture = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t swizzle = 0;
+    uint8_t signs = 0;
+    bool valid = false;
+    switch (direct_texture_kinds[texture_index]) {
+      case DirectTextureKind::kResolvedColor:
+        valid =
+            GetExactResolvedSurfaceTextureForFetch(fetch, texture, width, height, swizzle, signs);
+        break;
+      case DirectTextureKind::kResolvedDepth:
+        valid =
+            GetResolvedDepthSnapshotTextureForFetch(fetch, texture, width, height, swizzle, signs);
+        break;
+      case DirectTextureKind::kGoldenEyePostprocess:
+        valid = goldeneye_postprocess_draw &&
+                GetGoldenEyePostprocessTextureForFetch(pixel_shader.ucode_data_hash(), fetch,
+                                                       texture, width, height, swizzle, signs);
+        break;
+      default:
+        break;
+    }
+    if (!valid || texture != direct_textures[texture_index] ||
+        width != direct_texture_widths[texture_index] ||
+        height != direct_texture_heights[texture_index] ||
+        swizzle != direct_texture_swizzles[texture_index] ||
+        signs != direct_texture_signs[texture_index]) {
+      return reject("exact output-merger direct texture changed during preparation");
+    }
+  }
+
+  exact_state.system_constants.textures_resolution_scaled = 0;
+  uint32_t textures_to_update = used_texture_mask;
+  texture_index = 0;
+  while (rex::bit_scan_forward(textures_to_update, &texture_index)) {
+    textures_to_update &= ~(UINT32_C(1) << texture_index);
+    const bool direct = (direct_texture_mask & (UINT32_C(1) << texture_index)) != 0;
+    uint32_t& signs_word = exact_state.system_constants.texture_swizzled_signs[texture_index >> 2];
+    const uint32_t signs_shift = 8 * (texture_index & 3);
+    const uint32_t signs_mask = UINT32_C(0xFF) << signs_shift;
+    const uint32_t signs = direct ? direct_texture_signs[texture_index]
+                                  : texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
+    signs_word = (signs_word & ~signs_mask) | ((signs & 0xFF) << signs_shift);
+
+    uint32_t& swizzle_word = exact_state.system_constants.texture_swizzles[texture_index >> 1];
+    const uint32_t swizzle_shift = 12 * (texture_index & 1);
+    const uint32_t swizzle_mask = UINT32_C(0xFFF) << swizzle_shift;
+    const uint32_t swizzle = direct ? direct_texture_swizzles[texture_index]
+                                    : texture_cache_->GetActiveTextureHostSwizzle(texture_index);
+    swizzle_word = (swizzle_word & ~swizzle_mask) | ((swizzle & 0xFFF) << swizzle_shift);
+    if (!direct && texture_cache_->IsActiveTextureResolutionScaled(texture_index)) {
+      exact_state.system_constants.textures_resolution_scaled |= UINT32_C(1) << texture_index;
+    }
+  }
+
+  auto build_texture_slots = [&](MetalShader& shader, MetalShader::MetalTranslation& translation,
+                                 const ExactOutputMergerStageLayout& layout,
+                                 std::vector<ExactOutputMergerTextureSlot>& slots) -> bool {
+    const std::vector<uint32_t>& fetches = GetMslTextureFetchConstantsByBindingIndex(&translation);
+    const auto& bindings = shader.GetTextureBindingsAfterTranslation();
+    if (fetches.size() != layout.texture_count || bindings.size() < fetches.size()) {
+      return false;
+    }
+    slots.clear();
+    slots.resize(fetches.size());
+    for (size_t i = 0; i < fetches.size(); ++i) {
+      const uint32_t fetch_index = fetches[i];
+      if (fetch_index >= 32) {
+        return false;
+      }
+      ExactOutputMergerTextureSlot& slot = slots[i];
+      const bool direct = (direct_texture_mask & (UINT32_C(1) << fetch_index)) != 0;
+      const bool is_signed = bool(bindings[i].is_signed);
+      slot.metal_texture = direct ? direct_textures[fetch_index]
+                                  : texture_cache_->GetActiveTexture(fetch_index, is_signed);
+      slot.width = direct ? direct_texture_widths[fetch_index]
+                          : texture_cache_->GetActiveTextureWidth(fetch_index);
+      slot.height = direct ? direct_texture_heights[fetch_index]
+                           : texture_cache_->GetActiveTextureHeight(fetch_index);
+      slot.array_length =
+          direct ? 1 : texture_cache_->GetActiveTextureArrayLength(fetch_index, is_signed);
+      if (!slot.metal_texture || !slot.width || !slot.height || !slot.array_length) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  std::vector<ExactOutputMergerTextureSlot> vertex_textures;
+  std::vector<ExactOutputMergerTextureSlot> fragment_textures;
+  if (!build_texture_slots(vertex_shader, *vertex_translation, pipeline_layout.vertex,
+                           vertex_textures) ||
+      !build_texture_slots(pixel_shader, *fragment_translation, pipeline_layout.fragment,
+                           fragment_textures)) {
+    return reject("exact output-merger resident texture bindings are unavailable");
+  }
+  std::vector<ProbeSamplerSlot> vertex_samplers =
+      MakeProbeSamplerSlots(*register_file_, vertex_shader);
+  std::vector<ProbeSamplerSlot> fragment_samplers =
+      MakeProbeSamplerSlots(*register_file_, pixel_shader);
+  if (vertex_samplers.size() != pipeline_layout.vertex.sampler_count ||
+      fragment_samplers.size() != pipeline_layout.fragment.sampler_count) {
+    return reject("exact output-merger sampler bindings do not match reflection");
+  }
+
+  const bool needs_shared_memory =
+      pipeline_layout.vertex.shared_memory_buffer_index != UINT32_MAX ||
+      pipeline_layout.fragment.shared_memory_buffer_index != UINT32_MAX;
+  void* resident_shared_memory = nullptr;
+  if (needs_shared_memory) {
+    if (!EnsureVertexFetchRangesResident(vertex_shader) ||
+        !(resident_shared_memory = shared_memory_->buffer())) {
+      return reject("exact output-merger shared-memory residency failed");
+    }
+  }
+
+  std::vector<uint32_t> vertex_float_constants;
+  std::vector<uint32_t> fragment_float_constants;
+  if (ExactOutputMergerStageUsesFloatConstants(pipeline_layout.vertex)) {
+    PackFloatConstantsForShader(*register_file_, vertex_shader, vertex_float_constants);
+  }
+  if (ExactOutputMergerStageUsesFloatConstants(pipeline_layout.fragment)) {
+    PackFloatConstantsForShader(*register_file_, pixel_shader, fragment_float_constants);
+  }
+
+  ProbeRasterizationState rasterization = {};
+  const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(*register_file_);
+  const bool depth_float24 =
+      depth_control.z_enable && register_file_->Get<reg::RB_DEPTH_INFO>().depth_format ==
+                                    xenos::DepthRenderTargetFormat::kD24FS8;
+  draw_util::ViewportInfo viewport = {};
+  draw_util::GetHostViewportInfo(*register_file_, 1, 1, true, coverage_width, coverage_height, true,
+                                 depth_control, depth_float24, depth_float24,
+                                 pixel_shader.writes_depth(), viewport);
+  draw_util::Scissor scissor = {};
+  draw_util::GetScissor(*register_file_, scissor);
+  const uint32_t scissor_x = std::min(scissor.offset[0], coverage_width);
+  const uint32_t scissor_y = std::min(scissor.offset[1], coverage_height);
+  const uint32_t scissor_width = std::min(scissor.extent[0], coverage_width - scissor_x);
+  const uint32_t scissor_height = std::min(scissor.extent[1], coverage_height - scissor_y);
+  if (!viewport.xy_extent[0] || !viewport.xy_extent[1] || !scissor_width || !scissor_height) {
+    return reject("exact output-merger viewport or scissor is empty");
+  }
+  rasterization.viewport_x = viewport.xy_offset[0];
+  rasterization.viewport_y = viewport.xy_offset[1];
+  rasterization.viewport_width = viewport.xy_extent[0];
+  rasterization.viewport_height = viewport.xy_extent[1];
+  rasterization.viewport_z_min = viewport.z_min;
+  rasterization.viewport_z_max = viewport.z_max;
+  rasterization.scissor_x = scissor_x;
+  rasterization.scissor_y = scissor_y;
+  rasterization.scissor_width = scissor_width;
+  rasterization.scissor_height = scissor_height;
+  rasterization.depth_clamp_enabled = register_file_->Get<reg::PA_CL_CLIP_CNTL>().clip_disable != 0;
+  if (primitive_polygonal) {
+    const reg::PA_SU_SC_MODE_CNTL mode_control = register_file_->Get<reg::PA_SU_SC_MODE_CNTL>();
+    rasterization.front_face_clockwise = mode_control.face != 0;
+    if (mode_control.cull_front != mode_control.cull_back) {
+      rasterization.cull_mode =
+          mode_control.cull_front ? ProbeCullMode::kFront : ProbeCullMode::kBack;
+    } else if (mode_control.cull_front) {
+      return reject("exact output-merger draw is fully culled");
+    }
+  }
+
+  ProbeIndexBuffer index_buffer = {};
+  const ProbeIndexBuffer* index_buffer_ptr = nullptr;
+  if (primitive_processing_result.index_buffer_type !=
+      PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+    index_buffer.index_size =
+        primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4;
+    if (primitive_processing_result.index_buffer_type ==
+        PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+      index_buffer.metal_buffer = shared_memory_->buffer();
+      index_buffer.size = SharedMemory::kBufferSize;
+      index_buffer.offset = primitive_processing_result.guest_index_base;
+      if (!index_buffer.metal_buffer) {
+        return reject("exact output-merger guest index buffer is unavailable");
+      }
+    } else {
+      const void* processed_indices = nullptr;
+      size_t processed_index_size = 0;
+      auto* metal_primitive_processor =
+          primitive_processor_ ? static_cast<MetalPrimitiveProcessor*>(primitive_processor_.get())
+                               : nullptr;
+      if (!metal_primitive_processor ||
+          !metal_primitive_processor->GetProcessedIndexBufferData(
+              primitive_processing_result, processed_indices, processed_index_size) ||
+          !processed_indices || !processed_index_size) {
+        return reject("exact output-merger processed index buffer is unavailable");
+      }
+      index_buffer.data = processed_indices;
+      index_buffer.size = processed_index_size;
+      index_buffer.production_host_data_trusted = true;
+    }
+    index_buffer_ptr = &index_buffer;
+  }
+
+  if (!exact_output_merger_residency_.exact_gpu_current()) {
+    if (!CaptureCanonicalEdramSnapshot(exact_output_merger_edram_transfer_, error_out)) {
+      if (error_out && error_out->empty()) {
+        *error_out = "exact output-merger canonical EDRAM capture failed";
+      }
+      return ExactOutputMergerExecutionResult::kRejectedBeforeSubmit;
+    }
+    if (!UploadExactOutputMergerEdram(exact_output_merger_resources_,
+                                      exact_output_merger_edram_transfer_.data(),
+                                      exact_output_merger_edram_transfer_.size(), error_out)) {
+      if (error_out && error_out->empty()) {
+        *error_out = "exact output-merger EDRAM upload failed";
+      }
+      return ExactOutputMergerExecutionResult::kRejectedBeforeSubmit;
+    }
+    ++exact_output_merger_profile_counters_.full_uploads;
+    exact_output_merger_profile_counters_.full_upload_bytes +=
+        exact_output_merger_edram_transfer_.size();
+  }
+
+  ExactOutputMergerBorrowedDraw draw = {};
+  draw.pipeline = pipeline;
+  draw.pipeline_layout = pipeline_layout;
+  draw.coverage_width = coverage_width;
+  draw.coverage_height = coverage_height;
+  draw.sample_count = sample_count;
+  draw.system_constants = &exact_state.system_constants;
+  draw.system_constants_size = sizeof(exact_state.system_constants);
+  draw.vertex_float_constants =
+      vertex_float_constants.empty() ? nullptr : vertex_float_constants.data();
+  draw.vertex_float_constants_size = vertex_float_constants.size() * sizeof(uint32_t);
+  draw.fragment_float_constants =
+      fragment_float_constants.empty() ? nullptr : fragment_float_constants.data();
+  draw.fragment_float_constants_size = fragment_float_constants.size() * sizeof(uint32_t);
+  const bool pipeline_uses_fetch_constants =
+      ExactOutputMergerPipelineUsesFetchConstants(pipeline_layout);
+  draw.fetch_constants = pipeline_uses_fetch_constants ? fetch_constants_.data() : nullptr;
+  draw.fetch_constants_size =
+      pipeline_uses_fetch_constants ? fetch_constants_.size() * sizeof(uint32_t) : 0;
+  const bool pipeline_uses_bool_loop_constants =
+      ExactOutputMergerPipelineUsesBoolLoopConstants(pipeline_layout);
+  draw.bool_loop_constants =
+      pipeline_uses_bool_loop_constants ? bool_loop_constants_.data() : nullptr;
+  draw.bool_loop_constants_size =
+      pipeline_uses_bool_loop_constants ? bool_loop_constants_.size() * sizeof(uint32_t) : 0;
+  draw.shared_memory_metal_buffer = resident_shared_memory;
+  draw.shared_memory_size = resident_shared_memory ? SharedMemory::kBufferSize : 0;
+  draw.vertex_textures = vertex_textures.empty() ? nullptr : vertex_textures.data();
+  draw.vertex_texture_count = vertex_textures.size();
+  draw.vertex_samplers = vertex_samplers.empty() ? nullptr : vertex_samplers.data();
+  draw.vertex_sampler_count = vertex_samplers.size();
+  draw.fragment_textures = fragment_textures.empty() ? nullptr : fragment_textures.data();
+  draw.fragment_texture_count = fragment_textures.size();
+  draw.fragment_samplers = fragment_samplers.empty() ? nullptr : fragment_samplers.data();
+  draw.fragment_sampler_count = fragment_samplers.size();
+  draw.index_buffer = index_buffer_ptr;
+  draw.rasterization_state = &rasterization;
+  draw.primitive_type = uint32_t(primitive_processing_result.host_primitive_type);
+  draw.primitive_restart_enabled = primitive_processing_result.host_primitive_reset_enabled;
+  draw.primitive_restart_index =
+      draw.primitive_restart_enabled && index_buffer.index_size == 2 ? UINT16_MAX : UINT32_MAX;
+  draw.vertex_start = 0;
+  draw.vertex_count = primitive_processing_result.host_draw_vertex_count;
+  draw.instance_count = 1;
+  // The translated vertex shader owns VGT_INDX_OFFSET through
+  // SystemConstants::vertex_base_index. Passing it to Metal as baseVertex too
+  // would apply the guest offset twice.
+  draw.base_vertex = 0;
+  draw.base_instance = 0;
+
+  ExactOutputMergerExecutionResult result =
+      ExecuteExactOutputMergerDraw(exact_output_merger_resources_, draw, error_out);
+  if (result == ExactOutputMergerExecutionResult::kRejectedBeforeSubmit) {
+    return result;
+  }
+  if (result == ExactOutputMergerExecutionResult::kFailedAfterSubmit) {
+    return fail_after_submit(error_out && !error_out->empty()
+                                 ? *error_out
+                                 : "exact output-merger Metal submission failed");
+  }
+
+  if (!exact_output_merger_residency_.RecordExactDraw()) {
+    return fail_after_submit("exact output-merger residency transition failed after submission");
+  }
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (exact_state.active_color_target_mask & (uint32_t(1) << i)) {
+      RecordCanonicalColorRequirement(exact_state.color_surfaces[i].color_format,
+                                      surface_info.msaa_samples);
+    }
+  }
+  if (exact_state.depth_stencil_enabled) {
+    RecordCanonicalDepthRequirement(exact_state.depth_surface.depth_format,
+                                    surface_info.msaa_samples);
+  }
+  if (error_out) {
+    error_out->clear();
+  }
+  return result;
+}
+
+void MetalCommandProcessor::ClearExactOutputMergerPipelineCache() {
+  for (auto& [key, pipeline] : exact_output_merger_pipeline_states_) {
+    (void)key;
+    ReleaseExactOutputMergerPipeline(pipeline);
+  }
+  exact_output_merger_pipeline_states_.clear();
+}
+
+void MetalCommandProcessor::ShutdownExactOutputMerger() {
+  // Resource release drains every retained exact command buffer. Keep the
+  // pipeline wrappers alive until that fence has completed.
+  ReleaseExactOutputMergerResources(exact_output_merger_resources_);
+  exact_output_merger_resources_ = nullptr;
+  ClearExactOutputMergerPipelineCache();
+  exact_output_merger_edram_transfer_.clear();
+  exact_output_merger_shader_translator_.reset();
+}
+
 void MetalCommandProcessor::ClearCaches() {
+  std::string exact_materialization_error;
+  if (!MaterializeExactOutputMergerEdram("cache clear", &exact_materialization_error)) {
+    ++pipeline_probe_failure_count_;
+    REXGPU_ERROR(
+        "Metal cache clear could not materialize exact EDRAM: {}",
+        exact_materialization_error.empty() ? "unknown error" : exact_materialization_error);
+  }
   if (!FlushGpuCompletionMemoryWrites()) {
     ++pipeline_probe_failure_count_;
   }
@@ -2809,7 +3878,14 @@ void MetalCommandProcessor::ClearCaches() {
     exact_resolved_surface_ = {};
   }
   exact_resolved_surface_invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
-  observed_exact_resolved_surface_fetches_.clear();
+  ClearExactOutputMergerPipelineCache();
+  // Materialization above leaves the idle exact resource coherent with the
+  // canonical image. Keep that authority valid while the shared-memory cache
+  // invokes its host-mutation fence below. Intentionally invalidating an idle
+  // resource here would make that callback indistinguishable from a submitted
+  // Metal failure and permanently poison command-processor residency. The
+  // next exact draw uploads the then-current canonical image before reuse.
+  exact_output_merger_edram_transfer_.clear();
   // Phase 0.5: mirror VulkanCommandProcessor::ClearCaches for the shared-memory /
   // texture-cache lifecycle, scoped to base-class methods present in Metal.
   if (texture_cache_) {
@@ -2822,8 +3898,7 @@ void MetalCommandProcessor::ClearCaches() {
   // must not promote ordinary live target contents into a hydration source.
   // The live full-surface layouts may wrap physical EDRAM and alias each other.
   const bool preserve_restored_edram =
-      !canonical_edram_unsupported_state_ &&
-      canonical_edram_state_.target_hydration_enabled();
+      !canonical_edram_unsupported_state_ && canonical_edram_state_.target_hydration_enabled();
   if (preserve_restored_edram) {
     std::vector<uint8_t> canonical_edram;
     std::string canonical_error;
@@ -2846,6 +3921,7 @@ void MetalCommandProcessor::ClearCaches() {
     canonical_edram_state_.Reset();
   }
   canonical_edram_ownership_.Reset();
+  canonical_edram_unexportable_native_alias_ = false;
   for (auto& rt_entry : host_render_targets_) {
     if (rt_entry.second.context) {
       ResetPipelineProbeContext(rt_entry.second.context);
@@ -2887,8 +3963,8 @@ void MetalCommandProcessor::ShutdownContext() {
     exact_resolved_surface_ = {};
   }
   exact_resolved_surface_invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
-  observed_exact_resolved_surface_fetches_.clear();
   ShutdownPipelineArchive();
+  ShutdownExactOutputMerger();
   REXLOG_INFO("Metal shader cache shutdown: {} shaders cached, {} translated, {} failed",
               shaders_.size(), translated_shader_count_, failed_shader_translation_count_);
   for (auto& pipeline_entry : render_pipeline_states_) {
@@ -2954,6 +4030,8 @@ void MetalCommandProcessor::ShutdownContext() {
   canonical_edram_state_.Reset();
   canonical_edram_transfer_active_ = false;
   canonical_edram_unsupported_state_ = false;
+  canonical_edram_unexportable_native_alias_ = false;
+  exact_output_merger_residency_.RecordCanonicalReplacement();
   ReleasePipelineProbeContext(host_render_target_context_);
   host_render_target_context_ = nullptr;
   host_render_target_context_override_ = nullptr;
@@ -3036,6 +4114,34 @@ bool MetalCommandProcessor::FlushGpuCompletionMemoryWrites() {
   if (pending_gpu_completion_writes_.empty()) {
     return true;
   }
+  // Reap older shared-memory uploads before any dependent exact/native work
+  // is accepted as complete. A later command buffer may report Completed even
+  // when an earlier upload failed, and the enqueue fallback must not consume
+  // that failure before deciding whether the guest completion is publishable.
+  if (shared_memory_ && !shared_memory_->WaitForPendingUploads()) {
+    ++pipeline_probe_failure_count_;
+    REXGPU_ERROR("Metal guest completion fence found a failed predecessor upload");
+    if (exact_output_merger_resources_) {
+      InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+      InvalidateCanonicalEdramAfterExactFailure();
+    }
+    return false;
+  }
+  // A later command buffer on the same Metal queue may complete even if an
+  // earlier exact EDRAM command buffer failed. Reap the exact authority epoch
+  // before enqueueing a guest-visible completion value so EVENT_WRITE_SHD can
+  // never acknowledge an exact resolve whose publication was revoked.
+  if (exact_output_merger_resources_) {
+    std::string exact_error;
+    if (!WaitExactOutputMergerDraws(exact_output_merger_resources_, &exact_error, nullptr)) {
+      ++pipeline_probe_failure_count_;
+      REXGPU_ERROR("Metal exact output-merger guest completion fence failed: {}",
+                   exact_error.empty() ? "unknown error" : exact_error);
+      InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+      InvalidateCanonicalEdramAfterExactFailure();
+      return false;
+    }
+  }
   std::vector<std::pair<uint32_t, uint32_t>> publication_ranges =
       MergeByteRanges(pending_gpu_tiled_resolve_publication_ranges_);
   std::vector<MetalSharedMemory::OrderedGuestMemoryWrite> completion_writes;
@@ -3111,6 +4217,32 @@ void MetalCommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+uint32_t MetalCommandProcessor::QueryPendingBackendSubmissionsForProfile() const {
+  std::unordered_set<void*> contexts;
+  auto add_context = [&](void* context) {
+    if (context) {
+      contexts.insert(context);
+    }
+  };
+  add_context(pipeline_probe_context_);
+  add_context(host_pixel_probe_context_);
+  add_context(host_render_target_context_);
+  add_context(host_render_target_context_override_);
+  for (const auto& target_entry : host_render_targets_) {
+    add_context(target_entry.second.context);
+  }
+  for (const auto& depth_entry : host_depth_stencil_targets_) {
+    add_context(depth_entry.second.context);
+  }
+  uint64_t pending_submissions = 0;
+  for (void* context : contexts) {
+    pending_submissions += GetPipelineProbeContextPendingSubmissionCount(context);
+  }
+  pending_submissions +=
+      GetExactOutputMergerPendingDrawCount(exact_output_merger_resources_);
+  return uint32_t(std::min<uint64_t>(pending_submissions, UINT32_MAX));
+}
+
 void MetalCommandProcessor::PrepareForWait() {
   if (!FlushGpuCompletionMemoryWrites()) {
     ++pipeline_probe_failure_count_;
@@ -3119,8 +4251,8 @@ void MetalCommandProcessor::PrepareForWait() {
 }
 
 CommandProcessor::GpuCompletionMemoryWriteWaitResult
-MetalCommandProcessor::WaitForGpuCompletionMemoryWrite(
-    uint32_t address, uint32_t length, std::chrono::milliseconds timeout) {
+MetalCommandProcessor::WaitForGpuCompletionMemoryWrite(uint32_t address, uint32_t length,
+                                                       std::chrono::milliseconds timeout) {
   if (!shared_memory_) {
     return GpuCompletionMemoryWriteWaitResult::kUnavailable;
   }
@@ -3156,8 +4288,7 @@ bool MetalCommandProcessor::BeginWaitRegMemMemoryChange(uint32_t address, uint32
   return true;
 }
 
-CommandProcessor::WaitRegMemMemoryChangeResult
-MetalCommandProcessor::WaitForWaitRegMemMemoryChange(
+CommandProcessor::WaitRegMemMemoryChangeResult MetalCommandProcessor::WaitForWaitRegMemMemoryChange(
     std::chrono::milliseconds timeout) {
   if (!wait_reg_mem_memory_change_event_ ||
       wait_reg_mem_memory_change_first_.load(std::memory_order_acquire) == UINT32_MAX) {
@@ -3765,8 +4896,13 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
       ++color_target_candidate_draws_this_swap_;
     }
   }
+  uint32_t route_color_mask = active_color_write_mask();
+  bool requires_true_mrt = edram_mode == xenos::EdramMode::kColorDepth && pixel_shader &&
+                           pixel_shader->writes_color_targets() &&
+                           RequiresTrueMrtSubmission(route_color_mask);
   if (metal_device_ && vertex_shader && vertex_translation_ok &&
-      HasMemExportSideEffects(*vertex_shader, vertex_translation)) {
+      HasMemExportSideEffects(*vertex_shader, vertex_translation) &&
+      (!requires_true_mrt || guest_faces_fully_culled)) {
     update_draw_constants();
     if (!WaitForPipelineProbeSubmissions("memexport")) {
       return false;
@@ -3833,25 +4969,337 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
   }
   bool pixel_memexport_draw = edram_mode == xenos::EdramMode::kColorDepth && pixel_shader &&
                               HasMemExportSideEffects(*pixel_shader, pixel_translation);
+  if (REXCVAR_GET(metal_exact_output_merger) && edram_mode == xenos::EdramMode::kColorDepth &&
+      primitive_processing_ok && vertex_shader && pixel_shader &&
+      route_vertex_shader == vertex_shader && !route_uses_reused_position_shader &&
+      vertex_shader->writes_position()) {
+    update_draw_constants();
+    std::string exact_error;
+    const ExactOutputMergerExecutionResult exact_result =
+        TryExecuteExactOutputMergerDraw(*vertex_shader, *pixel_shader, primitive_processing_result,
+                                        guest_primitive_polygonal, &exact_error);
+    ++exact_output_merger_profile_counters_.attempts;
+    switch (exact_result) {
+      case ExactOutputMergerExecutionResult::kEnqueued:
+        ++exact_output_merger_profile_counters_.enqueued;
+        break;
+      case ExactOutputMergerExecutionResult::kCompleted:
+        ++exact_output_merger_profile_counters_.completed;
+        break;
+      case ExactOutputMergerExecutionResult::kRejectedBeforeSubmit:
+        ++exact_output_merger_profile_counters_.rejected;
+        break;
+      case ExactOutputMergerExecutionResult::kFailedAfterSubmit:
+      default:
+        ++exact_output_merger_profile_counters_.terminal_failures;
+        break;
+    }
+    switch (GetExactOutputMergerRouteDecision(exact_result)) {
+      case ExactOutputMergerRouteDecision::kReturnSuccess: {
+        static std::atomic<uint32_t> exact_success_logs{0};
+        const uint32_t success_index =
+            exact_success_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogMetalDiagnostic(success_index, 16, 0xFF)) {
+          const char* ownership = exact_result == ExactOutputMergerExecutionResult::kEnqueued
+                                      ? "enqueued"
+                                      : "completed";
+          std::fprintf(
+              stderr,
+              "[metal] exact output-merger draw %s#%u draw=%u "
+              "vs=%016llx ps=%016llx samples=%u\n",
+              ownership, success_index, metal_draw_index,
+              static_cast<unsigned long long>(vertex_shader->ucode_data_hash()),
+              static_cast<unsigned long long>(pixel_shader->ucode_data_hash()),
+              GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples));
+          std::fflush(stderr);
+        }
+        return true;
+      }
+      case ExactOutputMergerRouteDecision::kReturnFailure:
+        REXGPU_ERROR("Metal exact output-merger draw failed after submission: {}",
+                     exact_error.empty() ? "unknown error" : exact_error);
+        return false;
+      case ExactOutputMergerRouteDecision::kContinueNative:
+      default: {
+        static std::atomic<uint32_t> exact_rejection_logs{0};
+        const uint32_t rejection_index =
+            exact_rejection_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogMetalDiagnostic(rejection_index, 32, 0xFF)) {
+          std::fprintf(stderr,
+                       "[metal] exact output-merger pre-submit fallback#%u draw=%u "
+                       "vs=%016llx ps=%016llx reason=%s\n",
+                       rejection_index, metal_draw_index,
+                       static_cast<unsigned long long>(vertex_shader->ucode_data_hash()),
+                       static_cast<unsigned long long>(pixel_shader->ucode_data_hash()),
+                       exact_error.empty() ? "unsupported draw" : exact_error.c_str());
+          std::fflush(stderr);
+        }
+        break;
+      }
+    }
+  }
+  std::string exact_materialization_error;
+  if (!MaterializeExactOutputMergerEdram("native draw", &exact_materialization_error)) {
+    REXGPU_ERROR(
+        "Metal native draw could not materialize exact EDRAM: {}",
+        exact_materialization_error.empty() ? "unknown error" : exact_materialization_error);
+    return false;
+  }
+  if (requires_true_mrt) {
+    ++production_mrt_attempts_this_swap_;
+    static std::atomic<uint32_t> production_mrt_failure_logs{0};
+    auto fail_production_mrt = [&](const std::string& reason) {
+      ++unsupported_mrt_draws_this_swap_;
+      ++production_mrt_rejections_this_swap_;
+      uint32_t failure_index =
+          production_mrt_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      // This text is intentionally unconditional and matches the stability
+      // cycle's release-fatal marker set. Never fall back to per-target replay:
+      // depth, stencil, discard, blending and memexport are draw side effects.
+      std::fprintf(
+          stderr,
+          "[metal] production MRT route failed#%u draw=%u active=%u mask=0x%04x "
+          "vs=%016llx ps=%016llx reason=%s; legacy per-target replay is disabled\n",
+          failure_index, metal_draw_index, CountActiveColorTargets(route_color_mask),
+          route_color_mask,
+          static_cast<unsigned long long>(vertex_shader ? vertex_shader->ucode_data_hash() : 0),
+          static_cast<unsigned long long>(pixel_shader ? pixel_shader->ucode_data_hash() : 0),
+          reason.c_str());
+      std::fflush(stderr);
+      REXGPU_ERROR("Metal production MRT draw failed closed: {}", reason);
+      return false;
+    };
+
+    const MrtActiveAttachmentSet active_attachments = GetMrtActiveAttachmentSet(route_color_mask);
+    if (!metal_device_ || !register_file_ || !pixel_shader || !pixel_translation_ok ||
+        !route_vertex_shader || !route_vertex_shader->writes_position()) {
+      return fail_production_mrt("missing translated position or fragment shader route");
+    }
+    if (!IsMrtVertexRouteSideEffectSafe(
+            route_uses_reused_position_shader,
+            vertex_shader && HasMemExportSideEffects(*vertex_shader, vertex_translation))) {
+      return fail_production_mrt(
+          "position-shader reuse would drop the active vertex program's memexport");
+    }
+    uint64_t mrt_vertex_modification = 0;
+    uint64_t mrt_pixel_modification = 0;
+    GetCurrentShaderModifications(route_vertex_shader, pixel_shader, mrt_vertex_modification,
+                                  mrt_pixel_modification);
+    MetalShader::MetalTranslation* route_vertex_translation =
+        GetTranslatedShader(*route_vertex_shader, mrt_vertex_modification);
+    MetalShader::MetalTranslation* mrt_pixel_translation =
+        GetTranslatedShader(*pixel_shader, mrt_pixel_modification);
+    if (!route_vertex_translation || !route_vertex_translation->metal_library() ||
+        !mrt_pixel_translation || !mrt_pixel_translation->metal_library()) {
+      return fail_production_mrt("translated MRT shader pair is unavailable");
+    }
+    if (IsVoidFragmentMsl(mrt_pixel_translation)) {
+      return fail_production_mrt("translated fragment shader has no executable MRT output");
+    }
+    const bool route_vertex_memexport_draw =
+        HasMemExportSideEffects(*route_vertex_shader, route_vertex_translation);
+    const bool route_pixel_memexport_draw =
+        HasMemExportSideEffects(*pixel_shader, mrt_pixel_translation);
+    if (route_uses_reused_position_shader && route_vertex_memexport_draw) {
+      return fail_production_mrt(
+          "reused position shader would execute stale vertex memexport side effects");
+    }
+    if (active_attachments.count < 2 ||
+        active_attachments.output_mask !=
+            uint8_t((route_color_mask & 0x000F ? 0x1 : 0) | (route_color_mask & 0x00F0 ? 0x2 : 0) |
+                    (route_color_mask & 0x0F00 ? 0x4 : 0) |
+                    (route_color_mask & 0xF000 ? 0x8 : 0))) {
+      return fail_production_mrt("invalid normalized MRT attachment set");
+    }
+
+    reg::RB_SURFACE_INFO mrt_surface_info = register_file_->Get<reg::RB_SURFACE_INFO>();
+    if (!mrt_surface_info.surface_pitch) {
+      return fail_production_mrt("zero guest surface pitch");
+    }
+    const uint32_t mrt_sample_count = GetMetalSampleCount(mrt_surface_info.msaa_samples);
+    const uint32_t mrt_width = std::max<uint32_t>(fallback_output_width_, 1);
+    const uint32_t mrt_height = std::max<uint32_t>(fallback_output_height_, 1);
+    ProbeRenderPipelineDescription mrt_pipeline_description = {};
+    mrt_pipeline_description.output_mask = active_attachments.output_mask;
+    std::array<MrtEdramSurface, xenos::kMaxColorRenderTargets + 1> mrt_edram_surfaces = {};
+    std::array<uint32_t, xenos::kMaxColorRenderTargets> mrt_color_info_values = {};
+    for (uint32_t active_index = 0; active_index < active_attachments.count; ++active_index) {
+      uint32_t rt_index = active_attachments.slots[active_index];
+      reg::RB_COLOR_INFO color_info = register_file_->Get<reg::RB_COLOR_INFO>(
+          reg::RB_COLOR_INFO::rt_register_indices[rt_index]);
+      ColorTargetStorageStrategy storage = GetColorTargetStorageStrategy(color_info.color_format);
+      if (!storage.native_render_target || !storage.canonical_byte_round_trip) {
+        return fail_production_mrt(
+            fmt::format("RT{} guest format {} has no exact native Metal storage", rt_index,
+                        uint32_t(color_info.color_format)));
+      }
+      uint32_t component_count =
+          xenos::GetColorRenderTargetFormatComponentCount(color_info.color_format);
+      if (!component_count || component_count > 4) {
+        return fail_production_mrt(fmt::format("RT{} has an invalid component count", rt_index));
+      }
+      ProbeColorTargetState& target_state = mrt_pipeline_description.color_targets[rt_index];
+      target_state.write_mask = uint8_t(((route_color_mask >> (rt_index * 4)) & 0xF) &
+                                        ((uint32_t(1) << component_count) - 1));
+      target_state.blend_control =
+          register_file_->values[reg::RB_BLENDCONTROL::rt_register_indices[rt_index]] & 0x1FFF1FFF;
+      target_state.color_format = color_info.color_format;
+      target_state.metal_storage = storage.kind;
+      if (!target_state.write_mask) {
+        return fail_production_mrt(
+            fmt::format("RT{} has no normalized component writes", rt_index));
+      }
+      uint32_t color_base = (color_info.color_base | (color_info.color_base_bit_11 << 11)) &
+                            (xenos::kEdramTileCount - 1);
+      bool is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_info.color_format);
+      uint32_t pitch_tiles = xenos::GetSurfacePitchTiles(mrt_surface_info.surface_pitch,
+                                                         mrt_surface_info.msaa_samples, is_64bpp);
+      mrt_edram_surfaces[rt_index] = MakeMrtEdramSurface(
+          color_base, pitch_tiles, mrt_surface_info.msaa_samples, is_64bpp, mrt_width, mrt_height);
+      mrt_color_info_values[rt_index] = color_info.value;
+    }
+    reg::RB_DEPTH_INFO mrt_depth_info = register_file_->Get<reg::RB_DEPTH_INFO>();
+    uint32_t depth_base = (mrt_depth_info.depth_base | (mrt_depth_info.depth_base_bit_11 << 11)) &
+                          (xenos::kEdramTileCount - 1);
+    uint32_t depth_pitch_tiles = xenos::GetSurfacePitchTiles(mrt_surface_info.surface_pitch,
+                                                             mrt_surface_info.msaa_samples, false);
+    if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
+      mrt_edram_surfaces[xenos::kMaxColorRenderTargets] =
+          MakeMrtEdramSurface(depth_base, depth_pitch_tiles, mrt_surface_info.msaa_samples, false,
+                              mrt_width, mrt_height);
+    }
+    MrtEdramValidation edram_validation = ValidateMrtEdramSurfaceSet(mrt_edram_surfaces);
+    if (edram_validation != MrtEdramValidation::kValid) {
+      const char* validation_name = "invalid-layout";
+      if (edram_validation == MrtEdramValidation::kSelfAliasing) {
+        validation_name = "self-alias";
+      } else if (edram_validation == MrtEdramValidation::kTargetOverlap) {
+        validation_name = "target-overlap";
+      }
+      return fail_production_mrt(
+          fmt::format("EDRAM attachment validation rejected {}", validation_name));
+    }
+
+    // All alias/layout rejection above occurs before creating a pipeline,
+    // hydrating resources, uploading guest data or executing either shader.
+    void* mrt_pipeline = EnsureMrtRenderPipeline(*route_vertex_shader, *pixel_shader,
+                                                 mrt_pipeline_description, mrt_sample_count);
+    if (!mrt_pipeline) {
+      return fail_production_mrt("four-slot Metal pipeline creation failed");
+    }
+
+    std::array<void*, xenos::kMaxColorRenderTargets> mrt_contexts = {};
+    std::array<HostRenderTarget*, xenos::kMaxColorRenderTargets> mrt_targets = {};
+    std::array<uint64_t, xenos::kMaxColorRenderTargets> mrt_target_keys = {};
+    uint64_t shared_depth_key = 0;
+    for (uint32_t active_index = 0; active_index < active_attachments.count; ++active_index) {
+      uint32_t rt_index = active_attachments.slots[active_index];
+      uint64_t target_key = GetHostRenderTargetKey(rt_index);
+      HostRenderTarget* target = target_key ? EnsureHostRenderTarget(rt_index) : nullptr;
+      if (!target || !target->context || target->rt_index != rt_index ||
+          target->color_info != mrt_color_info_values[rt_index] ||
+          target->surface_info != mrt_surface_info.value) {
+        return fail_production_mrt(fmt::format("RT{} context state is incomplete", rt_index));
+      }
+      if (!shared_depth_key) {
+        shared_depth_key = target->depth_stencil_key;
+      } else if (target->depth_stencil_key != shared_depth_key) {
+        return fail_production_mrt("color contexts do not share one depth/stencil identity");
+      }
+      for (uint32_t previous = 0; previous < active_index; ++previous) {
+        uint32_t previous_slot = active_attachments.slots[previous];
+        if (mrt_contexts[previous_slot] == target->context ||
+            mrt_target_keys[previous_slot] == target_key) {
+          return fail_production_mrt("color attachment context or canonical owner aliases");
+        }
+      }
+      mrt_contexts[rt_index] = target->context;
+      mrt_targets[rt_index] = target;
+      mrt_target_keys[rt_index] = target_key;
+    }
+    auto shared_depth_it = host_depth_stencil_targets_.find(shared_depth_key);
+    if (!shared_depth_key || shared_depth_it == host_depth_stencil_targets_.end() ||
+        !shared_depth_it->second.context ||
+        shared_depth_it->second.depth_info != mrt_depth_info.value ||
+        shared_depth_it->second.surface_info != mrt_surface_info.value) {
+      return fail_production_mrt("shared depth/stencil context state is incomplete");
+    }
+
+    update_draw_constants();
+    PipelineProbeMrtTelemetry mrt_telemetry;
+    bool mrt_routed = TryRenderPipelineProbe(
+        *route_vertex_shader, pixel_shader, mrt_pipeline, host_prim_type, host_draw_vertex_count,
+        true, primitive_processing_ok ? &primitive_processing_result : nullptr, 0, &mrt_contexts,
+        &mrt_pipeline_description, &mrt_telemetry);
+
+    production_mrt_targets_this_swap_ += mrt_telemetry.bound_color_target_count;
+    production_mrt_encoded_draws_this_swap_ += mrt_telemetry.encoded_draw_count;
+    production_mrt_completed_commands_this_swap_ += mrt_telemetry.completed_command_buffer_count;
+    if (mrt_telemetry.encoded_draw_count) {
+      production_mrt_vertex_memexport_draws_this_swap_ += route_vertex_memexport_draw ? 1 : 0;
+      production_mrt_pixel_memexport_draws_this_swap_ += route_pixel_memexport_draw ? 1 : 0;
+    }
+
+    // A completed command has changed target contents even if a later
+    // memexport publication step reports failure. Publish canonical ownership
+    // before failing closed so a caller can never retry against stale owners.
+    if (mrt_telemetry.completed_command_buffer_count == 1) {
+      for (uint32_t active_index = 0; active_index < active_attachments.count; ++active_index) {
+        uint32_t rt_index = active_attachments.slots[active_index];
+        MarkCanonicalColorTargetWritten(*mrt_targets[rt_index], mrt_target_keys[rt_index]);
+      }
+      if (depth_stencil_write_draw) {
+        MarkCanonicalDepthTargetWritten(shared_depth_it->second, shared_depth_it->first);
+      }
+    }
+    if (!mrt_routed) {
+      return fail_production_mrt("one-draw synchronous Metal submission failed");
+    }
+    const uint32_t expected_vertex_shared_binding =
+        route_vertex_translation->msl_reflection().shared_memory_buffer_index != UINT32_MAX ? 1 : 0;
+    const uint32_t expected_fragment_shared_binding =
+        mrt_pixel_translation->msl_reflection().shared_memory_buffer_index != UINT32_MAX ? 1 : 0;
+    if (!IsMrtSubmissionExactlyOnce(
+            active_attachments.count, mrt_telemetry.bound_color_target_count,
+            mrt_telemetry.encoded_draw_count, mrt_telemetry.depth_attachment_bind_count,
+            mrt_telemetry.completed_command_buffer_count) ||
+        mrt_telemetry.vertex_shared_memory_binding_count != expected_vertex_shared_binding ||
+        mrt_telemetry.fragment_shared_memory_binding_count != expected_fragment_shared_binding) {
+      return fail_production_mrt(fmt::format(
+          "exactly-once invariant failed (targets={} draws={} depth={} completed={} "
+          "v_shared={} f_shared={})",
+          mrt_telemetry.bound_color_target_count, mrt_telemetry.encoded_draw_count,
+          mrt_telemetry.depth_attachment_bind_count, mrt_telemetry.completed_command_buffer_count,
+          mrt_telemetry.vertex_shared_memory_binding_count,
+          mrt_telemetry.fragment_shared_memory_binding_count));
+    }
+    ++production_mrt_successes_this_swap_;
+    owned_rt_routed_this_draw = true;
+    if (collect_draw_route_summary_) {
+      ++owned_rt_routed_draws_this_swap_;
+      owned_rt_routed_targets_this_swap_ += active_attachments.count;
+    }
+    static std::atomic<uint32_t> production_mrt_success_logs{0};
+    uint32_t success_index =
+        production_mrt_success_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ShouldLogMetalDiagnostic(success_index, 32, 0xFF)) {
+      std::fprintf(
+          stderr,
+          "[metal] production MRT submit#%u draw=%u outputs=0x%x targets=%u "
+          "encoded=1 depth=1 completed=1 samples=%u sync=1 vs_memexport=%u ps_memexport=%u\n",
+          success_index, metal_draw_index, active_attachments.output_mask, active_attachments.count,
+          mrt_sample_count, route_vertex_memexport_draw ? 1u : 0u,
+          route_pixel_memexport_draw ? 1u : 0u);
+      std::fflush(stderr);
+    }
+    // The translated vertex and fragment programs have already run exactly
+    // once. Do not enter any CPU, per-target or diagnostic rerender path.
+    return true;
+  }
   if (metal_device_ && route_vertex_shader && route_vertex_shader->writes_position() &&
       (edram_mode == xenos::EdramMode::kDepthOnly || !pixel_shader || pixel_translation_ok) &&
       depth_rendering_mode) {
-    uint32_t normalized_color_mask = active_color_write_mask();
-    if (pixel_memexport_draw) {
-      uint32_t active_color_target_count = 0;
-      for (uint32_t rt_index = 0; rt_index < xenos::kMaxColorRenderTargets; ++rt_index) {
-        active_color_target_count += ((normalized_color_mask >> (rt_index * 4)) & 0xF) != 0;
-      }
-      // This compatibility route currently renders one Metal color attachment
-      // at a time. Replaying a fragment memexport shader once per attachment
-      // would duplicate guest-memory side effects, so reject that unsupported
-      // combination instead of producing silently incorrect memory.
-      if (active_color_target_count > 1) {
-        REXGPU_ERROR("Metal pixel memexport with {} active color targets is unsupported",
-                     active_color_target_count);
-        return false;
-      }
-    }
+    uint32_t normalized_color_mask = route_color_mask;
     bool shader_exports_color = pixel_shader && pixel_shader->writes_color_targets() != 0;
     bool depth_only_draw =
         depth_stencil_write_draw && (!shader_exports_color || !normalized_color_mask);
@@ -3926,7 +5374,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
         bool routed = TryRenderPipelineProbe(
             *route_vertex_shader, pixel_shader, pipeline_state, host_prim_type,
             host_draw_vertex_count, true,
-            primitive_processing_ok ? &primitive_processing_result : nullptr);
+            primitive_processing_ok ? &primitive_processing_result : nullptr, rt_index);
         if (!routed && pixel_memexport_draw) {
           host_render_target_context_override_ = saved_host_render_target_context_override;
           return false;
@@ -5585,10 +7033,26 @@ bool MetalCommandProcessor::IssueCopy() {
     std::fprintf(stderr, "[metal] IssueCopy#%u\n", metal_copy_index);
     std::fflush(stderr);
   }
+  std::string exact_materialization_error;
   if (register_file_) {
     last_copy_dest_base_ = register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE];
   }
   bool wrote_source_resolve = false;
+  bool native_resolve_compatible = false;
+  bool native_resolve_completed = false;
+  bool cpu_fallback_compatible = false;
+  bool cpu_fallback_completed = false;
+  bool diagnostic_resolve_completed = false;
+  auto complete_native_resolve = [&]() {
+    native_resolve_compatible = true;
+    native_resolve_completed = true;
+    wrote_source_resolve = true;
+  };
+  auto complete_cpu_fallback = [&]() {
+    cpu_fallback_compatible = true;
+    cpu_fallback_completed = true;
+    wrote_source_resolve = true;
+  };
   reg::RB_COPY_CONTROL active_copy_control = {};
   reg::RB_COPY_DEST_INFO active_copy_dest_info = {};
   reg::RB_COPY_DEST_PITCH active_copy_dest_pitch = {};
@@ -5688,6 +7152,114 @@ bool MetalCommandProcessor::IssueCopy() {
       }
     }
   }
+  if (resolve_info_valid && canonical_edram_unexportable_native_alias_) {
+    // The native target contains independent logical samples for aliased
+    // physical EDRAM words. Reject the whole packet before the resolve
+    // destination or either clear can be submitted. The upstream exact route
+    // handles GoldenEye's band producers; this is the fail-closed boundary for
+    // any unsupported native producer that reaches the compatibility path.
+    REXGPU_ERROR(
+        "Metal IssueCopy rejected an unexportable self-aliasing native EDRAM owner before "
+        "destination publication");
+    return false;
+  }
+  if (resolve_info_valid && exact_output_merger_residency_.exact_gpu_current()) {
+    // Exact draws may consume earlier shared-memory uploads. Same-queue order
+    // orders the bytes but doesn't propagate an upload error into a later
+    // command buffer's status, so a failed predecessor is terminal before any
+    // IssueCopy fallback is allowed to materialize exact EDRAM.
+    if (!shared_memory_ || !shared_memory_->WaitForPendingUploads()) {
+      InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+      InvalidateCanonicalEdramAfterExactFailure();
+      REXGPU_ERROR("Metal exact IssueCopy found a failed predecessor upload");
+      return false;
+    }
+    ExactOutputMergerResolvePlan exact_plan;
+    std::string exact_copy_error;
+    bool exact_copy_ready =
+        exact_output_merger_resources_ && shared_memory_ && shared_memory_->buffer() &&
+        shared_memory_->guest_memory_buffer() &&
+        BuildExactOutputMergerResolvePlan(resolve_info, SharedMemory::kBufferSize, exact_plan,
+                                          &exact_copy_error);
+    if (exact_copy_ready && (!shared_memory_->RequestRange(exact_plan.destination_start,
+                                                           exact_plan.destination_length) ||
+                             // Queue order alone does not make a later command-buffer success
+                             // depend on an earlier upload's success. Drain destination uploads so
+                             // a failed partial-page preservation blit can never be followed by a
+                             // successful resolve that publishes stale bytes in the conservative
+                             // destination range.
+                             !shared_memory_->WaitForPendingUploads())) {
+      exact_copy_ready = false;
+      exact_copy_error = "exact resolve destination could not be made resident";
+    }
+
+    ExactOutputMergerExecutionResult exact_copy_result =
+        ExactOutputMergerExecutionResult::kRejectedBeforeSubmit;
+    if (exact_copy_ready) {
+      ExactOutputMergerResolveDestination destination;
+      destination.metal_buffer = shared_memory_->buffer();
+      destination.metal_buffer_size = SharedMemory::kBufferSize;
+      destination.guest_memory_metal_buffer = shared_memory_->guest_memory_buffer();
+      destination.guest_memory_metal_buffer_size = SharedMemory::kBufferSize;
+      destination.submission_callback = [](void* context, uint32_t start, uint32_t length) {
+        static_cast<MetalCommandProcessor*>(context)->PublishExactOutputMergerCopyDestination(
+            start, length);
+      };
+      destination.submission_callback_context = this;
+      destination.async_failure_callback = [](void* context, uint32_t start, uint32_t length) {
+        static_cast<MetalCommandProcessor*>(context)->RevokeExactOutputMergerCopyDestination(
+            start, length);
+      };
+      destination.async_failure_callback_context = this;
+      exact_copy_result = ExecuteExactOutputMergerResolveAndClear(
+          exact_output_merger_resources_, exact_plan, destination, &exact_copy_error);
+    }
+
+    switch (GetExactOutputMergerRouteDecision(exact_copy_result)) {
+      case ExactOutputMergerRouteDecision::kReturnSuccess: {
+        if (!exact_output_merger_residency_.RecordExactDraw()) {
+          InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+          InvalidateCanonicalEdramAfterExactFailure();
+          REXGPU_ERROR("Metal exact IssueCopy lost exact EDRAM residency after submission");
+          return false;
+        }
+        static std::atomic<uint32_t> exact_copy_success_logs{0};
+        const uint32_t success_index =
+            exact_copy_success_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogMetalDiagnostic(success_index, 16, 0xFF)) {
+          std::fprintf(stderr,
+                       "[metal] exact IssueCopy enqueued#%u copy=%u dest=0x%08x+0x%x "
+                       "size=%ux%u clear(c=%u d=%u)\n",
+                       success_index, metal_copy_index, exact_plan.destination_start,
+                       exact_plan.destination_length, exact_plan.copy_width, exact_plan.copy_height,
+                       exact_plan.clear_color ? 1u : 0u, exact_plan.clear_depth ? 1u : 0u);
+          std::fflush(stderr);
+        }
+        LogIncompleteOnce("copy");
+        return true;
+      }
+      case ExactOutputMergerRouteDecision::kReturnFailure:
+        InvalidateExactOutputMergerResources(exact_output_merger_resources_);
+        InvalidateCanonicalEdramAfterExactFailure();
+        REXGPU_ERROR("Metal exact IssueCopy failed after submission: {}",
+                     exact_copy_error.empty() ? "unknown error" : exact_copy_error);
+        return false;
+      case ExactOutputMergerRouteDecision::kContinueNative:
+      default:
+        if (log_copy_diagnostics) {
+          std::fprintf(stderr, "[metal] exact IssueCopy fallback#%u reason=%s\n", metal_copy_index,
+                       exact_copy_error.empty() ? "unsupported resolve" : exact_copy_error.c_str());
+          std::fflush(stderr);
+        }
+        break;
+    }
+  }
+  if (!MaterializeExactOutputMergerEdram("copy", &exact_materialization_error)) {
+    REXGPU_ERROR(
+        "Metal copy could not materialize exact EDRAM: {}",
+        exact_materialization_error.empty() ? "unknown error" : exact_materialization_error);
+    return false;
+  }
   auto compute_copy_rect = [&](uint32_t resolve_width, uint32_t resolve_height, uint32_t& rect_x,
                                uint32_t& rect_y, uint32_t& rect_width, uint32_t& rect_height) {
     rect_x = 0;
@@ -5778,6 +7350,7 @@ bool MetalCommandProcessor::IssueCopy() {
                                         copy_rect_x, copy_rect_y, copy_rect_width,
                                         copy_rect_height)) {
         wrote_source_resolve = true;
+        diagnostic_resolve_completed = true;
         static std::atomic<uint32_t> magenta_resolve_logs{0};
         uint32_t magenta_resolve_index =
             magenta_resolve_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -5827,6 +7400,32 @@ bool MetalCommandProcessor::IssueCopy() {
         uint32_t(active_copy_control.copy_src_select), resolve_source_color_base,
         resolve_info.color_edram_info.format, resolve_min_surface_pitch,
         resolve_info.color_edram_info.msaa_samples);
+  }
+  if (resolve_info_valid && !resolve_info.IsCopyingDepth() &&
+      active_copy_control.copy_src_select < xenos::kMaxColorRenderTargets &&
+      canonical_edram_state_.target_hydration_enabled()) {
+    const uint32_t source_rt = uint32_t(active_copy_control.copy_src_select);
+    if (!resolve_host_rt) {
+      EnsureHostRenderTarget(source_rt);
+      const uint32_t resolve_source_color_base =
+          resolve_info.color_original_base & (xenos::kEdramTileCount - 1);
+      const uint32_t resolve_min_surface_pitch =
+          uint32_t(resolve_info.coordinate_info.width_div_8) * 8;
+      resolve_host_rt = FindHostRenderTargetForResolve(
+          source_rt, resolve_source_color_base, resolve_info.color_edram_info.format,
+          resolve_min_surface_pitch, resolve_info.color_edram_info.msaa_samples);
+    }
+    std::string hydration_error;
+    const uint32_t target_width = std::max<uint32_t>(fallback_output_width_, 1);
+    const uint32_t target_height = std::max<uint32_t>(fallback_output_height_, 1);
+    if (!resolve_host_rt || !resolve_host_rt->context ||
+        !PrepareCanonicalContextForUse(resolve_host_rt->context, target_width, target_height,
+                                       &hydration_error) ||
+        !resolve_host_rt->canonical_hydrated) {
+      REXGPU_ERROR("Metal copy could not hydrate color source {} from canonical EDRAM: {}",
+                   source_rt, hydration_error.empty() ? "no compatible source" : hydration_error);
+      return false;
+    }
   }
   void* resolve_host_rt_context =
       resolve_host_rt && resolve_host_rt->context ? resolve_host_rt->context : nullptr;
@@ -5893,90 +7492,64 @@ bool MetalCommandProcessor::IssueCopy() {
   GoldenEyePostprocessProducer goldeneye_postprocess_producer = {};
   if (resolve_info_valid && register_file_) {
     GoldenEyePostprocessBand band = GetGoldenEyePostprocessBand();
-    reg::RB_SURFACE_INFO surface_info =
-        register_file_->Get<reg::RB_SURFACE_INFO>();
+    reg::RB_SURFACE_INFO surface_info = register_file_->Get<reg::RB_SURFACE_INFO>();
     goldeneye_postprocess_producer.band = band;
     goldeneye_postprocess_producer.base = resolve_info.copy_dest_base;
     goldeneye_postprocess_producer.source_x =
-        uint16_t(uint32_t(
-                     resolve_info.coordinate_info.edram_offset_x_div_8) *
-                 8);
+        uint16_t(uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) * 8);
     goldeneye_postprocess_producer.source_y =
-        uint16_t(uint32_t(
-                     resolve_info.coordinate_info.edram_offset_y_div_8) *
-                 8);
+        uint16_t(uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) * 8);
     goldeneye_postprocess_producer.x =
-        uint16_t(uint32_t(
-                     resolve_info.copy_dest_coordinate_info.offset_x_div_8) *
-                 8);
+        uint16_t(uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8) * 8);
     goldeneye_postprocess_producer.y =
-        uint16_t(uint32_t(
-                     resolve_info.copy_dest_coordinate_info.offset_y_div_8) *
-                 8);
+        uint16_t(uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8) * 8);
     goldeneye_postprocess_producer.width =
         uint16_t(uint32_t(resolve_info.coordinate_info.width_div_8) * 8);
-    goldeneye_postprocess_producer.height =
-        uint16_t(uint32_t(resolve_info.height_div_8) * 8);
-    goldeneye_postprocess_producer.raw_pitch =
-        uint16_t(active_copy_dest_pitch.copy_dest_pitch);
-    goldeneye_postprocess_producer.raw_height =
-        uint16_t(active_copy_dest_pitch.copy_dest_height);
-    goldeneye_postprocess_producer.sample = uint8_t(
-        resolve_info.copy_dest_coordinate_info.copy_sample_select);
-    goldeneye_postprocess_producer.endian =
-        uint8_t(resolve_info.copy_dest_info.copy_dest_endian);
+    goldeneye_postprocess_producer.height = uint16_t(uint32_t(resolve_info.height_div_8) * 8);
+    goldeneye_postprocess_producer.raw_pitch = uint16_t(active_copy_dest_pitch.copy_dest_pitch);
+    goldeneye_postprocess_producer.raw_height = uint16_t(active_copy_dest_pitch.copy_dest_height);
+    goldeneye_postprocess_producer.sample =
+        uint8_t(resolve_info.copy_dest_coordinate_info.copy_sample_select);
+    goldeneye_postprocess_producer.endian = uint8_t(resolve_info.copy_dest_info.copy_dest_endian);
 
-    bool common_signature =
-        band != GoldenEyePostprocessBand::kNone &&
-        IsGoldenEyePostprocessProducerTileMask(band, bin_mask_) &&
-        surface_info.surface_pitch == 1280 &&
-        surface_info.msaa_samples == xenos::MsaaSamples::k4X &&
-        resolve_info.copy_dest_extent_start == resolve_info.copy_dest_base &&
-        resolve_info.copy_dest_extent_length == 0x28000;
+    bool common_signature = band != GoldenEyePostprocessBand::kNone &&
+                            IsGoldenEyePostprocessProducerTileMask(band, bin_mask_) &&
+                            surface_info.surface_pitch == 1280 &&
+                            surface_info.msaa_samples == xenos::MsaaSamples::k4X &&
+                            resolve_info.copy_dest_extent_start == resolve_info.copy_dest_base &&
+                            resolve_info.copy_dest_extent_length == 0x28000;
     if (common_signature && !resolve_info.IsCopyingDepth() &&
-        active_copy_control.value == 0x00100000 &&
-        active_copy_dest_info.value == 0x01000302 &&
-        resolve_info.color_original_base == 0 &&
-        resolve_info.color_edram_info.base_tiles == 0 &&
+        active_copy_control.value == 0x00100000 && active_copy_dest_info.value == 0x01000302 &&
+        resolve_info.color_original_base == 0 && resolve_info.color_edram_info.base_tiles == 0 &&
         resolve_info.color_edram_info.pitch_tiles == 32 &&
-        resolve_info.color_edram_info.msaa_samples ==
-            xenos::MsaaSamples::k4X &&
-        xenos::ColorRenderTargetFormat(
-            resolve_info.color_edram_info.format) ==
+        resolve_info.color_edram_info.msaa_samples == xenos::MsaaSamples::k4X &&
+        xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format) ==
             xenos::ColorRenderTargetFormat::k_8_8_8_8) {
-      goldeneye_postprocess_producer.role =
-          GoldenEyePostprocessProducerRole::kColor;
+      goldeneye_postprocess_producer.role = GoldenEyePostprocessProducerRole::kColor;
       goldeneye_postprocess_producer.source_signature =
           GoldenEyePostprocessSourceSignature::kColorTarget0Rgba8;
       goldeneye_postprocess_producer.control_signature =
-          GoldenEyePostprocessControlSignature::
-              kColorTarget0ConvertSample0;
+          GoldenEyePostprocessControlSignature::kColorTarget0ConvertSample0;
       goldeneye_postprocess_producer.destination_signature =
-          GoldenEyePostprocessDestinationSignature::
-              kColorRgba8UnsignedSwapped;
-      goldeneye_postprocess_producer.msaa =
-          uint8_t(resolve_info.color_edram_info.msaa_samples);
+          GoldenEyePostprocessDestinationSignature::kColorRgba8UnsignedSwapped;
+      goldeneye_postprocess_producer.msaa = uint8_t(resolve_info.color_edram_info.msaa_samples);
     } else if (common_signature && resolve_info.IsCopyingDepth() &&
                active_copy_control.value == 0x00000004 &&
                active_copy_dest_info.value == 0x00000302 &&
                resolve_info.depth_original_base == 1024 &&
                resolve_info.depth_edram_info.base_tiles == 1024 &&
                resolve_info.depth_edram_info.pitch_tiles == 32 &&
-               resolve_info.depth_edram_info.msaa_samples ==
-                   xenos::MsaaSamples::k4X &&
-               xenos::DepthRenderTargetFormat(
-                   resolve_info.depth_edram_info.format) ==
+               resolve_info.depth_edram_info.msaa_samples == xenos::MsaaSamples::k4X &&
+               xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format) ==
                    xenos::DepthRenderTargetFormat::kD24S8) {
-      goldeneye_postprocess_producer.role =
-          GoldenEyePostprocessProducerRole::kDepth;
+      goldeneye_postprocess_producer.role = GoldenEyePostprocessProducerRole::kDepth;
       goldeneye_postprocess_producer.source_signature =
           GoldenEyePostprocessSourceSignature::kDepthTarget24Stencil8;
       goldeneye_postprocess_producer.control_signature =
           GoldenEyePostprocessControlSignature::kDepthRawSample0;
       goldeneye_postprocess_producer.destination_signature =
           GoldenEyePostprocessDestinationSignature::kDepth24Stencil8;
-      goldeneye_postprocess_producer.msaa =
-          uint8_t(resolve_info.depth_edram_info.msaa_samples);
+      goldeneye_postprocess_producer.msaa = uint8_t(resolve_info.depth_edram_info.msaa_samples);
     }
   }
   GoldenEyePostprocessProducerRole goldeneye_postprocess_producer_role =
@@ -6054,13 +7627,11 @@ bool MetalCommandProcessor::IssueCopy() {
     }
   }
   if (!wrote_source_resolve &&
-      goldeneye_postprocess_producer_role ==
-          GoldenEyePostprocessProducerRole::kColor &&
+      goldeneye_postprocess_producer_role == GoldenEyePostprocessProducerRole::kColor &&
       resolve_host_rt_context) {
-    uint32_t source_x =
-        uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) * 8;
-    uint32_t source_y =
-        uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) * 8;
+    native_resolve_compatible = true;
+    uint32_t source_x = uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) * 8;
+    uint32_t source_y = uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) * 8;
     uint32_t copy_width = goldeneye_postprocess_producer.width;
     uint32_t copy_height = goldeneye_postprocess_producer.height;
     uint32_t target_width = std::max<uint32_t>(fallback_output_width_, 1);
@@ -6068,74 +7639,58 @@ bool MetalCommandProcessor::IssueCopy() {
     void* color_texture = nullptr;
     void* unused_depth_texture = nullptr;
     void* unused_packed_depth_texture = nullptr;
-    bool source_valid =
-        source_x <= target_width && source_y <= target_height &&
-        copy_width <= target_width - source_x &&
-        copy_height <= target_height - source_y;
+    bool source_valid = source_x <= target_width && source_y <= target_height &&
+                        copy_width <= target_width - source_x &&
+                        copy_height <= target_height - source_y;
     // A new top strip starts overwriting the reusable aggregate. Commit every
     // open consumer first so the shared Metal queue orders the previous
     // restore draws before this generation's writes.
     bool reuse_order_ready =
-        goldeneye_postprocess_producer.band !=
-            GoldenEyePostprocessBand::kTop ||
+        goldeneye_postprocess_producer.band != GoldenEyePostprocessBand::kTop ||
         FinalizePipelineProbeSubmissions();
-    bool snapshot_ready =
-        source_valid && reuse_order_ready &&
-        EnsureGoldenEyePostprocessTextures(
-            color_texture, unused_depth_texture,
-            unused_packed_depth_texture);
+    bool snapshot_ready = source_valid && reuse_order_ready &&
+                          EnsureGoldenEyePostprocessTextures(color_texture, unused_depth_texture,
+                                                             unused_packed_depth_texture);
     std::string snapshot_error;
     bool snapshot_submitted = false;
     if (snapshot_ready) {
       ProbeTiledResolveTarget snapshot_destination;
-      snapshot_destination.endian =
-          uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
+      snapshot_destination.endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
       snapshot_destination.presentation_snapshot_texture = color_texture;
       snapshot_destination.presentation_snapshot_y =
-          GoldenEyePostprocessBandY(
-              goldeneye_postprocess_producer.band);
-      snapshot_destination.color_sample_select =
-          uint32_t(xenos::CopySampleSelect::k0);
-      snapshot_destination.async_failure_callback =
-          [](void* context, uint32_t start, uint32_t length) {
-            static_cast<MetalCommandProcessor*>(context)
-                ->InvalidateGoldenEyePostprocessAliases(start, length);
-          };
+          GoldenEyePostprocessBandY(goldeneye_postprocess_producer.band);
+      snapshot_destination.color_sample_select = uint32_t(xenos::CopySampleSelect::k0);
+      snapshot_destination.async_failure_callback = [](void* context, uint32_t start,
+                                                       uint32_t length) {
+        static_cast<MetalCommandProcessor*>(context)->InvalidateGoldenEyePostprocessAliases(start,
+                                                                                            length);
+      };
       snapshot_destination.async_failure_callback_context = this;
-      snapshot_destination.async_failure_start =
-          kGoldenEyePostprocessColorBase;
+      snapshot_destination.async_failure_start = kGoldenEyePostprocessColorBase;
       snapshot_destination.async_failure_length = 1;
       snapshot_submitted = ResolvePipelineProbeContextToXenosTiled(
-          resolve_host_rt_context, target_width, target_height, source_x,
-          source_y, copy_width, copy_height, snapshot_destination, nullptr,
-          &snapshot_error);
+          resolve_host_rt_context, target_width, target_height, source_x, source_y, copy_width,
+          copy_height, snapshot_destination, nullptr, &snapshot_error);
     } else if (!source_valid) {
       snapshot_error = "GoldenEye restore color source rectangle is invalid";
     } else if (!reuse_order_ready) {
-      snapshot_error =
-          "GoldenEye restore color reuse ordering could not be finalized";
+      snapshot_error = "GoldenEye restore color reuse ordering could not be finalized";
     } else {
       snapshot_error = "GoldenEye restore color snapshot is unavailable";
     }
-    if (snapshot_submitted &&
-        PublishGoldenEyePostprocessProducer(
-            goldeneye_postprocess_producer)) {
-      wrote_source_resolve = true;
+    if (snapshot_submitted && PublishGoldenEyePostprocessProducer(goldeneye_postprocess_producer)) {
+      complete_native_resolve();
     } else {
-      InvalidateGoldenEyePostprocessAliases(kGoldenEyePostprocessColorBase,
-                                            1);
+      InvalidateGoldenEyePostprocessAliases(kGoldenEyePostprocessColorBase, 1);
       static std::atomic<uint32_t> color_snapshot_failure_logs{0};
-      uint32_t failure_index = color_snapshot_failure_logs.fetch_add(
-                                   1, std::memory_order_relaxed) +
-                               1;
+      uint32_t failure_index =
+          color_snapshot_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
       if (ShouldLogMetalDiagnostic(failure_index, 8, 0x3F)) {
-        std::fprintf(
-            stderr,
-            "[metal] GoldenEye restore color snapshot failed#%u copy=%u "
-            "band=%u: %s\n",
-            failure_index, metal_copy_index,
-            uint32_t(goldeneye_postprocess_producer.band),
-            snapshot_error.c_str());
+        std::fprintf(stderr,
+                     "[metal] GoldenEye restore color snapshot failed#%u copy=%u "
+                     "band=%u: %s\n",
+                     failure_index, metal_copy_index, uint32_t(goldeneye_postprocess_producer.band),
+                     snapshot_error.c_str());
         std::fflush(stderr);
       }
     }
@@ -6143,11 +7698,34 @@ bool MetalCommandProcessor::IssueCopy() {
   if (!wrote_source_resolve && resolve_info_valid && resolve_info.IsCopyingDepth() &&
       resolve_info.copy_dest_extent_length && memory_ && register_file_ && shared_memory_ &&
       shared_memory_->buffer() && !resolve_info.copy_dest_info.copy_dest_array) {
+    native_resolve_compatible = true;
     const draw_util::ResolveEdramInfo& depth_edram_info = resolve_info.depth_edram_info;
     HostDepthStencilTarget* depth_owner =
         FindHostDepthStencilTargetForResolve(depth_edram_info, resolve_info.depth_original_base);
     uint32_t target_width = std::max<uint32_t>(fallback_output_width_, 1);
     uint32_t target_height = std::max<uint32_t>(fallback_output_height_, 1);
+    if (canonical_edram_state_.target_hydration_enabled()) {
+      const reg::RB_DEPTH_INFO current_depth = register_file_->Get<reg::RB_DEPTH_INFO>();
+      const reg::RB_SURFACE_INFO current_surface = register_file_->Get<reg::RB_SURFACE_INFO>();
+      if (!depth_owner) {
+        EnsureHostDepthStencilTarget(current_depth.value, current_surface.value);
+        depth_owner = FindHostDepthStencilTargetForResolve(depth_edram_info,
+                                                           resolve_info.depth_original_base);
+      }
+      std::string hydration_error;
+      auto depth_owner_it =
+          std::find_if(host_depth_stencil_targets_.begin(), host_depth_stencil_targets_.end(),
+                       [depth_owner](const auto& entry) { return &entry.second == depth_owner; });
+      if (!depth_owner || !depth_owner->context ||
+          depth_owner_it == host_depth_stencil_targets_.end() ||
+          !PrepareCanonicalDepthTargetForUse(*depth_owner, depth_owner_it->first, target_width,
+                                             target_height, &hydration_error) ||
+          !depth_owner->canonical_hydrated) {
+        REXGPU_ERROR("Metal copy could not hydrate depth source from canonical EDRAM: {}",
+                     hydration_error.empty() ? "no compatible source" : hydration_error);
+        return false;
+      }
+    }
     uint32_t source_x = uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) * 8;
     uint32_t source_y = uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) * 8;
     uint32_t depth_original_base = resolve_info.depth_original_base & (xenos::kEdramTileCount - 1);
@@ -6176,8 +7754,7 @@ bool MetalCommandProcessor::IssueCopy() {
     uint32_t dirty_length = resolve_info.copy_dest_extent_length;
     xenos::DepthRenderTargetFormat depth_format =
         xenos::DepthRenderTargetFormat(depth_edram_info.format);
-    xenos::Endian128 depth_endian =
-        xenos::Endian128(resolve_info.copy_dest_info.copy_dest_endian);
+    xenos::Endian128 depth_endian = xenos::Endian128(resolve_info.copy_dest_info.copy_dest_endian);
     uint32_t depth_sample_select =
         uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select);
     bool depth_float24_round = REXCVAR_GET(depth_float24_round);
@@ -6218,8 +7795,7 @@ bool MetalCommandProcessor::IssueCopy() {
           command_processor->shared_memory_->MemoryInvalidationCallback(start, length, true);
         }
         command_processor->InvalidateResolvedDepthSnapshot(start, length);
-        command_processor->InvalidateGoldenEyePostprocessAliases(start,
-                                                                 length);
+        command_processor->InvalidateGoldenEyePostprocessAliases(start, length);
       };
       depth_destination.async_failure_callback_context = this;
       depth_destination.async_failure_start = dirty_start;
@@ -6227,36 +7803,30 @@ bool MetalCommandProcessor::IssueCopy() {
     }
 
     bool goldeneye_depth_snapshot_candidate =
-        goldeneye_postprocess_producer_role ==
-            GoldenEyePostprocessProducerRole::kDepth &&
+        goldeneye_postprocess_producer_role == GoldenEyePostprocessProducerRole::kDepth &&
         !source_x && !source_y;
     bool goldeneye_depth_snapshot_ready = false;
     if (goldeneye_depth_snapshot_candidate && depth_resolve_ready) {
       void* unused_color_texture = nullptr;
       void* goldeneye_depth_texture = nullptr;
       void* goldeneye_packed_depth_texture = nullptr;
-      goldeneye_depth_snapshot_ready =
-          EnsureGoldenEyePostprocessTextures(
-              unused_color_texture, goldeneye_depth_texture,
-              goldeneye_packed_depth_texture);
+      goldeneye_depth_snapshot_ready = EnsureGoldenEyePostprocessTextures(
+          unused_color_texture, goldeneye_depth_texture, goldeneye_packed_depth_texture);
       if (goldeneye_depth_snapshot_ready) {
         depth_destination.depth_snapshot_texture = goldeneye_depth_texture;
         depth_destination.depth_snapshot_y =
-            GoldenEyePostprocessBandY(
-                goldeneye_postprocess_producer.band);
-        depth_destination.packed_depth_snapshot_texture =
-            goldeneye_packed_depth_texture;
+            GoldenEyePostprocessBandY(goldeneye_postprocess_producer.band);
+        depth_destination.packed_depth_snapshot_texture = goldeneye_packed_depth_texture;
         depth_destination.packed_depth_snapshot_y =
-            GoldenEyePostprocessBandY(
-                goldeneye_postprocess_producer.band);
+            GoldenEyePostprocessBandY(goldeneye_postprocess_producer.band);
         depth_destination.packed_depth_snapshot_fetch_endian = 2;
       }
     }
 
     uint32_t depth_snapshot_tiled_extent =
         destination_pitch && target_height
-            ? texture_util::GetTiledAddressUpperBound2D(
-                  destination_pitch, target_height, destination_pitch, 2)
+            ? texture_util::GetTiledAddressUpperBound2D(destination_pitch, target_height,
+                                                        destination_pitch, 2)
             : 0;
     uint64_t depth_resolve_signature = UINT64_C(1469598103934665603);
     auto mix_depth_resolve_signature = [&](uint64_t value) {
@@ -6273,25 +7843,20 @@ bool MetalCommandProcessor::IssueCopy() {
     // bands. Degenerate zero-pitch title descriptors and partial-width or
     // unordered copies remain on the strict guest-memory path.
     bool depth_snapshot_candidate =
-        depth_resolve_ready && has_guest_memory_alias && !source_x &&
-        !destination_x && destination_pitch == target_width &&
-        destination_height >= target_height && copy_width == destination_pitch &&
-        destination_y <= target_height &&
-        copy_height <= target_height - destination_y &&
-        !(destination_y & 31u) && depth_snapshot_tiled_extent &&
-        resolve_info.copy_dest_base < SharedMemory::kBufferSize &&
-        depth_snapshot_tiled_extent <=
-            SharedMemory::kBufferSize - resolve_info.copy_dest_base;
+        depth_resolve_ready && has_guest_memory_alias && !source_x && !destination_x &&
+        destination_pitch == target_width && destination_height >= target_height &&
+        copy_width == destination_pitch && destination_y <= target_height &&
+        copy_height <= target_height - destination_y && !(destination_y & 31u) &&
+        depth_snapshot_tiled_extent && resolve_info.copy_dest_base < SharedMemory::kBufferSize &&
+        depth_snapshot_tiled_extent <= SharedMemory::kBufferSize - resolve_info.copy_dest_base;
     bool depth_snapshot_ready = false;
     uint64_t depth_snapshot_invalidation_epoch = 0;
     void* depth_snapshot_texture = nullptr;
     if (depth_snapshot_candidate) {
       depth_snapshot_ready = PrepareResolvedDepthSnapshotGpuBand(
-          resolve_info.copy_dest_base, destination_pitch,
-          depth_snapshot_tiled_extent, target_width, target_height, destination_y,
-          copy_height, depth_format, depth_endian, depth_resolve_signature,
-          depth_snapshot_texture,
-          depth_snapshot_invalidation_epoch);
+          resolve_info.copy_dest_base, destination_pitch, depth_snapshot_tiled_extent, target_width,
+          target_height, destination_y, copy_height, depth_format, depth_endian,
+          depth_resolve_signature, depth_snapshot_texture, depth_snapshot_invalidation_epoch);
     }
     if (depth_snapshot_ready) {
       depth_destination.depth_snapshot_texture = depth_snapshot_texture;
@@ -6304,36 +7869,29 @@ bool MetalCommandProcessor::IssueCopy() {
     if (depth_resolve_ready) {
       if (depth_snapshot_ready) {
         uint32_t page_mask = uint32_t(rex::memory::page_size()) - 1;
-        resolved_depth_expected_gpu_write_first_.store(
-            dirty_start & ~page_mask, std::memory_order_relaxed);
-        resolved_depth_expected_gpu_write_last_.store(
-            (dirty_start + dirty_length - 1) | page_mask,
-            std::memory_order_relaxed);
-        resolved_depth_expected_gpu_write_active_.store(true,
-                                                        std::memory_order_release);
+        resolved_depth_expected_gpu_write_first_.store(dirty_start & ~page_mask,
+                                                       std::memory_order_relaxed);
+        resolved_depth_expected_gpu_write_last_.store((dirty_start + dirty_length - 1) | page_mask,
+                                                      std::memory_order_relaxed);
+        resolved_depth_expected_gpu_write_active_.store(true, std::memory_order_release);
       }
       if (goldeneye_depth_snapshot_ready) {
         uint32_t page_mask = uint32_t(rex::memory::page_size()) - 1;
-        goldeneye_postprocess_expected_gpu_write_first_.store(
-            dirty_start & ~page_mask, std::memory_order_relaxed);
+        goldeneye_postprocess_expected_gpu_write_first_.store(dirty_start & ~page_mask,
+                                                              std::memory_order_relaxed);
         goldeneye_postprocess_expected_gpu_write_last_.store(
-            (dirty_start + dirty_length - 1) | page_mask,
-            std::memory_order_relaxed);
-        goldeneye_postprocess_expected_gpu_write_active_.store(
-            true, std::memory_order_release);
+            (dirty_start + dirty_length - 1) | page_mask, std::memory_order_relaxed);
+        goldeneye_postprocess_expected_gpu_write_active_.store(true, std::memory_order_release);
       }
       depth_resolved = ResolvePipelineProbeDepthStencilContextToXenosTiled(
           depth_owner->context, target_width, target_height, source_x, source_y, copy_width,
-          copy_height, depth_format == xenos::DepthRenderTargetFormat::kD24FS8,
-          depth_float24_round, depth_sample_select, depth_destination,
-          !has_guest_memory_alias, &depth_resolve_error);
+          copy_height, depth_format == xenos::DepthRenderTargetFormat::kD24FS8, depth_float24_round,
+          depth_sample_select, depth_destination, !has_guest_memory_alias, &depth_resolve_error);
       if (depth_snapshot_ready) {
-        resolved_depth_expected_gpu_write_active_.store(
-            false, std::memory_order_release);
+        resolved_depth_expected_gpu_write_active_.store(false, std::memory_order_release);
       }
       if (goldeneye_depth_snapshot_ready) {
-        goldeneye_postprocess_expected_gpu_write_active_.store(
-            false, std::memory_order_release);
+        goldeneye_postprocess_expected_gpu_write_active_.store(false, std::memory_order_release);
       }
       if (depth_resolved && !has_guest_memory_alias &&
           !shared_memory_->CommitGpuBufferWriteToGuest(dirty_start, dirty_length)) {
@@ -6342,20 +7900,16 @@ bool MetalCommandProcessor::IssueCopy() {
       }
       if (depth_resolved && depth_snapshot_ready) {
         UpdateResolvedDepthSnapshotGpuCache(
-            resolve_info.copy_dest_base, destination_pitch,
-            depth_snapshot_tiled_extent, target_width, target_height, destination_y,
-            copy_height, depth_format, depth_endian, depth_resolve_signature,
-            depth_snapshot_invalidation_epoch);
+            resolve_info.copy_dest_base, destination_pitch, depth_snapshot_tiled_extent,
+            target_width, target_height, destination_y, copy_height, depth_format, depth_endian,
+            depth_resolve_signature, depth_snapshot_invalidation_epoch);
       }
       if (depth_resolved && goldeneye_depth_snapshot_ready) {
-        if (!PublishGoldenEyePostprocessProducer(
-                goldeneye_postprocess_producer)) {
-          InvalidateGoldenEyePostprocessAliases(
-              kGoldenEyePostprocessDepthBase, 1);
+        if (!PublishGoldenEyePostprocessProducer(goldeneye_postprocess_producer)) {
+          InvalidateGoldenEyePostprocessAliases(kGoldenEyePostprocessDepthBase, 1);
         }
       } else if (goldeneye_depth_snapshot_candidate) {
-        InvalidateGoldenEyePostprocessAliases(
-            kGoldenEyePostprocessDepthBase, 1);
+        InvalidateGoldenEyePostprocessAliases(kGoldenEyePostprocessDepthBase, 1);
       }
     } else if (!depth_owner || !depth_owner->context) {
       depth_resolve_error = "no compatible initialized host depth/stencil owner";
@@ -6368,7 +7922,7 @@ bool MetalCommandProcessor::IssueCopy() {
     }
 
     if (depth_resolved) {
-      wrote_source_resolve = true;
+      complete_native_resolve();
       ++gpu_depth_resolve_count_;
       gpu_depth_resolve_pixel_count_ += uint64_t(copy_width) * copy_height;
       static std::atomic<uint32_t> depth_resolve_logs{0};
@@ -6379,14 +7933,10 @@ bool MetalCommandProcessor::IssueCopy() {
                      "source=%u,%u size=%ux%u dest=%u,%u pitch=%u height=%u "
                      "msaa=%u sample=%u format=%u snapshot=%u async=%u\n",
                      resolve_index, metal_copy_index, resolve_info.copy_dest_base, dirty_length,
-                     source_x, source_y, copy_width, copy_height, destination_x,
-                     destination_y, destination_pitch, destination_height,
-                     uint32_t(depth_edram_info.msaa_samples), depth_sample_select,
-                     uint32_t(depth_edram_info.format),
-                     (depth_snapshot_ready ||
-                      goldeneye_depth_snapshot_ready)
-                         ? 1u
-                         : 0u,
+                     source_x, source_y, copy_width, copy_height, destination_x, destination_y,
+                     destination_pitch, destination_height, uint32_t(depth_edram_info.msaa_samples),
+                     depth_sample_select, uint32_t(depth_edram_info.format),
+                     (depth_snapshot_ready || goldeneye_depth_snapshot_ready) ? 1u : 0u,
                      has_guest_memory_alias ? 1u : 0u);
         std::fflush(stderr);
       }
@@ -6521,6 +8071,7 @@ bool MetalCommandProcessor::IssueCopy() {
           host_source_rect_x <= resolve_width && host_source_rect_y <= resolve_height &&
           copy_width <= resolve_width - host_source_rect_x &&
           copy_height <= resolve_height - host_source_rect_y) {
+        native_resolve_compatible = true;
         uint32_t dirty_offset_start =
             texture_util::GetTiledAddressLowerBound2D(rect_x, write_dest_y, dest_pitch, 2);
         uint32_t dirty_offset_end = texture_util::GetTiledAddressUpperBound2D(
@@ -6616,13 +8167,14 @@ bool MetalCommandProcessor::IssueCopy() {
           gpu_resolve_error = "failed to make GPU tiled resolve destination resident";
         }
         bool exact_snapshot_ready = false;
-        uint64_t exact_snapshot_invalidation_epoch = 0;
+        uint64_t exact_snapshot_publication_token = 0;
+        uint64_t exact_cache_invalidation_epoch = 0;
         if (gpu_resolve_ready && exact_snapshot_candidate && has_guest_memory_alias) {
           void* exact_snapshot_texture = nullptr;
           exact_snapshot_ready = PrepareExactResolvedSurfaceGpuBand(
               exact_snapshot_base, dest_pitch, exact_snapshot_height, exact_snapshot_y, copy_height,
               resolve_info.copy_dest_info.copy_dest_endian, exact_resolve_signature,
-              exact_snapshot_texture, exact_snapshot_invalidation_epoch);
+              exact_snapshot_texture, exact_snapshot_publication_token);
           if (exact_snapshot_ready) {
             gpu_destination.presentation_snapshot_texture = exact_snapshot_texture;
             gpu_destination.presentation_snapshot_y = exact_snapshot_y;
@@ -6651,13 +8203,25 @@ bool MetalCommandProcessor::IssueCopy() {
           gpu_destination.async_failure_length = dirty_length;
         }
         bool gpu_resolve_completed = false;
-        bool capture_resolve_bgra = (exact_snapshot_candidate && !exact_snapshot_ready) ||
-                                    MetalVerboseDiagnosticsEnabled() || !has_guest_memory_alias;
+        const bool sync_missing_snapshot = exact_snapshot_candidate && !exact_snapshot_ready;
+        const bool sync_verbose = MetalVerboseDiagnosticsEnabled();
+        const bool sync_missing_alias = !has_guest_memory_alias;
+        const bool capture_resolve_bgra =
+            sync_missing_snapshot || sync_verbose || sync_missing_alias;
         if (exact_snapshot_candidate && !exact_snapshot_ready) {
-          exact_snapshot_invalidation_epoch =
+          exact_cache_invalidation_epoch =
               exact_resolved_surface_invalidation_epoch_.load(std::memory_order_acquire);
         }
         if (gpu_resolve_ready) {
+          if (capture_resolve_bgra) {
+            ++gpu_tiled_resolve_sync_readback_count_;
+            gpu_tiled_resolve_sync_missing_snapshot_count_ += sync_missing_snapshot ? 1 : 0;
+            gpu_tiled_resolve_sync_verbose_count_ += sync_verbose ? 1 : 0;
+            gpu_tiled_resolve_sync_missing_alias_count_ += sync_missing_alias ? 1 : 0;
+          } else {
+            ++gpu_tiled_resolve_async_count_;
+          }
+          gpu_tiled_resolve_exact_snapshot_count_ += exact_snapshot_ready ? 1 : 0;
           bool exact_cache_write_expected = exact_snapshot_candidate;
           if (exact_cache_write_expected) {
             uint32_t page_mask = uint32_t(rex::memory::page_size()) - 1;
@@ -6696,7 +8260,7 @@ bool MetalCommandProcessor::IssueCopy() {
                 exact_snapshot_base, dest_pitch, exact_snapshot_height, dest_pitch,
                 exact_snapshot_height, exact_snapshot_y, copy_height,
                 resolve_info.copy_dest_info.copy_dest_endian, exact_resolve_signature,
-                exact_snapshot_invalidation_epoch);
+                exact_snapshot_publication_token);
           } else if (!exact_snapshot_candidate || gpu_tiled_resolve_bgra.empty()) {
             InvalidateExactResolvedSurfaceCache(
                 write_dest_base,
@@ -6707,7 +8271,7 @@ bool MetalCommandProcessor::IssueCopy() {
             UpdateExactResolvedSurfaceCache(
                 write_dest_base, dest_pitch, dest_height, gpu_tiled_resolve_bgra, copy_width,
                 copy_height, 0, 0, rect_x, write_dest_y, copy_width, copy_height,
-                resolve_info.copy_dest_info.copy_dest_endian, exact_snapshot_invalidation_epoch);
+                resolve_info.copy_dest_info.copy_dest_endian, exact_cache_invalidation_epoch);
           }
         } else {
           if (gpu_resolve_ready) {
@@ -6735,6 +8299,7 @@ bool MetalCommandProcessor::IssueCopy() {
           host_source_rect_y <= resolve_height &&
           copy_width <= resolve_width - host_source_rect_x &&
           copy_height <= resolve_height - host_source_rect_y) {
+        cpu_fallback_compatible = true;
         std::string regional_error;
         if (ReadPipelineProbeContextRectSampleSelected(
                 resolve_host_rt_context, resolve_width, resolve_height, host_source_rect_x,
@@ -6747,6 +8312,7 @@ bool MetalCommandProcessor::IssueCopy() {
       // A generic read resolves every host sample. It is not a valid fallback
       // when the guest requested one sample or one 4x sample pair.
       if (!refreshed_host_rt && !selective_msaa_copy) {
+        cpu_fallback_compatible = true;
         refreshed_host_rt = refresh_resolve_host_rt(resolve_width, resolve_height);
       }
       if (log_resolve_gate) {
@@ -6870,7 +8436,11 @@ bool MetalCommandProcessor::IssueCopy() {
                                       resolve_source_y, rect_x, write_dest_y, copy_width,
                                       copy_height, resolve_info.copy_dest_info.copy_dest_endian));
         if (wrote_host_rt_resolve) {
-          wrote_source_resolve = true;
+          if (gpu_tiled_resolve) {
+            complete_native_resolve();
+          } else {
+            complete_cpu_fallback();
+          }
           static std::atomic<uint32_t> host_rt_resolve_logs{0};
           uint32_t host_rt_resolve_index =
               MetalVerboseDiagnosticsEnabled()
@@ -6926,15 +8496,13 @@ bool MetalCommandProcessor::IssueCopy() {
                     clear_y, clear_width, clear_height, double(clear_r) / 255.0,
                     double(clear_g) / 255.0, double(clear_b) / 255.0, double(clear_a) / 255.0,
                     &clear_error)) {
-              auto clear_owner_it = std::find_if(
-                  host_render_targets_.begin(), host_render_targets_.end(),
-                  [resolve_host_rt](const auto& entry) {
-                    return &entry.second == resolve_host_rt;
-                  });
-              if (clear_width && clear_height &&
-                  clear_owner_it != host_render_targets_.end()) {
-                MarkCanonicalColorTargetWritten(clear_owner_it->second,
-                                                clear_owner_it->first);
+              auto clear_owner_it =
+                  std::find_if(host_render_targets_.begin(), host_render_targets_.end(),
+                               [resolve_host_rt](const auto& entry) {
+                                 return &entry.second == resolve_host_rt;
+                               });
+              if (clear_width && clear_height && clear_owner_it != host_render_targets_.end()) {
+                MarkCanonicalColorTargetWritten(clear_owner_it->second, clear_owner_it->first);
               }
               if (gpu_tiled_resolve || regional_host_rt_readback) {
                 // A rectangular read is exact only inside its source region. Do
@@ -7044,18 +8612,16 @@ bool MetalCommandProcessor::IssueCopy() {
                               ? xenos::Float20e4To32(packed_depth) * 0.5f
                               : xenos::UNorm24To32(packed_depth);
       std::string depth_clear_error;
-      auto depth_owner_it = std::find_if(
-          host_depth_stencil_targets_.begin(), host_depth_stencil_targets_.end(),
-          [depth_owner](const auto& entry) { return &entry.second == depth_owner; });
+      auto depth_owner_it =
+          std::find_if(host_depth_stencil_targets_.begin(), host_depth_stencil_targets_.end(),
+                       [depth_owner](const auto& entry) { return &entry.second == depth_owner; });
       bool depth_clear_succeeded =
           depth_owner_it != host_depth_stencil_targets_.end() &&
           PrepareCanonicalDepthTargetForUse(depth_owner_it->second, depth_owner_it->first,
-                                            target_width, target_height,
-                                            &depth_clear_error) &&
+                                            target_width, target_height, &depth_clear_error) &&
           QueuePipelineProbeContextDepthStencilClearRect(
-              depth_owner->context, target_width, target_height, clear_x, clear_y,
-              clear_width, clear_height, clear_depth,
-              uint8_t(resolve_info.rb_depth_clear), &depth_clear_error);
+              depth_owner->context, target_width, target_height, clear_x, clear_y, clear_width,
+              clear_height, clear_depth, uint8_t(resolve_info.rb_depth_clear), &depth_clear_error);
       if (!depth_clear_succeeded) {
         static std::atomic<uint32_t> depth_clear_failure_logs{0};
         uint32_t failure_index =
@@ -7087,6 +8653,7 @@ bool MetalCommandProcessor::IssueCopy() {
   if (MetalFallbackResolveEnabled()) {
     if (!wrote_source_resolve && memory_ && register_file_ && last_copy_dest_base_ &&
         active_copy_valid && pipeline_probe_context_) {
+      cpu_fallback_compatible = true;
       reg::RB_COPY_DEST_PITCH copy_dest_pitch = active_copy_dest_pitch;
       uint32_t resolve_width = std::min<uint32_t>(
           fallback_output_width_, std::max<uint32_t>(copy_dest_pitch.copy_dest_pitch, 1));
@@ -7102,7 +8669,7 @@ bool MetalCommandProcessor::IssueCopy() {
                                       copy_dest_pitch.copy_dest_height, resolved_color_bgra_,
                                       resolved_color_width_, resolved_color_height_, copy_rect_x,
                                       copy_rect_y, copy_rect_width, copy_rect_height)) {
-        wrote_source_resolve = true;
+        complete_cpu_fallback();
         static std::atomic<uint32_t> probe_target_resolve_logs{0};
         uint32_t probe_target_resolve_index =
             probe_target_resolve_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -7120,6 +8687,7 @@ bool MetalCommandProcessor::IssueCopy() {
     }
     if (!wrote_source_resolve && memory_ && register_file_ && last_copy_dest_base_ &&
         active_copy_valid) {
+      cpu_fallback_compatible = true;
       reg::RB_COPY_DEST_PITCH copy_dest_pitch = active_copy_dest_pitch;
       if (copy_dest_pitch.copy_dest_pitch && copy_dest_pitch.copy_dest_height &&
           copy_dest_pitch.copy_dest_height >= fallback_output_height_) {
@@ -7220,7 +8788,7 @@ bool MetalCommandProcessor::IssueCopy() {
                                         resolve_width, resolve_height, 0, 0, resolve_width,
                                         resolve_height);
           if (metal_resolve_rendered) {
-            wrote_source_resolve = true;
+            complete_cpu_fallback();
             static std::atomic<uint32_t> source_resolve_write_logs{0};
             uint32_t source_resolve_write_index =
                 source_resolve_write_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -7247,7 +8815,7 @@ bool MetalCommandProcessor::IssueCopy() {
                                           copy_dest_pitch.copy_dest_height, source_bgra,
                                           source_width, source_height, 0, 0, source_width,
                                           source_height)) {
-              wrote_source_resolve = true;
+              complete_cpu_fallback();
             }
           }
         }
@@ -7256,6 +8824,7 @@ bool MetalCommandProcessor::IssueCopy() {
     if (!wrote_source_resolve && memory_ && register_file_ && last_copy_dest_base_ &&
         active_copy_valid && !pending_texture_resolve_bgra_.empty() &&
         pending_texture_resolve_width_ && pending_texture_resolve_height_) {
+      cpu_fallback_compatible = true;
       reg::RB_COPY_DEST_PITCH copy_dest_pitch = active_copy_dest_pitch;
       uint32_t resolve_width = std::min<uint32_t>(
           pending_texture_resolve_width_, std::max<uint32_t>(copy_dest_pitch.copy_dest_pitch, 1));
@@ -7296,7 +8865,7 @@ bool MetalCommandProcessor::IssueCopy() {
                                     fallback_output_height_, pending_texture_resolve_bgra_,
                                     pending_texture_resolve_width_, pending_texture_resolve_height_,
                                     copy_rect_x, copy_rect_y, copy_rect_width, copy_rect_height)) {
-        wrote_source_resolve = true;
+        complete_cpu_fallback();
         static std::atomic<uint32_t> texture_resolve_write_logs{0};
         uint32_t texture_resolve_write_index =
             texture_resolve_write_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -7321,6 +8890,7 @@ bool MetalCommandProcessor::IssueCopy() {
     }
     if (!wrote_source_resolve && memory_ && register_file_ && draw_renderer_ &&
         last_copy_dest_base_ && draw_count_ && !pending_host_vertices_.empty()) {
+      cpu_fallback_compatible = true;
       reg::RB_COPY_DEST_PITCH copy_dest_pitch = active_copy_dest_pitch;
       if (!copy_dest_pitch.copy_dest_pitch) {
         copy_dest_pitch.copy_dest_pitch = fallback_output_width_;
@@ -7380,7 +8950,8 @@ bool MetalCommandProcessor::IssueCopy() {
           latest_fullscreen_postprocess_width_ == fallback_output_width_ &&
           latest_fullscreen_postprocess_height_ == fallback_output_height_ &&
           BgraHasNonZeroRgb(latest_fullscreen_postprocess_bgra_);
-      if (!host_texture_ptr && recent_fullscreen_resolve) {
+      bool skip_untextured_fallback = !host_texture_ptr && recent_fullscreen_resolve;
+      if (skip_untextured_fallback) {
         static std::atomic<uint32_t> fallback_stomp_skip_logs{0};
         uint32_t fallback_stomp_skip_index =
             fallback_stomp_skip_logs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -7392,120 +8963,126 @@ bool MetalCommandProcessor::IssueCopy() {
                        latest_fullscreen_postprocess_draw_count_, pending_host_vertices_.size());
           std::fflush(stderr);
         }
-        return true;
       }
-      bool recent_host_pixel_frame =
-          latest_host_pixel_frame_draw_count_ &&
-          draw_count_ >= latest_host_pixel_frame_draw_count_ &&
-          draw_count_ - latest_host_pixel_frame_draw_count_ <= 64 &&
-          latest_host_pixel_frame_width_ == resolve_width &&
-          latest_host_pixel_frame_height_ == resolve_height &&
-          latest_host_pixel_frame_bgra_.size() >= size_t(resolve_width) * resolve_height * 4;
-      if (recent_host_pixel_frame) {
-        BgraFrameStats host_pixel_stats = GetBgraFrameStats(latest_host_pixel_frame_bgra_);
-        const std::vector<uint8_t>* selected_resolve_bgra = &latest_host_pixel_frame_bgra_;
-        BgraFrameStats selected_resolve_stats = host_pixel_stats;
-        std::vector<uint8_t> fallback_candidate_bgra;
-        if (host_pixel_skipped_vertices_this_swap_ && latest_host_pixel_frame_from_fallback_ &&
-            draw_renderer_ &&
-            draw_renderer_->RenderDrawEventFrame(
-                resolve_width, resolve_height, draw_count_, metal_copy_index, pending_draw_events_,
-                pending_host_vertices_, fallback_candidate_bgra, host_texture_ptr)) {
-          BgraFrameStats fallback_candidate_stats = GetBgraFrameStats(fallback_candidate_bgra);
-          if (fallback_candidate_stats.visible_pixels >
-                  host_pixel_stats.visible_pixels + host_pixel_stats.visible_pixels / 5 &&
-              !IsDominantFlatVisibleFrame(fallback_candidate_bgra, resolve_width, resolve_height,
-                                          fallback_candidate_stats.visible_pixels)) {
-            selected_resolve_bgra = &fallback_candidate_bgra;
-            selected_resolve_stats = fallback_candidate_stats;
-            static std::atomic<uint32_t> fallback_candidate_prefer_logs{0};
-            uint32_t fallback_candidate_prefer_index =
-                fallback_candidate_prefer_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (fallback_candidate_prefer_index <= 16 ||
-                (fallback_candidate_prefer_index & 0x3F) == 0) {
+      if (!skip_untextured_fallback) {
+        bool recent_host_pixel_frame =
+            latest_host_pixel_frame_draw_count_ &&
+            draw_count_ >= latest_host_pixel_frame_draw_count_ &&
+            draw_count_ - latest_host_pixel_frame_draw_count_ <= 64 &&
+            latest_host_pixel_frame_width_ == resolve_width &&
+            latest_host_pixel_frame_height_ == resolve_height &&
+            latest_host_pixel_frame_bgra_.size() >= size_t(resolve_width) * resolve_height * 4;
+        if (recent_host_pixel_frame) {
+          BgraFrameStats host_pixel_stats = GetBgraFrameStats(latest_host_pixel_frame_bgra_);
+          const std::vector<uint8_t>* selected_resolve_bgra = &latest_host_pixel_frame_bgra_;
+          BgraFrameStats selected_resolve_stats = host_pixel_stats;
+          std::vector<uint8_t> fallback_candidate_bgra;
+          if (host_pixel_skipped_vertices_this_swap_ && latest_host_pixel_frame_from_fallback_ &&
+              draw_renderer_ &&
+              draw_renderer_->RenderDrawEventFrame(resolve_width, resolve_height, draw_count_,
+                                                   metal_copy_index, pending_draw_events_,
+                                                   pending_host_vertices_, fallback_candidate_bgra,
+                                                   host_texture_ptr)) {
+            BgraFrameStats fallback_candidate_stats = GetBgraFrameStats(fallback_candidate_bgra);
+            if (fallback_candidate_stats.visible_pixels >
+                    host_pixel_stats.visible_pixels + host_pixel_stats.visible_pixels / 5 &&
+                !IsDominantFlatVisibleFrame(fallback_candidate_bgra, resolve_width, resolve_height,
+                                            fallback_candidate_stats.visible_pixels)) {
+              selected_resolve_bgra = &fallback_candidate_bgra;
+              selected_resolve_stats = fallback_candidate_stats;
+              static std::atomic<uint32_t> fallback_candidate_prefer_logs{0};
+              uint32_t fallback_candidate_prefer_index =
+                  fallback_candidate_prefer_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+              if (fallback_candidate_prefer_index <= 16 ||
+                  (fallback_candidate_prefer_index & 0x3F) == 0) {
+                std::fprintf(
+                    stderr,
+                    "[metal] preferred fallback candidate#%u over host pixel "
+                    "skipped_vertices=%u host_visible=%u fallback_visible=%u "
+                    "host_vertices=%zu\n",
+                    fallback_candidate_prefer_index, host_pixel_skipped_vertices_this_swap_,
+                    host_pixel_stats.visible_pixels, fallback_candidate_stats.visible_pixels,
+                    pending_host_vertices_.size());
+                std::fflush(stderr);
+              }
+            }
+          }
+          if (selected_resolve_stats.visible_pixels &&
+              !IsDominantFlatVisibleFrame(*selected_resolve_bgra, resolve_width, resolve_height,
+                                          selected_resolve_stats.visible_pixels) &&
+              CompositeAndWriteResolvedColor(last_copy_dest_base_, copy_dest_pitch.copy_dest_pitch,
+                                             fallback_output_height_, *selected_resolve_bgra,
+                                             resolve_width, resolve_height, copy_rect_x,
+                                             copy_rect_y, copy_rect_width, copy_rect_height)) {
+            complete_cpu_fallback();
+            latest_draw_event_frame_bgra_ = resolved_color_bgra_;
+            latest_draw_event_frame_width_ = resolved_color_width_;
+            latest_draw_event_frame_height_ = resolved_color_height_;
+            static std::atomic<uint32_t> host_pixel_resolve_write_logs{0};
+            uint32_t host_pixel_resolve_write_index =
+                host_pixel_resolve_write_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogMetalDiagnostic(host_pixel_resolve_write_index, 16, 0x3F)) {
+              BgraFrameStats resolved_write_stats = GetBgraFrameStats(resolved_color_bgra_);
               std::fprintf(stderr,
-                           "[metal] preferred fallback candidate#%u over host pixel "
-                           "skipped_vertices=%u host_visible=%u fallback_visible=%u "
-                           "host_vertices=%zu\n",
-                           fallback_candidate_prefer_index, host_pixel_skipped_vertices_this_swap_,
-                           host_pixel_stats.visible_pixels, fallback_candidate_stats.visible_pixels,
-                           pending_host_vertices_.size());
+                           "[metal] wrote host pixel resolve#%u base=0x%08x pitch=%u height=%u "
+                           "image=%ux%u rect=%u,%u %ux%u host_vertices=%zu "
+                           "source_visible=%u resolved_visible=%u range=%u\n",
+                           host_pixel_resolve_write_index, last_copy_dest_base_,
+                           copy_dest_pitch.copy_dest_pitch, copy_dest_pitch.copy_dest_height,
+                           resolve_width, resolve_height, copy_rect_x, copy_rect_y, copy_rect_width,
+                           copy_rect_height, pending_host_vertices_.size(),
+                           selected_resolve_stats.visible_pixels,
+                           resolved_write_stats.visible_pixels, BgraRgbRange(resolved_write_stats));
               std::fflush(stderr);
+            }
+            if (host_pixel_resolve_write_index <= 8) {
+              DumpBgraFrameAsPpm("host_resolve", host_pixel_resolve_write_index,
+                                 resolved_color_bgra_, resolved_color_width_,
+                                 resolved_color_height_);
+            }
+            if (copy_rect_y + copy_rect_height >= fallback_output_height_) {
+              pending_draw_events_.clear();
+              pending_host_vertices_.clear();
+              pending_texture_resolve_bgra_.clear();
+              pending_texture_resolve_width_ = 0;
+              pending_texture_resolve_height_ = 0;
             }
           }
         }
-        if (selected_resolve_stats.visible_pixels &&
-            !IsDominantFlatVisibleFrame(*selected_resolve_bgra, resolve_width, resolve_height,
-                                        selected_resolve_stats.visible_pixels) &&
-            CompositeAndWriteResolvedColor(last_copy_dest_base_, copy_dest_pitch.copy_dest_pitch,
-                                           fallback_output_height_, *selected_resolve_bgra,
-                                           resolve_width, resolve_height, copy_rect_x, copy_rect_y,
-                                           copy_rect_width, copy_rect_height)) {
-          wrote_source_resolve = true;
-          latest_draw_event_frame_bgra_ = resolved_color_bgra_;
-          latest_draw_event_frame_width_ = resolved_color_width_;
-          latest_draw_event_frame_height_ = resolved_color_height_;
-          static std::atomic<uint32_t> host_pixel_resolve_write_logs{0};
-          uint32_t host_pixel_resolve_write_index =
-              host_pixel_resolve_write_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-          if (ShouldLogMetalDiagnostic(host_pixel_resolve_write_index, 16, 0x3F)) {
-            BgraFrameStats resolved_write_stats = GetBgraFrameStats(resolved_color_bgra_);
-            std::fprintf(stderr,
-                         "[metal] wrote host pixel resolve#%u base=0x%08x pitch=%u height=%u "
-                         "image=%ux%u rect=%u,%u %ux%u host_vertices=%zu "
-                         "source_visible=%u resolved_visible=%u range=%u\n",
-                         host_pixel_resolve_write_index, last_copy_dest_base_,
-                         copy_dest_pitch.copy_dest_pitch, copy_dest_pitch.copy_dest_height,
-                         resolve_width, resolve_height, copy_rect_x, copy_rect_y, copy_rect_width,
-                         copy_rect_height, pending_host_vertices_.size(),
-                         selected_resolve_stats.visible_pixels, resolved_write_stats.visible_pixels,
-                         BgraRgbRange(resolved_write_stats));
-            std::fflush(stderr);
-          }
-          if (host_pixel_resolve_write_index <= 8) {
-            DumpBgraFrameAsPpm("host_resolve", host_pixel_resolve_write_index, resolved_color_bgra_,
-                               resolved_color_width_, resolved_color_height_);
-          }
-          if (copy_rect_y + copy_rect_height >= fallback_output_height_) {
-            pending_draw_events_.clear();
-            pending_host_vertices_.clear();
-            pending_texture_resolve_bgra_.clear();
-            pending_texture_resolve_width_ = 0;
-            pending_texture_resolve_height_ = 0;
-          }
-        }
-      }
-      if (!wrote_source_resolve) {
-        std::vector<uint8_t> resolve_bgra;
-        if (draw_renderer_->RenderDrawEventFrame(
-                resolve_width, resolve_height, draw_count_, metal_copy_index, pending_draw_events_,
-                pending_host_vertices_, resolve_bgra, host_texture_ptr) &&
-            BlitAndWriteResolvedColor(last_copy_dest_base_, copy_dest_pitch.copy_dest_pitch,
-                                      fallback_output_height_, resolve_bgra, resolve_width,
-                                      resolve_height, copy_rect_x, copy_rect_y, copy_rect_width,
-                                      copy_rect_height)) {
-          latest_draw_event_frame_bgra_ = resolve_bgra;
-          latest_draw_event_frame_width_ = resolve_width;
-          latest_draw_event_frame_height_ = resolve_height;
-          static std::atomic<uint32_t> resolve_write_logs{0};
-          uint32_t resolve_write_index =
-              resolve_write_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-          if (ShouldLogMetalDiagnostic(resolve_write_index, 8, 0x3F)) {
-            std::fprintf(stderr,
-                         "[metal] wrote fallback resolve#%u base=0x%08x pitch=%u height=%u "
-                         "image=%ux%u rect=%u,%u %ux%u host_vertices=%zu texture=%u\n",
-                         resolve_write_index, last_copy_dest_base_, copy_dest_pitch.copy_dest_pitch,
-                         copy_dest_pitch.copy_dest_height, resolve_width, resolve_height,
-                         copy_rect_x, copy_rect_y, copy_rect_width, copy_rect_height,
-                         pending_host_vertices_.size(), host_texture_ptr ? 1u : 0u);
-            std::fflush(stderr);
-          }
-          if (copy_rect_y + copy_rect_height >= fallback_output_height_) {
-            pending_draw_events_.clear();
-            pending_host_vertices_.clear();
-            pending_texture_resolve_bgra_.clear();
-            pending_texture_resolve_width_ = 0;
-            pending_texture_resolve_height_ = 0;
+        if (!wrote_source_resolve) {
+          std::vector<uint8_t> resolve_bgra;
+          if (draw_renderer_->RenderDrawEventFrame(
+                  resolve_width, resolve_height, draw_count_, metal_copy_index,
+                  pending_draw_events_, pending_host_vertices_, resolve_bgra, host_texture_ptr) &&
+              BlitAndWriteResolvedColor(last_copy_dest_base_, copy_dest_pitch.copy_dest_pitch,
+                                        fallback_output_height_, resolve_bgra, resolve_width,
+                                        resolve_height, copy_rect_x, copy_rect_y, copy_rect_width,
+                                        copy_rect_height)) {
+            complete_cpu_fallback();
+            latest_draw_event_frame_bgra_ = resolve_bgra;
+            latest_draw_event_frame_width_ = resolve_width;
+            latest_draw_event_frame_height_ = resolve_height;
+            static std::atomic<uint32_t> resolve_write_logs{0};
+            uint32_t resolve_write_index =
+                resolve_write_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogMetalDiagnostic(resolve_write_index, 8, 0x3F)) {
+              std::fprintf(stderr,
+                           "[metal] wrote fallback resolve#%u base=0x%08x pitch=%u height=%u "
+                           "image=%ux%u rect=%u,%u %ux%u host_vertices=%zu texture=%u\n",
+                           resolve_write_index, last_copy_dest_base_,
+                           copy_dest_pitch.copy_dest_pitch, copy_dest_pitch.copy_dest_height,
+                           resolve_width, resolve_height, copy_rect_x, copy_rect_y, copy_rect_width,
+                           copy_rect_height, pending_host_vertices_.size(),
+                           host_texture_ptr ? 1u : 0u);
+              std::fflush(stderr);
+            }
+            if (copy_rect_y + copy_rect_height >= fallback_output_height_) {
+              pending_draw_events_.clear();
+              pending_host_vertices_.clear();
+              pending_texture_resolve_bgra_.clear();
+              pending_texture_resolve_width_ = 0;
+              pending_texture_resolve_height_ = 0;
+            }
           }
         }
       }
@@ -7551,7 +9128,47 @@ bool MetalCommandProcessor::IssueCopy() {
     std::fflush(stderr);
   }
   LogIncompleteOnce("copy");
-  return true;
+
+  bool copy_packet_valid = memory_ && register_file_ && (resolve_info_valid || active_copy_valid);
+  uint32_t route_destination_start = 0;
+  uint32_t route_destination_length = 0;
+  if (resolve_info_valid) {
+    route_destination_start = resolve_info.copy_dest_extent_start;
+    route_destination_length = resolve_info.copy_dest_extent_length;
+  } else if (active_copy_valid) {
+    route_destination_start = last_copy_dest_base_;
+    route_destination_length = texture_util::GetTiledAddressUpperBound2D(
+        active_copy_dest_pitch.copy_dest_pitch, active_copy_dest_pitch.copy_dest_height,
+        active_copy_dest_pitch.copy_dest_pitch, 2);
+  }
+  bool route_destination_bounds_valid = IsResolveDestinationRangeValid(
+      route_destination_start, route_destination_length, SharedMemory::kBufferSize);
+  ResolveRouteState route_state = {
+      copy_packet_valid,
+      route_destination_bounds_valid,
+      native_resolve_compatible,
+      native_resolve_completed,
+      cpu_fallback_compatible,
+      cpu_fallback_completed,
+      diagnostic_resolve_completed,
+  };
+  ResolveRouteOutcome route_outcome = ClassifyResolveRoute(route_state);
+  if (ResolveRouteSucceeded(route_outcome)) {
+    return true;
+  }
+
+  std::fprintf(stderr,
+               "[metal] IssueCopy failed copy=%u reason=%s packet_valid=%u resolve_valid=%u "
+               "active_valid=%u dest=0x%08x+0x%x native(compatible=%u completed=%u) "
+               "cpu(compatible=%u completed=%u enabled=%u) diagnostic_completed=%u\n",
+               metal_copy_index, ResolveRouteOutcomeName(route_outcome),
+               copy_packet_valid ? 1u : 0u, resolve_info_valid ? 1u : 0u,
+               active_copy_valid ? 1u : 0u, route_destination_start, route_destination_length,
+               native_resolve_compatible ? 1u : 0u, native_resolve_completed ? 1u : 0u,
+               cpu_fallback_compatible ? 1u : 0u, cpu_fallback_completed ? 1u : 0u,
+               MetalFallbackResolveEnabled() ? 1u : 0u, diagnostic_resolve_completed ? 1u : 0u);
+  std::fflush(stderr);
+  return false;
 }
 
 bool MetalCommandProcessor::WriteBgraToTiledResolve(uint32_t dest_base, uint32_t pitch,
@@ -8201,13 +9818,11 @@ CanonicalEdramSurfaceLayout MetalCommandProcessor::GetCanonicalColorLayout(
   surface_info.value = target.surface_info;
   CanonicalEdramSurfaceLayout layout;
   layout.base_tiles =
-      (color_info.color_base | (color_info.color_base_bit_11 << 11)) &
-      (xenos::kEdramTileCount - 1);
+      (color_info.color_base | (color_info.color_base_bit_11 << 11)) & (xenos::kEdramTileCount - 1);
   layout.msaa_samples = surface_info.msaa_samples;
   layout.is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_info.color_format);
-  layout.pitch_tiles =
-      xenos::GetSurfacePitchTiles(surface_info.surface_pitch, surface_info.msaa_samples,
-                                  layout.is_64bpp);
+  layout.pitch_tiles = xenos::GetSurfacePitchTiles(surface_info.surface_pitch,
+                                                   surface_info.msaa_samples, layout.is_64bpp);
   return layout;
 }
 
@@ -8219,8 +9834,7 @@ CanonicalEdramSurfaceLayout MetalCommandProcessor::GetCanonicalDepthLayout(
   surface_info.value = target.surface_info;
   CanonicalEdramSurfaceLayout layout;
   layout.base_tiles =
-      (depth_info.depth_base | (depth_info.depth_base_bit_11 << 11)) &
-      (xenos::kEdramTileCount - 1);
+      (depth_info.depth_base | (depth_info.depth_base_bit_11 << 11)) & (xenos::kEdramTileCount - 1);
   layout.pitch_tiles =
       xenos::GetSurfacePitchTiles(surface_info.surface_pitch, surface_info.msaa_samples, false);
   layout.msaa_samples = surface_info.msaa_samples;
@@ -8228,8 +9842,8 @@ CanonicalEdramSurfaceLayout MetalCommandProcessor::GetCanonicalDepthLayout(
   return layout;
 }
 
-void MetalCommandProcessor::RecordCanonicalColorRequirement(
-    xenos::ColorRenderTargetFormat format, xenos::MsaaSamples msaa_samples) {
+void MetalCommandProcessor::RecordCanonicalColorRequirement(xenos::ColorRenderTargetFormat format,
+                                                            xenos::MsaaSamples msaa_samples) {
   if (!trace_writer_.is_open()) {
     return;
   }
@@ -8237,8 +9851,8 @@ void MetalCommandProcessor::RecordCanonicalColorRequirement(
   trace_writer_.RequireEdramMsaaSamples(msaa_samples);
 }
 
-void MetalCommandProcessor::RecordCanonicalDepthRequirement(
-    xenos::DepthRenderTargetFormat format, xenos::MsaaSamples msaa_samples) {
+void MetalCommandProcessor::RecordCanonicalDepthRequirement(xenos::DepthRenderTargetFormat format,
+                                                            xenos::MsaaSamples msaa_samples) {
   if (!trace_writer_.is_open()) {
     return;
   }
@@ -8248,6 +9862,9 @@ void MetalCommandProcessor::RecordCanonicalDepthRequirement(
 
 bool MetalCommandProcessor::CaptureCanonicalEdramSnapshot(std::vector<uint8_t>& snapshot_out,
                                                           std::string* error_out) {
+  if (!MaterializeExactOutputMergerEdram("canonical capture", error_out)) {
+    return false;
+  }
   if (canonical_edram_unsupported_state_) {
     if (error_out) {
       *error_out =
@@ -8351,8 +9968,7 @@ bool MetalCommandProcessor::RestoreCanonicalColorTarget(HostRenderTarget& target
     canonical_edram_unsupported_state_ = true;
     return true;
   }
-  if (canonical_edram_unsupported_state_ ||
-      !canonical_edram_state_.target_hydration_enabled()) {
+  if (canonical_edram_unsupported_state_ || !canonical_edram_state_.target_hydration_enabled()) {
     return true;
   }
   const uint32_t width = target.canonical_width;
@@ -8363,11 +9979,10 @@ bool MetalCommandProcessor::RestoreCanonicalColorTarget(HostRenderTarget& target
     }
     return false;
   }
-  bool needs_hydration =
-      !target.canonical_hydrated ||
-      canonical_edram_ownership_.SurfaceNeedsHydration(
-          layout, width, height, CanonicalEdramOwnerKind::kColorTarget, target_key,
-          target.canonical_hydrated_sequence);
+  bool needs_hydration = !target.canonical_hydrated ||
+                         canonical_edram_ownership_.SurfaceNeedsHydration(
+                             layout, width, height, CanonicalEdramOwnerKind::kColorTarget,
+                             target_key, target.canonical_hydrated_sequence);
   if (!needs_hydration) {
     return true;
   }
@@ -8377,9 +9992,9 @@ bool MetalCommandProcessor::RestoreCanonicalColorTarget(HostRenderTarget& target
       return false;
     }
   }
-  if (!RestorePipelineProbeColorFromCanonicalEdram(
-          target.context, width, height, layout, color_info.color_format, edram_bgra_.data(),
-          edram_bgra_.size(), error_out)) {
+  if (!RestorePipelineProbeColorFromCanonicalEdram(target.context, width, height, layout,
+                                                   color_info.color_format, edram_bgra_.data(),
+                                                   edram_bgra_.size(), error_out)) {
     return false;
   }
   target.canonical_hydrated = true;
@@ -8398,8 +10013,7 @@ bool MetalCommandProcessor::RestoreCanonicalDepthTarget(HostDepthStencilTarget& 
     canonical_edram_unsupported_state_ = true;
     return true;
   }
-  if (canonical_edram_unsupported_state_ ||
-      !canonical_edram_state_.target_hydration_enabled()) {
+  if (canonical_edram_unsupported_state_ || !canonical_edram_state_.target_hydration_enabled()) {
     return true;
   }
   const uint32_t width = target.width;
@@ -8410,11 +10024,10 @@ bool MetalCommandProcessor::RestoreCanonicalDepthTarget(HostDepthStencilTarget& 
     }
     return false;
   }
-  bool needs_hydration =
-      !target.canonical_hydrated ||
-      canonical_edram_ownership_.SurfaceNeedsHydration(
-          layout, width, height, CanonicalEdramOwnerKind::kDepthStencilTarget, target_key,
-          target.canonical_hydrated_sequence);
+  bool needs_hydration = !target.canonical_hydrated ||
+                         canonical_edram_ownership_.SurfaceNeedsHydration(
+                             layout, width, height, CanonicalEdramOwnerKind::kDepthStencilTarget,
+                             target_key, target.canonical_hydrated_sequence);
   if (!needs_hydration) {
     return true;
   }
@@ -8435,8 +10048,7 @@ bool MetalCommandProcessor::RestoreCanonicalDepthTarget(HostDepthStencilTarget& 
 }
 
 bool MetalCommandProcessor::PrepareCanonicalContextForUse(void* context, uint32_t width,
-                                                          uint32_t height,
-                                                          std::string* error_out) {
+                                                          uint32_t height, std::string* error_out) {
   if (!context || !width || !height) {
     if (error_out) {
       *error_out = "invalid canonical target context or extent";
@@ -8521,9 +10133,10 @@ bool MetalCommandProcessor::PrepareCanonicalContextForUse(void* context, uint32_
          RestoreCanonicalColorTarget(color_target, color_it->first, error_out);
 }
 
-bool MetalCommandProcessor::PrepareCanonicalDepthTargetForUse(
-    HostDepthStencilTarget& target, uint64_t target_key, uint32_t width, uint32_t height,
-    std::string* error_out) {
+bool MetalCommandProcessor::PrepareCanonicalDepthTargetForUse(HostDepthStencilTarget& target,
+                                                              uint64_t target_key, uint32_t width,
+                                                              uint32_t height,
+                                                              std::string* error_out) {
   if (!target.context || !width || !height || !EnsureEdramBgraBacking()) {
     if (error_out) {
       *error_out = "invalid canonical depth/stencil target or extent";
@@ -8572,13 +10185,30 @@ void MetalCommandProcessor::MarkCanonicalColorTargetWritten(HostRenderTarget& ta
   if (!IsCanonicalEdramColorFormatSupportedByMetal(color_info.color_format)) {
     canonical_edram_unsupported_state_ = true;
   }
-  if (canonical_edram_unsupported_state_ || !target.canonical_width ||
-      !target.canonical_height) {
+  if (canonical_edram_unsupported_state_ || !target.canonical_width || !target.canonical_height) {
     target.canonical_hydrated = false;
     return;
   }
+  const CanonicalEdramSurfaceLayout layout = GetCanonicalColorLayout(target);
+  const bool contain_native_alias =
+      ShouldContainCanonicalEdramNativeAlias(canonical_edram_state_.target_hydration_enabled(),
+                                             exact_output_merger_residency_.exact_gpu_current());
+  if (contain_native_alias && ClassifyCanonicalEdramSurfaceLayout(layout, target.canonical_width,
+                                                                  target.canonical_height) !=
+                                  CanonicalEdramSurfaceLayoutClass::kNonAliasing) {
+    // A private native texture has independent logical samples where wrapped
+    // Xenos EDRAM has one physical word. Never publish it as a canonical tile
+    // owner after a native write: there is no lossless export ordering for the
+    // aliases. The existing native path may continue, but future exact capture
+    // must reject rather than upload a silently chosen alias.
+    canonical_edram_unsupported_state_ = true;
+    canonical_edram_unexportable_native_alias_ = true;
+    target.canonical_hydrated_sequence = 0;
+    target.canonical_hydrated = true;
+    return;
+  }
   target.canonical_hydrated_sequence = canonical_edram_ownership_.MarkSurface(
-      GetCanonicalColorLayout(target), target.canonical_width, target.canonical_height,
+      layout, target.canonical_width, target.canonical_height,
       CanonicalEdramOwnerKind::kColorTarget, target_key);
   target.canonical_hydrated = true;
 }
@@ -8596,15 +10226,27 @@ void MetalCommandProcessor::MarkCanonicalDepthTargetWritten(HostDepthStencilTarg
     target.canonical_hydrated = false;
     return;
   }
+  const CanonicalEdramSurfaceLayout layout = GetCanonicalDepthLayout(target);
+  const bool contain_native_alias =
+      ShouldContainCanonicalEdramNativeAlias(canonical_edram_state_.target_hydration_enabled(),
+                                             exact_output_merger_residency_.exact_gpu_current());
+  if (contain_native_alias &&
+      ClassifyCanonicalEdramSurfaceLayout(layout, target.width, target.height) !=
+          CanonicalEdramSurfaceLayoutClass::kNonAliasing) {
+    canonical_edram_unsupported_state_ = true;
+    canonical_edram_unexportable_native_alias_ = true;
+    target.canonical_hydrated_sequence = 0;
+    target.canonical_hydrated = true;
+    return;
+  }
   target.canonical_hydrated_sequence = canonical_edram_ownership_.MarkSurface(
-      GetCanonicalDepthLayout(target), target.width, target.height,
-      CanonicalEdramOwnerKind::kDepthStencilTarget, target_key);
+      layout, target.width, target.height, CanonicalEdramOwnerKind::kDepthStencilTarget,
+      target_key);
   target.canonical_hydrated = true;
 }
 
 void MetalCommandProcessor::MarkCanonicalWritesForContext(
-    void* context, uint32_t shader_color_target_mask,
-    const ProbeDepthStencilState* depth_state) {
+    void* context, uint32_t shader_color_target_mask, const ProbeDepthStencilState* depth_state) {
   if (!context) {
     return;
   }
@@ -8615,20 +10257,18 @@ void MetalCommandProcessor::MarkCanonicalWritesForContext(
     bool color_written =
         register_file_ && (shader_color_target_mask & (UINT32_C(1) << target.rt_index)) &&
         ((register_file_->values[XE_GPU_REG_RB_COLOR_MASK] >> (target.rt_index * 4)) & 0xF) &&
-        register_file_->Get<reg::RB_MODECONTROL>().edram_mode ==
-            xenos::EdramMode::kColorDepth;
+        register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth;
     if (color_written) {
       MarkCanonicalColorTargetWritten(target, key);
     }
     bool depth_written = depth_state && depth_state->depth_write_enabled;
     auto stencil_face_writes = [](const ProbeStencilFaceState& face) {
-      return face.write_mask &&
-             (face.stencil_failure_operation || face.depth_failure_operation ||
-              face.depth_stencil_pass_operation);
+      return face.write_mask && (face.stencil_failure_operation || face.depth_failure_operation ||
+                                 face.depth_stencil_pass_operation);
     };
-    depth_written |= depth_state && depth_state->stencil_test_enabled &&
-                     (stencil_face_writes(depth_state->front) ||
-                      stencil_face_writes(depth_state->back));
+    depth_written |=
+        depth_state && depth_state->stencil_test_enabled &&
+        (stencil_face_writes(depth_state->front) || stencil_face_writes(depth_state->back));
     if (depth_written) {
       auto depth_it = host_depth_stencil_targets_.find(target.depth_stencil_key);
       if (depth_it != host_depth_stencil_targets_.end()) {
@@ -8800,8 +10440,8 @@ uint64_t MetalCommandProcessor::GetHostRenderTargetKey(uint32_t rt_index) const 
   }
   // Color contents survive depth-buffer rebinds. Depth/stencil identity is
   // tracked independently and the color context is reattached when needed.
-  uint32_t key_parts[4] = {rt_index, color_info.value, surface_info.surface_pitch,
-                           uint32_t(surface_info.msaa_samples)};
+  uint32_t key_parts[5] = {rt_index, color_info.value, surface_info.surface_pitch,
+                           uint32_t(surface_info.msaa_samples), uint32_t(color_info.color_format)};
   return XXH3_64bits(key_parts, sizeof(key_parts));
 }
 
@@ -8943,6 +10583,8 @@ MetalCommandProcessor::HostRenderTarget* MetalCommandProcessor::EnsureHostRender
   uint32_t current_surface_info = register_file_->Get<reg::RB_SURFACE_INFO>().value;
   reg::RB_SURFACE_INFO surface_info = {};
   surface_info.value = current_surface_info;
+  reg::RB_COLOR_INFO color_info = {};
+  color_info.value = current_color_info;
   uint32_t sample_count = GetMetalSampleCount(surface_info.msaa_samples);
 
   auto [it, inserted] = host_render_targets_.try_emplace(key);
@@ -8968,7 +10610,9 @@ MetalCommandProcessor::HostRenderTarget* MetalCommandProcessor::EnsureHostRender
       }
       return nullptr;
     }
-    if (!SetPipelineProbeContextSampleCount(target.context, sample_count, &context_error)) {
+    if (!SetPipelineProbeContextColorFormat(target.context, color_info.color_format,
+                                            &context_error) ||
+        !SetPipelineProbeContextSampleCount(target.context, sample_count, &context_error)) {
       ReleasePipelineProbeContext(target.context);
       target.context = nullptr;
       host_render_targets_.erase(it);
@@ -9374,63 +11018,47 @@ bool MetalCommandProcessor::EnsureExactResolvedSurfaceSnapshot(uint32_t width, u
   if (!WaitForPipelineProbeSubmissions("exact-snapshot-resize")) {
     return false;
   }
-
-  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
-  ExactResolvedSurface& candidate = exact_resolved_surface_;
-  if (candidate.metal_texture && candidate.texture_width == width &&
-      candidate.texture_height == height) {
-    return true;
-  }
-  ReleaseExactResolvedSurfaceSnapshot();
   std::string error;
-  candidate.metal_texture =
+  void* replacement_texture =
       CreatePipelineProbeSnapshotTexture(metal_device_, width, height, &error);
-  if (!candidate.metal_texture) {
+  if (!replacement_texture) {
     if (!error.empty()) {
       REXLOG_WARN("Metal exact presentation snapshot unavailable: {}", error);
     }
     return false;
   }
-  candidate.texture_width = width;
-  candidate.texture_height = height;
-  return true;
-}
 
-void MetalCommandProcessor::RememberCompatibleExactResolvedSurfaceFetch(
-    const xenos::xe_gpu_texture_fetch_t& fetch) {
-  uint64_t key = GetCompatibleExactResolvedSurfaceFetchKey(fetch);
-  if (key) {
-    observed_exact_resolved_surface_fetches_.insert(key);
-  }
-}
-
-bool MetalCommandProcessor::HasCompatibleExactResolvedSurfaceFetch(uint32_t base, uint32_t pitch,
-                                                                   uint32_t height,
-                                                                   xenos::Endian128 endian) const {
-  if (!register_file_ || !base || !pitch || !height) {
-    return false;
-  }
-  uint64_t expected_key = uint64_t(base >> 12) | (uint64_t(pitch) << 17) |
-                          (uint64_t(height) << 31) | (uint64_t(endian) << 45);
-  if (observed_exact_resolved_surface_fetches_.count(expected_key)) {
-    return true;
-  }
-  for (uint32_t fetch_index = 0; fetch_index < 32; ++fetch_index) {
-    if (GetCompatibleExactResolvedSurfaceFetchKey(register_file_->GetTextureFetch(fetch_index)) ==
-        expected_key) {
-      return true;
+  void* texture_to_release = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+    ExactResolvedSurface& candidate = exact_resolved_surface_;
+    if (candidate.metal_texture && candidate.texture_width == width &&
+        candidate.texture_height == height) {
+      texture_to_release = replacement_texture;
+    } else {
+      texture_to_release = candidate.metal_texture;
+      candidate.metal_texture = replacement_texture;
+      candidate.texture_width = width;
+      candidate.texture_height = height;
+      candidate.gpu_snapshot_row_valid.clear();
+      candidate.gpu_snapshot_valid_row_count = 0;
+      candidate.gpu_snapshot = false;
+      candidate.valid = false;
+      exact_resolved_surface_publication_tracker_.Reset();
     }
   }
-  return last_swap_fetch_valid_ &&
-         GetCompatibleExactResolvedSurfaceFetchKey(last_swap_fetch_) == expected_key;
+  if (texture_to_release) {
+    ReleasePipelineProbeSnapshotTexture(texture_to_release);
+  }
+  return true;
 }
 
 bool MetalCommandProcessor::PrepareExactResolvedSurfaceGpuBand(
     uint32_t dest_base, uint32_t pitch, uint32_t surface_height, uint32_t snapshot_y,
     uint32_t write_height, xenos::Endian128 dest_endian, uint64_t resolve_signature,
-    void*& texture_out, uint64_t& invalidation_epoch_out) {
+    void*& texture_out, uint64_t& publication_token_out) {
   texture_out = nullptr;
-  invalidation_epoch_out = 0;
+  publication_token_out = 0;
   uint32_t tiled_extent =
       texture_util::GetTiledAddressUpperBound2D(pitch, surface_height, pitch, 2);
   if (!memory_ || !dest_base || !pitch || !surface_height || !write_height ||
@@ -9441,23 +11069,44 @@ bool MetalCommandProcessor::PrepareExactResolvedSurfaceGpuBand(
     return false;
   }
 
+  const ExactResolvedSurfaceAssemblyIdentity proposed_identity = {
+      dest_base,         pitch, surface_height, surface_height, tiled_extent, uint32_t(dest_endian),
+      resolve_signature,
+  };
+
+  auto can_prepare_with_candidate = [&](const ExactResolvedSurface& candidate) {
+    ExactResolvedSurfaceAssemblyIdentity active_identity;
+    const ExactResolvedSurfaceAssemblyIdentity* active_identity_ptr = nullptr;
+    if (candidate.gpu_snapshot) {
+      active_identity = {
+          candidate.base,
+          candidate.pitch,
+          candidate.bgra_height,
+          candidate.surface_height,
+          candidate.tiled_extent,
+          uint32_t(candidate.endian),
+          candidate.resolve_signature,
+      };
+      active_identity_ptr = &active_identity;
+    }
+    return CanPrepareExactResolvedSurfaceAssemblyBand(
+        active_identity_ptr, uint32_t(candidate.gpu_snapshot_row_valid.size()),
+        candidate.gpu_snapshot_valid_row_count, proposed_identity, snapshot_y, write_height);
+  };
+
   if (!snapshot_y) {
-    // A first band is only worth copying when a live fetch already describes
-    // this exact surface. A complete full-height resolve is also directly
-    // presentable and doesn't need speculative multi-band assembly.
-    if (write_height != surface_height &&
-        !HasCompatibleExactResolvedSurfaceFetch(dest_base, pitch, surface_height, dest_endian)) {
+    // Start a strictly identified generation even before a fetch observes it.
+    // GoldenEye alternates complete three-band surfaces, and the unobserved
+    // producer must not force synchronous GPU readback merely because its
+    // texture is consumed in a later frame (or not consumed at all).
+    if (!CanPrepareExactResolvedSurfaceAssemblyBand(nullptr, 0, 0, proposed_identity, snapshot_y,
+                                                    write_height)) {
       return false;
     }
   } else {
     std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
     const ExactResolvedSurface& candidate = exact_resolved_surface_;
-    if (!candidate.gpu_snapshot || candidate.base != dest_base || candidate.pitch != pitch ||
-        candidate.bgra_height != surface_height || candidate.surface_height != surface_height ||
-        candidate.tiled_extent != tiled_extent || candidate.endian != dest_endian ||
-        candidate.resolve_signature != resolve_signature ||
-        candidate.gpu_snapshot_row_valid.size() != surface_height ||
-        candidate.gpu_snapshot_valid_row_count != snapshot_y) {
+    if (!can_prepare_with_candidate(candidate)) {
       return false;
     }
   }
@@ -9467,38 +11116,46 @@ bool MetalCommandProcessor::PrepareExactResolvedSurfaceGpuBand(
   }
 
   std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
-  const ExactResolvedSurface& candidate = exact_resolved_surface_;
-  if (snapshot_y &&
-      (!candidate.gpu_snapshot || candidate.base != dest_base || candidate.pitch != pitch ||
-       candidate.bgra_height != surface_height || candidate.surface_height != surface_height ||
-       candidate.tiled_extent != tiled_extent || candidate.endian != dest_endian ||
-       candidate.resolve_signature != resolve_signature ||
-       candidate.gpu_snapshot_row_valid.size() != surface_height ||
-       candidate.gpu_snapshot_valid_row_count != snapshot_y)) {
+  ExactResolvedSurface& candidate = exact_resolved_surface_;
+  if (snapshot_y && !can_prepare_with_candidate(candidate)) {
     return false;
   }
   if (!candidate.metal_texture || candidate.texture_width != pitch ||
       candidate.texture_height != surface_height) {
     return false;
   }
+  ExactResolvedSurfacePublicationIdentity publication_identity = {
+      dest_base,  pitch,        surface_height,        tiled_extent,
+      snapshot_y, write_height, uint32_t(dest_endian), resolve_signature,
+  };
+  // Row zero begins a new texture generation. Stop exposing the previous
+  // complete generation before the shared Metal texture is overwritten, so a
+  // rejected completion can never leave the old identity pointing at new data.
+  if (!snapshot_y) {
+    candidate.valid = false;
+  }
   texture_out = candidate.metal_texture;
-  invalidation_epoch_out =
-      exact_resolved_surface_invalidation_epoch_.load(std::memory_order_acquire);
+  publication_token_out = exact_resolved_surface_publication_tracker_.Arm(publication_identity);
   return true;
 }
 
 void MetalCommandProcessor::UpdateExactResolvedSurfaceGpuCache(
     uint32_t dest_base, uint32_t pitch, uint32_t surface_height, uint32_t snapshot_width,
     uint32_t snapshot_height, uint32_t snapshot_y, uint32_t write_height,
-    xenos::Endian128 dest_endian, uint64_t resolve_signature,
-    uint64_t expected_invalidation_epoch) {
+    xenos::Endian128 dest_endian, uint64_t resolve_signature, uint64_t publication_token) {
   uint32_t tiled_extent =
       texture_util::GetTiledAddressUpperBound2D(pitch, surface_height, pitch, 2);
   std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
   ExactResolvedSurface& candidate = exact_resolved_surface_;
-  if (exact_resolved_surface_invalidation_epoch_.load(std::memory_order_acquire) !=
-          expected_invalidation_epoch ||
-      !candidate.metal_texture || !memory_ || !dest_base || !pitch || !surface_height ||
+  ExactResolvedSurfacePublicationIdentity publication_identity = {
+      dest_base,  pitch,        surface_height,        tiled_extent,
+      snapshot_y, write_height, uint32_t(dest_endian), resolve_signature,
+  };
+  if (!exact_resolved_surface_publication_tracker_.Consume(publication_token,
+                                                           publication_identity)) {
+    return;
+  }
+  if (!candidate.metal_texture || !memory_ || !dest_base || !pitch || !surface_height ||
       !snapshot_width || !snapshot_height || snapshot_width != pitch ||
       snapshot_y > snapshot_height || !write_height ||
       write_height > snapshot_height - snapshot_y || snapshot_height < fallback_output_height_ ||
@@ -9618,18 +11275,23 @@ bool MetalCommandProcessor::GetExactResolvedSurfaceTextureForFetch(
 }
 
 void MetalCommandProcessor::ReleaseExactResolvedSurfaceSnapshot() {
-  std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
-  ExactResolvedSurface& candidate = exact_resolved_surface_;
-  if (candidate.metal_texture) {
-    ReleasePipelineProbeSnapshotTexture(candidate.metal_texture);
+  void* texture_to_release = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
+    ExactResolvedSurface& candidate = exact_resolved_surface_;
+    texture_to_release = candidate.metal_texture;
     candidate.metal_texture = nullptr;
+    candidate.texture_width = 0;
+    candidate.texture_height = 0;
+    candidate.gpu_snapshot_row_valid.clear();
+    candidate.gpu_snapshot_valid_row_count = 0;
+    candidate.gpu_snapshot = false;
+    candidate.valid = false;
+    exact_resolved_surface_publication_tracker_.Reset();
   }
-  candidate.texture_width = 0;
-  candidate.texture_height = 0;
-  candidate.gpu_snapshot_row_valid.clear();
-  candidate.gpu_snapshot_valid_row_count = 0;
-  candidate.gpu_snapshot = false;
-  candidate.valid = false;
+  if (texture_to_release) {
+    ReleasePipelineProbeSnapshotTexture(texture_to_release);
+  }
 }
 
 bool MetalCommandProcessor::EnsureResolvedDepthSnapshot(uint32_t width, uint32_t height) {
@@ -9677,15 +11339,13 @@ bool MetalCommandProcessor::EnsureResolvedDepthSnapshot(uint32_t width, uint32_t
 bool MetalCommandProcessor::PrepareResolvedDepthSnapshotGpuBand(
     uint32_t base, uint32_t pitch, uint32_t tiled_extent, uint32_t snapshot_width,
     uint32_t snapshot_height, uint32_t snapshot_y, uint32_t write_height,
-    xenos::DepthRenderTargetFormat format, xenos::Endian128 endian,
-    uint64_t resolve_signature, void*& texture_out,
-    uint64_t& invalidation_epoch_out) {
+    xenos::DepthRenderTargetFormat format, xenos::Endian128 endian, uint64_t resolve_signature,
+    void*& texture_out, uint64_t& invalidation_epoch_out) {
   texture_out = nullptr;
   invalidation_epoch_out = 0;
   if (!memory_ || !base || !pitch || !tiled_extent || !snapshot_width || !snapshot_height ||
       !write_height || snapshot_y > snapshot_height ||
-      write_height > snapshot_height - snapshot_y ||
-      base >= SharedMemory::kBufferSize ||
+      write_height > snapshot_height - snapshot_y || base >= SharedMemory::kBufferSize ||
       tiled_extent > SharedMemory::kBufferSize - base) {
     return false;
   }
@@ -9694,11 +11354,9 @@ bool MetalCommandProcessor::PrepareResolvedDepthSnapshotGpuBand(
     std::lock_guard<std::recursive_mutex> lock(resolved_depth_snapshot_mutex_);
     const ResolvedDepthSnapshot& snapshot = resolved_depth_snapshot_;
     if (!snapshot.gpu_snapshot || snapshot.base != base || snapshot.pitch != pitch ||
-        snapshot.tiled_extent != tiled_extent ||
-        snapshot.texture_width != snapshot_width ||
+        snapshot.tiled_extent != tiled_extent || snapshot.texture_width != snapshot_width ||
         snapshot.texture_height != snapshot_height || snapshot.format != format ||
-        snapshot.endian != endian ||
-        snapshot.resolve_signature != resolve_signature ||
+        snapshot.endian != endian || snapshot.resolve_signature != resolve_signature ||
         snapshot.gpu_snapshot_row_valid.size() != snapshot_height ||
         snapshot.gpu_snapshot_valid_row_count != snapshot_y) {
       return false;
@@ -9713,17 +11371,14 @@ bool MetalCommandProcessor::PrepareResolvedDepthSnapshotGpuBand(
   const ResolvedDepthSnapshot& snapshot = resolved_depth_snapshot_;
   if (snapshot_y &&
       (!snapshot.gpu_snapshot || snapshot.base != base || snapshot.pitch != pitch ||
-       snapshot.tiled_extent != tiled_extent ||
-       snapshot.texture_width != snapshot_width ||
+       snapshot.tiled_extent != tiled_extent || snapshot.texture_width != snapshot_width ||
        snapshot.texture_height != snapshot_height || snapshot.format != format ||
-       snapshot.endian != endian ||
-       snapshot.resolve_signature != resolve_signature ||
+       snapshot.endian != endian || snapshot.resolve_signature != resolve_signature ||
        snapshot.gpu_snapshot_row_valid.size() != snapshot_height ||
        snapshot.gpu_snapshot_valid_row_count != snapshot_y)) {
     return false;
   }
-  if (!snapshot.metal_texture ||
-      snapshot.texture_width != snapshot_width ||
+  if (!snapshot.metal_texture || snapshot.texture_width != snapshot_width ||
       snapshot.texture_height != snapshot_height) {
     return false;
   }
@@ -9736,19 +11391,16 @@ bool MetalCommandProcessor::PrepareResolvedDepthSnapshotGpuBand(
 void MetalCommandProcessor::UpdateResolvedDepthSnapshotGpuCache(
     uint32_t base, uint32_t pitch, uint32_t tiled_extent, uint32_t snapshot_width,
     uint32_t snapshot_height, uint32_t snapshot_y, uint32_t write_height,
-    xenos::DepthRenderTargetFormat format, xenos::Endian128 endian,
-    uint64_t resolve_signature, uint64_t expected_invalidation_epoch) {
+    xenos::DepthRenderTargetFormat format, xenos::Endian128 endian, uint64_t resolve_signature,
+    uint64_t expected_invalidation_epoch) {
   std::lock_guard<std::recursive_mutex> lock(resolved_depth_snapshot_mutex_);
   ResolvedDepthSnapshot& snapshot = resolved_depth_snapshot_;
   if (resolved_depth_snapshot_invalidation_epoch_.load(std::memory_order_acquire) !=
           expected_invalidation_epoch ||
-      !snapshot.metal_texture || !memory_ || !base || !pitch || !tiled_extent ||
-      !snapshot_width || !snapshot_height || !write_height ||
-      snapshot_y > snapshot_height ||
-      write_height > snapshot_height - snapshot_y ||
-      snapshot.texture_width != snapshot_width ||
-      snapshot.texture_height != snapshot_height ||
-      base >= SharedMemory::kBufferSize ||
+      !snapshot.metal_texture || !memory_ || !base || !pitch || !tiled_extent || !snapshot_width ||
+      !snapshot_height || !write_height || snapshot_y > snapshot_height ||
+      write_height > snapshot_height - snapshot_y || snapshot.texture_width != snapshot_width ||
+      snapshot.texture_height != snapshot_height || base >= SharedMemory::kBufferSize ||
       tiled_extent > SharedMemory::kBufferSize - base) {
     snapshot.valid = false;
     snapshot.gpu_snapshot = false;
@@ -9759,11 +11411,9 @@ void MetalCommandProcessor::UpdateResolvedDepthSnapshotGpuCache(
 
   bool same_surface =
       snapshot.gpu_snapshot && snapshot.base == base && snapshot.pitch == pitch &&
-      snapshot.tiled_extent == tiled_extent &&
-      snapshot.texture_width == snapshot_width &&
+      snapshot.tiled_extent == tiled_extent && snapshot.texture_width == snapshot_width &&
       snapshot.texture_height == snapshot_height && snapshot.format == format &&
-      snapshot.endian == endian &&
-      snapshot.resolve_signature == resolve_signature &&
+      snapshot.endian == endian && snapshot.resolve_signature == resolve_signature &&
       snapshot.gpu_snapshot_row_valid.size() == snapshot_height;
   if (!same_surface) {
     if (snapshot_y) {
@@ -9784,10 +11434,9 @@ void MetalCommandProcessor::UpdateResolvedDepthSnapshotGpuCache(
     snapshot.gpu_snapshot_row_valid.clear();
     snapshot.gpu_snapshot_valid_row_count = 0;
   }
-  if (!UpdateExactResolvedSurfaceRowCoverage(
-          snapshot.gpu_snapshot_row_valid,
-          snapshot.gpu_snapshot_valid_row_count, snapshot_height, snapshot_y,
-          write_height)) {
+  if (!UpdateExactResolvedSurfaceRowCoverage(snapshot.gpu_snapshot_row_valid,
+                                             snapshot.gpu_snapshot_valid_row_count, snapshot_height,
+                                             snapshot_y, write_height)) {
     snapshot.valid = false;
     snapshot.gpu_snapshot = false;
     snapshot.gpu_snapshot_row_valid.clear();
@@ -9795,18 +11444,16 @@ void MetalCommandProcessor::UpdateResolvedDepthSnapshotGpuCache(
     return;
   }
   bool was_valid = snapshot.valid;
-  snapshot.valid =
-      snapshot.gpu_snapshot_valid_row_count == snapshot_height;
+  snapshot.valid = snapshot.gpu_snapshot_valid_row_count == snapshot_height;
   if (snapshot.valid && !was_valid) {
     static std::atomic<uint32_t> resolved_depth_ready_logs{0};
-    uint32_t ready_index =
-        resolved_depth_ready_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint32_t ready_index = resolved_depth_ready_logs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (ShouldLogMetalDiagnostic(ready_index, 8, 0x3F)) {
       std::fprintf(stderr,
                    "[metal] resolved depth snapshot ready#%u base=0x%08x "
                    "size=%ux%u extent=0x%x\n",
-                   ready_index, snapshot.base, snapshot.texture_width,
-                   snapshot.texture_height, snapshot.tiled_extent);
+                   ready_index, snapshot.base, snapshot.texture_width, snapshot.texture_height,
+                   snapshot.tiled_extent);
       std::fflush(stderr);
     }
   }
@@ -9846,17 +11493,14 @@ bool MetalCommandProcessor::GetResolvedDepthSnapshotTextureForFetch(
   uint32_t fetch_pitch = uint32_t(fetch.pitch) << 5;
   uint32_t required_tiled_extent =
       fetch_pitch && fetch_height
-          ? texture_util::GetTiledAddressUpperBound2D(
-                fetch_pitch, fetch_height, fetch_pitch, 2)
+          ? texture_util::GetTiledAddressUpperBound2D(fetch_pitch, fetch_height, fetch_pitch, 2)
           : 0;
   uint8_t swizzled_signs = texture_util::SwizzleSigns(fetch);
-  if (!base_page || depth_or_array_size_minus_1 || !fetch_width ||
-      !fetch_height || fetch_pitch < fetch_width ||
-      (base_page << 12) != snapshot.base || fetch_pitch != snapshot.pitch ||
-      fetch_width != snapshot.texture_width ||
+  if (!base_page || depth_or_array_size_minus_1 || !fetch_width || !fetch_height ||
+      fetch_pitch < fetch_width || (base_page << 12) != snapshot.base ||
+      fetch_pitch != snapshot.pitch || fetch_width != snapshot.texture_width ||
       fetch_height != snapshot.texture_height ||
-      uint32_t(fetch.endianness) != uint32_t(snapshot.endian) ||
-      !required_tiled_extent ||
+      uint32_t(fetch.endianness) != uint32_t(snapshot.endian) || !required_tiled_extent ||
       required_tiled_extent > snapshot.tiled_extent ||
       texture_util::IsAnySignSigned(swizzled_signs)) {
     return false;
@@ -9868,14 +11512,12 @@ bool MetalCommandProcessor::GetResolvedDepthSnapshotTextureForFetch(
       TextureCache::GuestToHostSwizzle(fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR);
   swizzled_signs_out = swizzled_signs;
   static std::atomic<uint32_t> resolved_depth_match_logs{0};
-  uint32_t match_index =
-      resolved_depth_match_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+  uint32_t match_index = resolved_depth_match_logs.fetch_add(1, std::memory_order_relaxed) + 1;
   if (ShouldLogMetalDiagnostic(match_index, 8, 0x3F)) {
     std::fprintf(stderr,
                  "[metal] matched resolved depth texture#%u base=0x%08x "
                  "size=%ux%u\n",
-                 match_index, snapshot.base, snapshot.texture_width,
-                 snapshot.texture_height);
+                 match_index, snapshot.base, snapshot.texture_width, snapshot.texture_height);
     std::fflush(stderr);
   }
   return true;
@@ -9888,12 +11530,10 @@ void MetalCommandProcessor::InvalidateResolvedDepthSnapshot(uint32_t base_physic
   }
   // Increment before taking the state lock so a write racing publication
   // prevents an incomplete or stale assembly from becoming sampleable.
-  resolved_depth_snapshot_invalidation_epoch_.fetch_add(1,
-                                                        std::memory_order_acq_rel);
+  resolved_depth_snapshot_invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
   std::lock_guard<std::recursive_mutex> lock(resolved_depth_snapshot_mutex_);
   ResolvedDepthSnapshot& snapshot = resolved_depth_snapshot_;
-  if ((!snapshot.valid && !snapshot.gpu_snapshot) ||
-      !snapshot.tiled_extent) {
+  if ((!snapshot.valid && !snapshot.gpu_snapshot) || !snapshot.tiled_extent) {
     return;
   }
   uint64_t write_start = base_physical;
@@ -9917,27 +11557,22 @@ void MetalCommandProcessor::ReleaseResolvedDepthSnapshot() {
   snapshot = {};
 }
 
-GoldenEyePostprocessBand MetalCommandProcessor::GetGoldenEyePostprocessBand()
-    const {
+GoldenEyePostprocessBand MetalCommandProcessor::GetGoldenEyePostprocessBand() const {
   if (!register_file_) {
     return GoldenEyePostprocessBand::kNone;
   }
-  reg::PA_SC_WINDOW_OFFSET window_offset =
-      register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
-  reg::PA_SC_WINDOW_SCISSOR_TL scissor_tl =
-      register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
-  reg::PA_SC_WINDOW_SCISSOR_BR scissor_br =
-      register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
-  return ClassifyGoldenEyePostprocessBand(
-      bin_select_, bin_mask_, window_offset.window_x_offset,
-      window_offset.window_y_offset, scissor_tl.tl_x, scissor_tl.tl_y,
-      scissor_br.br_x, scissor_br.br_y,
-      scissor_tl.window_offset_disable != 0);
+  reg::PA_SC_WINDOW_OFFSET window_offset = register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
+  reg::PA_SC_WINDOW_SCISSOR_TL scissor_tl = register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+  reg::PA_SC_WINDOW_SCISSOR_BR scissor_br = register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+  return ClassifyGoldenEyePostprocessBand(bin_select_, bin_mask_, window_offset.window_x_offset,
+                                          window_offset.window_y_offset, scissor_tl.tl_x,
+                                          scissor_tl.tl_y, scissor_br.br_x, scissor_br.br_y,
+                                          scissor_tl.window_offset_disable != 0);
 }
 
-bool MetalCommandProcessor::EnsureGoldenEyePostprocessTextures(
-    void*& color_texture_out, void*& depth_texture_out,
-    void*& packed_depth_texture_out) {
+bool MetalCommandProcessor::EnsureGoldenEyePostprocessTextures(void*& color_texture_out,
+                                                               void*& depth_texture_out,
+                                                               void*& packed_depth_texture_out) {
   color_texture_out = nullptr;
   depth_texture_out = nullptr;
   packed_depth_texture_out = nullptr;
@@ -9946,10 +11581,8 @@ bool MetalCommandProcessor::EnsureGoldenEyePostprocessTextures(
 
   {
     std::lock_guard<std::recursive_mutex> lock(goldeneye_postprocess_mutex_);
-    const GoldenEyePostprocessTextureSet& existing =
-        goldeneye_postprocess_textures_;
-    if (existing.width == kWidth && existing.height == kHeight &&
-        existing.color_texture &&
+    const GoldenEyePostprocessTextureSet& existing = goldeneye_postprocess_textures_;
+    if (existing.width == kWidth && existing.height == kHeight && existing.color_texture &&
         existing.depth_texture && existing.packed_depth_texture) {
       color_texture_out = existing.color_texture;
       depth_texture_out = existing.depth_texture;
@@ -9960,23 +11593,19 @@ bool MetalCommandProcessor::EnsureGoldenEyePostprocessTextures(
 
   std::string texture_error;
   void* new_color =
-      CreatePipelineProbeSnapshotTexture(metal_device_, kWidth, kHeight,
-                                         &texture_error);
-  void* new_depth =
-      new_color ? CreatePipelineProbeDepthSnapshotTexture(
-                      metal_device_, kWidth, kHeight, &texture_error)
-                : nullptr;
-  void* new_packed_depth =
-      new_depth ? CreatePipelineProbePackedDepthSnapshotTexture(
-                      metal_device_, kWidth, kHeight, &texture_error)
-                : nullptr;
+      CreatePipelineProbeSnapshotTexture(metal_device_, kWidth, kHeight, &texture_error);
+  void* new_depth = new_color ? CreatePipelineProbeDepthSnapshotTexture(metal_device_, kWidth,
+                                                                        kHeight, &texture_error)
+                              : nullptr;
+  void* new_packed_depth = new_depth ? CreatePipelineProbePackedDepthSnapshotTexture(
+                                           metal_device_, kWidth, kHeight, &texture_error)
+                                     : nullptr;
   if (!new_color || !new_depth || !new_packed_depth) {
     ReleasePipelineProbeSnapshotTexture(new_color);
     ReleasePipelineProbeSnapshotTexture(new_depth);
     ReleasePipelineProbeSnapshotTexture(new_packed_depth);
     static std::atomic<uint32_t> allocation_failure_logs{0};
-    uint32_t failure_index =
-        allocation_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint32_t failure_index = allocation_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (ShouldLogMetalDiagnostic(failure_index, 8, 0x3F)) {
       std::fprintf(stderr,
                    "[metal] GoldenEye restore snapshot allocation failed#%u "
@@ -9988,10 +11617,8 @@ bool MetalCommandProcessor::EnsureGoldenEyePostprocessTextures(
   }
 
   std::lock_guard<std::recursive_mutex> lock(goldeneye_postprocess_mutex_);
-  GoldenEyePostprocessTextureSet& texture_set =
-      goldeneye_postprocess_textures_;
-  if (texture_set.width == kWidth && texture_set.height == kHeight &&
-      texture_set.color_texture &&
+  GoldenEyePostprocessTextureSet& texture_set = goldeneye_postprocess_textures_;
+  if (texture_set.width == kWidth && texture_set.height == kHeight && texture_set.color_texture &&
       texture_set.depth_texture && texture_set.packed_depth_texture) {
     ReleasePipelineProbeSnapshotTexture(new_color);
     ReleasePipelineProbeSnapshotTexture(new_depth);
@@ -10020,38 +11647,32 @@ bool MetalCommandProcessor::PublishGoldenEyePostprocessProducer(
     ++gpu_goldeneye_postprocess_snapshot_count_;
   }
   static std::atomic<uint32_t> publication_logs{0};
-  uint32_t publication_index =
-      publication_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+  uint32_t publication_index = publication_logs.fetch_add(1, std::memory_order_relaxed) + 1;
   if (ShouldLogMetalDiagnostic(publication_index, 12, 0xFF)) {
-    std::fprintf(
-        stderr,
-        "[metal] GoldenEye restore snapshot#%u role=%u height=%u "
-        "published=%u generation=%llu complete=%u\n",
-        publication_index, uint32_t(producer.role), uint32_t(producer.height),
-        published ? 1u : 0u,
-        static_cast<unsigned long long>(
-            goldeneye_postprocess_tracker_.generation()),
-        goldeneye_postprocess_tracker_.has_complete_cohort() ? 1u : 0u);
+    std::fprintf(stderr,
+                 "[metal] GoldenEye restore snapshot#%u role=%u height=%u "
+                 "published=%u generation=%llu complete=%u\n",
+                 publication_index, uint32_t(producer.role), uint32_t(producer.height),
+                 published ? 1u : 0u,
+                 static_cast<unsigned long long>(goldeneye_postprocess_tracker_.generation()),
+                 goldeneye_postprocess_tracker_.has_complete_cohort() ? 1u : 0u);
     std::fflush(stderr);
   }
   return published;
 }
 
 bool MetalCommandProcessor::GetGoldenEyePostprocessTextureForFetch(
-    uint64_t pixel_shader_hash, const xenos::xe_gpu_texture_fetch_t& fetch,
-    void*& texture_out,
+    uint64_t pixel_shader_hash, const xenos::xe_gpu_texture_fetch_t& fetch, void*& texture_out,
     uint32_t& width_out, uint32_t& height_out, uint32_t& host_swizzle_out,
     uint8_t& swizzled_signs_out) const {
   texture_out = nullptr;
   width_out = 0;
   height_out = 0;
   host_swizzle_out = xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
-  swizzled_signs_out =
-      uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
+  swizzled_signs_out = uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
 
-  std::array<uint32_t, 6> fetch_words = {
-      fetch.dword_0, fetch.dword_1, fetch.dword_2,
-      fetch.dword_3, fetch.dword_4, fetch.dword_5};
+  std::array<uint32_t, 6> fetch_words = {fetch.dword_0, fetch.dword_1, fetch.dword_2,
+                                         fetch.dword_3, fetch.dword_4, fetch.dword_5};
   GoldenEyePostprocessConsumer consumer =
       ClassifyGoldenEyePostprocessConsumer(pixel_shader_hash, fetch_words);
   if (consumer == GoldenEyePostprocessConsumer::kNone) {
@@ -10061,17 +11682,14 @@ bool MetalCommandProcessor::GetGoldenEyePostprocessTextureForFetch(
   std::lock_guard<std::recursive_mutex> lock(goldeneye_postprocess_mutex_);
   auto log_unavailable = [&](const char* reason) {
     static std::atomic<uint32_t> unavailable_logs{0};
-    uint32_t unavailable_index =
-        unavailable_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint32_t unavailable_index = unavailable_logs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (ShouldLogMetalDiagnostic(unavailable_index, 12, 0xFF)) {
-      std::fprintf(
-          stderr,
-          "[metal] GoldenEye restore unavailable#%u consumer=%u "
-          "generation=%llu reason=%s\n",
-          unavailable_index, uint32_t(consumer),
-          static_cast<unsigned long long>(
-              goldeneye_postprocess_tracker_.generation()),
-          reason);
+      std::fprintf(stderr,
+                   "[metal] GoldenEye restore unavailable#%u consumer=%u "
+                   "generation=%llu reason=%s\n",
+                   unavailable_index, uint32_t(consumer),
+                   static_cast<unsigned long long>(goldeneye_postprocess_tracker_.generation()),
+                   reason);
       std::fflush(stderr);
     }
   };
@@ -10079,10 +11697,8 @@ bool MetalCommandProcessor::GetGoldenEyePostprocessTextureForFetch(
     log_unavailable("producer cohort is incomplete");
     return false;
   }
-  const GoldenEyePostprocessTextureSet& texture_set =
-      goldeneye_postprocess_textures_;
-  if (texture_set.width != 1280 || texture_set.height != 720 ||
-      !texture_set.color_texture ||
+  const GoldenEyePostprocessTextureSet& texture_set = goldeneye_postprocess_textures_;
+  if (texture_set.width != 1280 || texture_set.height != 720 || !texture_set.color_texture ||
       !texture_set.depth_texture || !texture_set.packed_depth_texture) {
     log_unavailable("aggregate textures are unavailable");
     return false;
@@ -10112,44 +11728,37 @@ bool MetalCommandProcessor::GetGoldenEyePostprocessTextureForFetch(
   }
   width_out = texture_set.width;
   height_out = texture_set.height;
-  host_swizzle_out =
-      TextureCache::GuestToHostSwizzle(fetch.swizzle, native_swizzle);
+  host_swizzle_out = TextureCache::GuestToHostSwizzle(fetch.swizzle, native_swizzle);
   swizzled_signs_out = swizzled_signs;
   return true;
 }
 
-void MetalCommandProcessor::InvalidateGoldenEyePostprocessAliases(
-    uint32_t base_physical, uint32_t length) {
+void MetalCommandProcessor::InvalidateGoldenEyePostprocessAliases(uint32_t base_physical,
+                                                                  uint32_t length) {
   if (!length) {
     return;
   }
   uint64_t write_start = base_physical;
   uint64_t write_end = write_start + length;
   std::lock_guard<std::recursive_mutex> lock(goldeneye_postprocess_mutex_);
-  auto contains = [&](uint32_t base) {
-    return write_start <= base && uint64_t(base) < write_end;
-  };
+  auto contains = [&](uint32_t base) { return write_start <= base && uint64_t(base) < write_end; };
   bool invalidates_color = contains(kGoldenEyePostprocessColorBase);
   bool invalidates_depth = contains(kGoldenEyePostprocessDepthBase);
   if (invalidates_color) {
-    goldeneye_postprocess_tracker_.InvalidateBase(
-        kGoldenEyePostprocessColorBase);
+    goldeneye_postprocess_tracker_.InvalidateBase(kGoldenEyePostprocessColorBase);
   }
   if (invalidates_depth) {
-    goldeneye_postprocess_tracker_.InvalidateBase(
-        kGoldenEyePostprocessDepthBase);
+    goldeneye_postprocess_tracker_.InvalidateBase(kGoldenEyePostprocessDepthBase);
   }
   if (invalidates_color || invalidates_depth) {
     static std::atomic<uint32_t> invalidation_logs{0};
-    uint32_t invalidation_index =
-        invalidation_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint32_t invalidation_index = invalidation_logs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (ShouldLogMetalDiagnostic(invalidation_index, 12, 0xFF)) {
-      std::fprintf(
-          stderr,
-          "[metal] GoldenEye restore invalidation#%u range=0x%08x+0x%x "
-          "color=%u depth=%u\n",
-          invalidation_index, base_physical, length,
-          invalidates_color ? 1u : 0u, invalidates_depth ? 1u : 0u);
+      std::fprintf(stderr,
+                   "[metal] GoldenEye restore invalidation#%u range=0x%08x+0x%x "
+                   "color=%u depth=%u\n",
+                   invalidation_index, base_physical, length, invalidates_color ? 1u : 0u,
+                   invalidates_depth ? 1u : 0u);
       std::fflush(stderr);
     }
   }
@@ -10157,12 +11766,9 @@ void MetalCommandProcessor::InvalidateGoldenEyePostprocessAliases(
 
 void MetalCommandProcessor::ReleaseGoldenEyePostprocessTextures() {
   std::lock_guard<std::recursive_mutex> lock(goldeneye_postprocess_mutex_);
-  ReleasePipelineProbeSnapshotTexture(
-      goldeneye_postprocess_textures_.color_texture);
-  ReleasePipelineProbeSnapshotTexture(
-      goldeneye_postprocess_textures_.depth_texture);
-  ReleasePipelineProbeSnapshotTexture(
-      goldeneye_postprocess_textures_.packed_depth_texture);
+  ReleasePipelineProbeSnapshotTexture(goldeneye_postprocess_textures_.color_texture);
+  ReleasePipelineProbeSnapshotTexture(goldeneye_postprocess_textures_.depth_texture);
+  ReleasePipelineProbeSnapshotTexture(goldeneye_postprocess_textures_.packed_depth_texture);
   goldeneye_postprocess_textures_ = {};
   goldeneye_postprocess_tracker_.Reset();
 }
@@ -10222,14 +11828,13 @@ void MetalCommandProcessor::ExactResolvedSurfaceWatchCallback(
   }
   bool expected_goldeneye_postprocess_write = false;
   if (invalidated_by_gpu &&
-      command_processor->goldeneye_postprocess_expected_gpu_write_active_
-          .load(std::memory_order_acquire)) {
+      command_processor->goldeneye_postprocess_expected_gpu_write_active_.load(
+          std::memory_order_acquire)) {
     uint32_t expected_first =
-        command_processor->goldeneye_postprocess_expected_gpu_write_first_
-            .load(std::memory_order_relaxed);
-    uint32_t expected_last =
-        command_processor->goldeneye_postprocess_expected_gpu_write_last_
-            .load(std::memory_order_relaxed);
+        command_processor->goldeneye_postprocess_expected_gpu_write_first_.load(
+            std::memory_order_relaxed);
+    uint32_t expected_last = command_processor->goldeneye_postprocess_expected_gpu_write_last_.load(
+        std::memory_order_relaxed);
     expected_goldeneye_postprocess_write =
         address_first == expected_first && address_last == expected_last;
   }
@@ -10242,8 +11847,8 @@ void MetalCommandProcessor::ExactResolvedSurfaceWatchCallback(
                                                        address_last - address_first + 1);
   }
   if (!expected_goldeneye_postprocess_write) {
-    command_processor->InvalidateGoldenEyePostprocessAliases(
-        address_first, address_last - address_first + 1);
+    command_processor->InvalidateGoldenEyePostprocessAliases(address_first,
+                                                             address_last - address_first + 1);
   }
 }
 
@@ -10252,20 +11857,21 @@ void MetalCommandProcessor::InvalidateExactResolvedSurfaceCache(uint32_t base_ph
   if (!length) {
     return;
   }
-  // Increment before waiting for the state lock. If publication is currently
-  // between submitting its Metal copy and updating row coverage, it will see
-  // this epoch change and refuse to publish stale state.
+  // CPU-backed snapshot publication still uses this epoch because it cannot
+  // arm the Metal publication tracker around the synchronous readback. Record
+  // every write before taking the state lock so an overlapping write cannot
+  // slip between capture and publication. The native GPU path uses the
+  // range-aware token below, so unrelated writes no longer reject it.
   exact_resolved_surface_invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
   std::lock_guard<std::recursive_mutex> lock(exact_resolved_surface_mutex_);
   ExactResolvedSurface& candidate = exact_resolved_surface_;
-  if ((!candidate.valid && !candidate.gpu_snapshot) || !candidate.tiled_extent) {
+  auto invalidation = exact_resolved_surface_publication_tracker_.Invalidate(
+      candidate.valid || candidate.gpu_snapshot, candidate.base, candidate.tiled_extent,
+      base_physical, length);
+  if (!invalidation.any_overlap()) {
     return;
   }
-  uint64_t write_start = base_physical;
-  uint64_t write_end = write_start + length;
-  uint64_t cache_start = candidate.base;
-  uint64_t cache_end = cache_start + candidate.tiled_extent;
-  if (write_start >= cache_end || write_end <= cache_start) {
+  if (!invalidation.current_overlap) {
     return;
   }
   candidate.valid = false;
@@ -10396,6 +12002,122 @@ bool MetalCommandProcessor::EnsureShaderTranslated(MetalShader& shader) {
   return EnsureShaderTranslated(shader, GetDefaultShaderModification(shader));
 }
 
+bool MetalCommandProcessor::EnsureExactOutputMergerShaderTranslator() {
+  if (!exact_output_merger_shader_translator_) {
+    exact_output_merger_shader_translator_ = CreateExactOutputMergerShaderTranslator();
+  }
+  return exact_output_merger_shader_translator_ != nullptr;
+}
+
+uint64_t MetalCommandProcessor::GetExactOutputMergerDefaultShaderModification(MetalShader& shader) {
+  if (!EnsureExactOutputMergerShaderTranslator() || !register_file_) {
+    return 0;
+  }
+  auto sq_program_cntl = register_file_->Get<reg::SQ_PROGRAM_CNTL>();
+  uint32_t dynamic_addressable_register_count = shader.GetDynamicAddressableRegisterCount(
+      shader.type() == xenos::ShaderType::kVertex ? sq_program_cntl.vs_num_reg
+                                                  : sq_program_cntl.ps_num_reg);
+  return shader.type() == xenos::ShaderType::kVertex
+             ? exact_output_merger_shader_translator_->GetDefaultVertexShaderModification(
+                   dynamic_addressable_register_count, current_host_vertex_shader_type_)
+             : exact_output_merger_shader_translator_->GetDefaultPixelShaderModification(
+                   dynamic_addressable_register_count);
+}
+
+bool MetalCommandProcessor::EnsureExactOutputMergerShaderTranslated(MetalShader& shader,
+                                                                    uint64_t modification) {
+  if (!EnsureExactOutputMergerShaderTranslator()) {
+    return false;
+  }
+  if (!shader.is_ucode_analyzed()) {
+    shader.AnalyzeUcode(ucode_disasm_buffer_);
+  }
+
+  bool is_new_translation = false;
+  MetalShader::MetalTranslation* translation =
+      shader.GetOrCreateExactOutputMergerTranslation(modification, &is_new_translation);
+  if (!translation) {
+    return false;
+  }
+  if (!is_new_translation) {
+    return translation->is_valid();
+  }
+
+  if (!exact_output_merger_shader_translator_->TranslateAnalyzedShader(*translation)) {
+    ++failed_shader_translation_count_;
+    std::fprintf(stderr,
+                 "[metal] exact SPIR-V translation failed shader=%016llx "
+                 "modification=%016llx host_vs_type=%u errors=%zu\n",
+                 static_cast<unsigned long long>(shader.ucode_data_hash()),
+                 static_cast<unsigned long long>(modification),
+                 shader.type() == xenos::ShaderType::kVertex
+                     ? uint32_t(current_host_vertex_shader_type_)
+                     : 0u,
+                 translation->errors().size());
+    for (const Shader::Error& error : translation->errors()) {
+      std::fprintf(stderr, "[metal]   exact shader error fatal=%u: %s\n", error.is_fatal ? 1u : 0u,
+                   error.message.c_str());
+    }
+    std::fflush(stderr);
+    return false;
+  }
+
+  ++translated_shader_count_;
+  if (!translation->TranslateMslFromSpirv()) {
+    ++failed_shader_translation_count_;
+    std::fprintf(stderr,
+                 "[metal] exact MSL translation failed shader=%016llx "
+                 "modification=%016llx host_vs_type=%u\n",
+                 static_cast<unsigned long long>(shader.ucode_data_hash()),
+                 static_cast<unsigned long long>(modification),
+                 shader.type() == xenos::ShaderType::kVertex
+                     ? uint32_t(current_host_vertex_shader_type_)
+                     : 0u);
+    std::fflush(stderr);
+    return false;
+  }
+  translation->set_host_disassembly(translation->msl_source());
+  if (metal_device_) {
+    std::string metal_compile_error;
+    const uint64_t compile_start_ns = profiling::NowNs();
+    const bool compile_succeeded =
+        translation->CompileMslLibrary(metal_device_, &metal_compile_error);
+    const uint64_t compile_duration_ns = profiling::ElapsedNs(compile_start_ns);
+    ++msl_library_compile_count_;
+    msl_library_compile_ns_ += compile_duration_ns;
+    msl_library_compile_max_ns_ = std::max(msl_library_compile_max_ns_, compile_duration_ns);
+    msl_library_compile_failure_count_ += compile_succeeded ? 0 : 1;
+    rex::perf::RecordMetalShaderCompile(compile_duration_ns, compile_succeeded);
+    if (!compile_succeeded) {
+      ++failed_shader_translation_count_;
+      DumpFailedMslSource(*translation);
+      std::fprintf(stderr,
+                   "[metal] exact MSL compile failed shader=%016llx "
+                   "modification=%016llx host_vs_type=%u: %s\n",
+                   static_cast<unsigned long long>(shader.ucode_data_hash()),
+                   static_cast<unsigned long long>(modification),
+                   shader.type() == xenos::ShaderType::kVertex
+                       ? uint32_t(current_host_vertex_shader_type_)
+                       : 0u,
+                   metal_compile_error.c_str());
+      std::fflush(stderr);
+      return false;
+    }
+  }
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    translation->Dump(REXCVAR_GET(dump_shaders), "metal_exact_spirv");
+  }
+  return translation->is_valid();
+}
+
+MetalShader::MetalTranslation* MetalCommandProcessor::GetExactOutputMergerTranslatedShader(
+    MetalShader& shader, uint64_t modification) {
+  if (!EnsureExactOutputMergerShaderTranslated(shader, modification)) {
+    return nullptr;
+  }
+  return shader.GetExactOutputMergerTranslation(modification);
+}
+
 uint64_t MetalCommandProcessor::GetDefaultShaderModification(MetalShader& shader) const {
   auto sq_program_cntl = register_file_->Get<reg::SQ_PROGRAM_CNTL>();
   uint32_t dynamic_addressable_register_count = shader.GetDynamicAddressableRegisterCount(
@@ -10488,6 +12210,83 @@ void MetalCommandProcessor::GetCurrentShaderModifications(MetalShader* vertex_sh
   }
 }
 
+void MetalCommandProcessor::GetCurrentExactOutputMergerShaderModifications(
+    MetalShader* vertex_shader, MetalShader* pixel_shader, uint64_t& vertex_modification,
+    uint64_t& pixel_modification, uint32_t* interpolator_mask_out, uint32_t* ps_param_gen_pos_out) {
+  vertex_modification = 0;
+  pixel_modification = 0;
+  if (!register_file_ || !EnsureExactOutputMergerShaderTranslator()) {
+    if (interpolator_mask_out) {
+      *interpolator_mask_out = 0;
+    }
+    if (ps_param_gen_pos_out) {
+      *ps_param_gen_pos_out = UINT32_MAX;
+    }
+    return;
+  }
+  uint32_t ps_param_gen_pos = UINT32_MAX;
+  uint32_t interpolator_mask = 0;
+  if (pixel_shader) {
+    uint32_t pixel_input_mask = pixel_shader->GetInterpolatorInputMask(
+        register_file_->Get<reg::SQ_PROGRAM_CNTL>(), register_file_->Get<reg::SQ_CONTEXT_MISC>(),
+        ps_param_gen_pos);
+    interpolator_mask = vertex_shader ? (vertex_shader->writes_interpolators() & pixel_input_mask)
+                                      : pixel_input_mask;
+  }
+
+  if (vertex_shader) {
+    SpirvShaderTranslator::Modification modification(
+        GetExactOutputMergerDefaultShaderModification(*vertex_shader));
+    modification.vertex.interpolator_mask = interpolator_mask;
+    if (current_host_vertex_shader_type_ ==
+        Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
+      modification.vertex.output_point_parameters = uint32_t(ps_param_gen_pos != UINT32_MAX);
+    } else {
+      modification.vertex.output_point_parameters =
+          uint32_t((vertex_shader->writes_point_size_edge_flag_kill_vertex() & 0b001) &&
+                   register_file_->Get<reg::VGT_DRAW_INITIATOR>().prim_type ==
+                       xenos::PrimitiveType::kPointList);
+    }
+    modification.vertex.point_ps_ucp_mode = register_file_->Get<reg::PA_CL_CLIP_CNTL>().ps_ucp_mode;
+    vertex_modification = modification.value;
+  }
+
+  if (pixel_shader) {
+    SpirvShaderTranslator::Modification modification(
+        GetExactOutputMergerDefaultShaderModification(*pixel_shader));
+    modification.pixel.interpolator_mask = interpolator_mask;
+    modification.pixel.interpolators_centroid =
+        interpolator_mask & ~xenos::GetInterpolatorSamplingPattern(
+                                register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples,
+                                register_file_->Get<reg::SQ_CONTEXT_MISC>().sc_sample_cntl,
+                                register_file_->Get<reg::SQ_INTERPOLATOR_CNTL>().sampling_pattern);
+    if (ps_param_gen_pos < xenos::kMaxInterpolators) {
+      modification.pixel.param_gen_enable = 1;
+      modification.pixel.param_gen_interpolator = ps_param_gen_pos;
+      modification.pixel.param_gen_point =
+          uint32_t(register_file_->Get<reg::VGT_DRAW_INITIATOR>().prim_type ==
+                   xenos::PrimitiveType::kPointList);
+    } else {
+      modification.pixel.param_gen_enable = 0;
+      modification.pixel.param_gen_interpolator = 0;
+      modification.pixel.param_gen_point = 0;
+    }
+    // The exact fragment shader performs D24S8/D24FS8 conversion and testing
+    // itself. Native attachment float24 modifiers would apply the operation a
+    // second time and must never participate in this cache key.
+    modification.pixel.depth_stencil_mode =
+        SpirvShaderTranslator::Modification::DepthStencilMode::kNoModifiers;
+    pixel_modification = modification.value;
+  }
+
+  if (interpolator_mask_out) {
+    *interpolator_mask_out = interpolator_mask;
+  }
+  if (ps_param_gen_pos_out) {
+    *ps_param_gen_pos_out = ps_param_gen_pos;
+  }
+}
+
 MetalShader::MetalTranslation* MetalCommandProcessor::GetTranslatedShader(MetalShader& shader,
                                                                           uint64_t modification) {
   if (!EnsureShaderTranslated(shader, modification)) {
@@ -10515,16 +12314,23 @@ void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
           ? register_file_->values[reg::RB_BLENDCONTROL::rt_register_indices[rt_index]] & 0x1FFF1FFF
           : 0x00010001;
   uint32_t sample_count = 1;
+  xenos::ColorRenderTargetFormat color_format = xenos::ColorRenderTargetFormat::k_8_8_8_8;
   if (register_file_) {
     sample_count = GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
+    color_format =
+        register_file_->Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[rt_index])
+            .color_format;
   }
-  uint64_t pipeline_key_parts[6] = {
-      vertex_shader.ucode_data_hash(),
-      pixel_shader.ucode_data_hash(),
-      vertex_modification,
-      pixel_modification,
-      uint64_t(rt_index) | (uint64_t(sample_count) << 32),
-      uint64_t(color_write_mask & 0xF) | (uint64_t(blend_control) << 32)};
+  ProbeColorTargetState color_target_state;
+  color_target_state.write_mask = uint8_t(color_write_mask & 0xF);
+  color_target_state.blend_control = blend_control;
+  color_target_state.color_format = color_format;
+  color_target_state.metal_storage = GetColorTargetStorageStrategy(color_format).kind;
+  ProbeRenderPipelineDescription pipeline_description =
+      MakeSingleProbeRenderPipelineDescription(color_target_state, rt_index);
+  uint64_t pipeline_key_parts[5] = {
+      vertex_shader.ucode_data_hash(), pixel_shader.ucode_data_hash(), vertex_modification,
+      pixel_modification, GetProbeRenderPipelineDescriptionKey(pipeline_description, sample_count)};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   auto existing_pipeline = render_pipeline_states_.find(pipeline_key);
   if (existing_pipeline != render_pipeline_states_.end()) {
@@ -10540,12 +12346,9 @@ void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
   }
 
   std::string pipeline_error;
-  ProbeColorTargetState color_target_state;
-  color_target_state.write_mask = uint8_t(color_write_mask & 0xF);
-  color_target_state.blend_control = blend_control;
   void* pipeline_state = CreateCachedRenderPipelineState(
       vertex_translation->metal_library(), pixel_translation->metal_library(), &pipeline_error,
-      &color_target_state, sample_count);
+      &pipeline_description, sample_count);
   render_pipeline_states_.emplace(pipeline_key, pipeline_state);
 
   static std::atomic<uint32_t> pipeline_logs{0};
@@ -10571,6 +12374,75 @@ void* MetalCommandProcessor::EnsureRenderPipeline(MetalShader& vertex_shader,
         static_cast<unsigned long long>(pixel_shader.ucode_data_hash()), rt_index,
         color_target_state.write_mask, color_target_state.blend_control, pipeline_error.c_str());
     std::fflush(stderr);
+  }
+  return pipeline_state;
+}
+
+void* MetalCommandProcessor::EnsureMrtRenderPipeline(
+    MetalShader& vertex_shader, MetalShader& pixel_shader,
+    const ProbeRenderPipelineDescription& pipeline_description, uint32_t sample_count) {
+  const uint32_t valid_output_mask = (uint32_t(1) << xenos::kMaxColorRenderTargets) - 1;
+  if (!pipeline_description.output_mask ||
+      (pipeline_description.output_mask & ~valid_output_mask) ||
+      (sample_count != 1 && sample_count != 2 && sample_count != 4)) {
+    return nullptr;
+  }
+
+  uint64_t vertex_modification = 0;
+  uint64_t pixel_modification = 0;
+  GetCurrentShaderModifications(&vertex_shader, &pixel_shader, vertex_modification,
+                                pixel_modification);
+  uint64_t pipeline_key_parts[5] = {
+      vertex_shader.ucode_data_hash(), pixel_shader.ucode_data_hash(), vertex_modification,
+      pixel_modification, GetProbeRenderPipelineDescriptionKey(pipeline_description, sample_count)};
+  uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
+  auto existing_pipeline = render_pipeline_states_.find(pipeline_key);
+  if (existing_pipeline != render_pipeline_states_.end()) {
+    return existing_pipeline->second;
+  }
+
+  auto* vertex_translation = GetTranslatedShader(vertex_shader, vertex_modification);
+  auto* pixel_translation = GetTranslatedShader(pixel_shader, pixel_modification);
+  if (!vertex_translation || !pixel_translation || !vertex_translation->metal_library() ||
+      !pixel_translation->metal_library()) {
+    render_pipeline_states_.emplace(pipeline_key, nullptr);
+    return nullptr;
+  }
+
+  std::string pipeline_error;
+  void* pipeline_state = CreateCachedRenderPipelineState(
+      vertex_translation->metal_library(), pixel_translation->metal_library(), &pipeline_error,
+      &pipeline_description, sample_count);
+  render_pipeline_states_.emplace(pipeline_key, pipeline_state);
+
+  static std::atomic<uint32_t> mrt_pipeline_logs{0};
+  uint32_t pipeline_log_index = mrt_pipeline_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (pipeline_state) {
+    if (pipeline_log_index <= 16 || (pipeline_log_index & 0x3F) == 0) {
+      std::fprintf(stderr,
+                   "[metal] production MRT pipeline ready#%u vs=%016llx ps=%016llx "
+                   "outputs=0x%x samples=%u key=%016llx\n",
+                   pipeline_log_index,
+                   static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
+                   static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
+                   pipeline_description.output_mask, sample_count,
+                   static_cast<unsigned long long>(pipeline_key));
+      std::fflush(stderr);
+    }
+  } else {
+    // Pipeline construction failure is a release-fatal correctness marker.
+    // IssueDraw never replays or retries the translated shader after this.
+    std::fprintf(stderr,
+                 "[metal] production MRT pipeline failed#%u vs=%016llx ps=%016llx "
+                 "outputs=0x%x samples=%u key=%016llx: %s\n",
+                 pipeline_log_index,
+                 static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
+                 static_cast<unsigned long long>(pixel_shader.ucode_data_hash()),
+                 pipeline_description.output_mask, sample_count,
+                 static_cast<unsigned long long>(pipeline_key), pipeline_error.c_str());
+    std::fflush(stderr);
+    REXGPU_ERROR("Metal production MRT pipeline creation failed for output mask 0x{:X}",
+                 pipeline_description.output_mask);
   }
   return pipeline_state;
 }
@@ -11408,9 +13280,8 @@ bool MetalCommandProcessor::RenderHostPixelShader(MetalShader& pixel_shader,
     if (rendered_to_context) {
       MarkCanonicalWritesForContext(persistent_host_context, UINT32_MAX, nullptr);
     }
-    rendered =
-        rendered_to_context &&
-        ReadPipelineProbeContext(persistent_host_context, width, height, bgra_out, &render_error);
+    rendered = rendered_to_context && ReadPipelineProbeContext(persistent_host_context, width,
+                                                               height, bgra_out, &render_error);
   } else {
     const uint8_t* initial_bgra = nullptr;
     size_t initial_bgra_row_pitch = 0;
@@ -11772,22 +13643,32 @@ void* MetalCommandProcessor::EnsureDepthOnlyPipeline(MetalShader& vertex_shader,
 
   uint32_t sample_count =
       GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
+  xenos::ColorRenderTargetFormat color_format =
+      register_file_->Get<reg::RB_COLOR_INFO>().color_format;
+  ProbeColorTargetState color_state;
+  color_state.write_mask = 0;
+  color_state.color_format = color_format;
+  color_state.metal_storage = GetColorTargetStorageStrategy(color_format).kind;
+  ProbeRenderPipelineDescription pipeline_description =
+      MakeSingleProbeRenderPipelineDescription(color_state);
   constexpr uint64_t kDepthOnlyPipelineTag = UINT64_C(0x445054484F4E4C59);
-  uint64_t pipeline_key_parts[5] = {kDepthOnlyPipelineTag, vertex_shader.ucode_data_hash(),
-                                    vertex_modification, sample_count,
-                                    uint64_t(depth_stencil_mode)};
+  uint64_t pipeline_key_parts[6] = {
+      kDepthOnlyPipelineTag,
+      vertex_shader.ucode_data_hash(),
+      vertex_modification,
+      sample_count,
+      uint64_t(depth_stencil_mode),
+      GetProbeRenderPipelineDescriptionKey(pipeline_description, sample_count)};
   uint64_t pipeline_key = XXH3_64bits(pipeline_key_parts, sizeof(pipeline_key_parts));
   auto existing = solid_color_pipeline_states_.find(pipeline_key);
   if (existing != solid_color_pipeline_states_.end()) {
     return existing->second;
   }
 
-  ProbeColorTargetState color_state;
-  color_state.write_mask = 0;
   std::string pipeline_error;
   void* pipeline_state =
       CreateCachedRenderPipelineState(vertex_translation->metal_library(), fragment_library,
-                                      &pipeline_error, &color_state, sample_count);
+                                      &pipeline_error, &pipeline_description, sample_count);
   solid_color_pipeline_states_.emplace(pipeline_key, pipeline_state);
   if (!pipeline_state) {
     REXLOG_WARN("Metal depth-only pipeline failed for vertex shader {:016X}: {}",
@@ -12116,7 +13997,11 @@ bool MetalCommandProcessor::EnsureVertexFetchRangesResident(const MetalShader& v
 bool MetalCommandProcessor::TryRenderPipelineProbe(
     MetalShader& vertex_shader, MetalShader* pixel_shader, void* pipeline_state,
     xenos::PrimitiveType prim_type, uint32_t index_count, bool host_render_target_debug,
-    const PrimitiveProcessor::ProcessingResult* primitive_processing_result) {
+    const PrimitiveProcessor::ProcessingResult* primitive_processing_result,
+    uint32_t color_attachment_index,
+    const std::array<void*, xenos::kMaxColorRenderTargets>* mrt_contexts,
+    const ProbeRenderPipelineDescription* mrt_pipeline_description,
+    PipelineProbeMrtTelemetry* mrt_telemetry_out) {
   // Detailed draw timing is sampled because this route may run well over a
   // thousand times per frame. The outer sample includes all CPU preparation;
   // the nested sample isolates the primary Metal resource/binding/draw call.
@@ -12125,24 +14010,60 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
   profiling::ScopedCommandEvent draw_probe_profile(profile_draw_sample ? &profile_window_ : nullptr,
                                                    profiling::CommandEvent::kDrawProbeSample);
   last_host_render_target_probe_read_ = false;
+  if (mrt_telemetry_out) {
+    *mrt_telemetry_out = {};
+  }
+  bool mrt_submission = mrt_contexts || mrt_pipeline_description;
+  if ((mrt_contexts == nullptr) != (mrt_pipeline_description == nullptr) ||
+      (mrt_submission && !host_render_target_debug)) {
+    return false;
+  }
   if (!pipeline_state || !metal_device_ || !memory_) {
     return false;
   }
   if (!register_file_) {
     return false;
   }
-  void* persistent_context =
-      host_render_target_debug ? GetActiveHostRenderTargetContext() : pipeline_probe_context_;
-  const char* persistent_label =
-      host_render_target_debug ? "host render target debug" : "persistent pipeline probe";
+  void* persistent_context = nullptr;
+  if (mrt_submission) {
+    uint32_t output_mask = mrt_pipeline_description->output_mask;
+    for (uint32_t slot = 0; slot < xenos::kMaxColorRenderTargets; ++slot) {
+      if (output_mask & (uint32_t(1) << slot)) {
+        persistent_context = (*mrt_contexts)[slot];
+        break;
+      }
+    }
+  } else {
+    persistent_context =
+        host_render_target_debug ? GetActiveHostRenderTargetContext() : pipeline_probe_context_;
+  }
+  const char* persistent_label = mrt_submission             ? "production MRT"
+                                 : host_render_target_debug ? "host render target debug"
+                                                            : "persistent pipeline probe";
   if (!persistent_context) {
     return false;
   }
   uint32_t probe_sample_count =
       GetMetalSampleCount(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
   std::string sample_count_error;
-  if (!SetPipelineProbeContextSampleCount(persistent_context, probe_sample_count,
-                                          &sample_count_error)) {
+  bool sample_count_ok = true;
+  if (mrt_submission) {
+    for (uint32_t slot = 0; slot < xenos::kMaxColorRenderTargets; ++slot) {
+      if (!(mrt_pipeline_description->output_mask & (uint32_t(1) << slot))) {
+        continue;
+      }
+      void* context = (*mrt_contexts)[slot];
+      if (!context ||
+          !SetPipelineProbeContextSampleCount(context, probe_sample_count, &sample_count_error)) {
+        sample_count_ok = false;
+        break;
+      }
+    }
+  } else {
+    sample_count_ok = SetPipelineProbeContextSampleCount(persistent_context, probe_sample_count,
+                                                         &sample_count_error);
+  }
+  if (!sample_count_ok) {
     static std::atomic<uint32_t> sample_count_failure_logs{0};
     uint32_t failure_index = sample_count_failure_logs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (failure_index <= 8 || (failure_index & 0x3F) == 0) {
@@ -12153,7 +14074,7 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
     return false;
   }
   constexpr uint32_t kMaxPersistentProbeDrawsPerSwap = 256;
-  if (!host_render_target_debug &&
+  if (!mrt_submission && !host_render_target_debug &&
       pipeline_probe_draws_this_swap_ >= kMaxPersistentProbeDrawsPerSwap) {
     ++pipeline_probe_skipped_this_swap_;
     if (pipeline_probe_skipped_this_swap_ == 1 || (pipeline_probe_skipped_this_swap_ & 0xFF) == 0) {
@@ -12246,31 +14167,20 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
   uint32_t exact_resolved_texture_mask = 0;
   uint32_t resolved_depth_texture_mask = 0;
   uint32_t goldeneye_postprocess_texture_mask = 0;
-  GoldenEyePostprocessBand goldeneye_postprocess_band =
-      GetGoldenEyePostprocessBand();
-  auto classify_goldeneye_fetch = [&](uint32_t fetch_index) {
-    xenos::xe_gpu_texture_fetch_t fetch =
-        register_file_->GetTextureFetch(fetch_index);
-    std::array<uint32_t, 6> words = {
-        fetch.dword_0, fetch.dword_1, fetch.dword_2,
-        fetch.dword_3, fetch.dword_4, fetch.dword_5};
-    return ClassifyGoldenEyePostprocessConsumer(pixel_shader_hash, words);
-  };
+  GoldenEyePostprocessBand goldeneye_postprocess_band = GetGoldenEyePostprocessBand();
+  std::array<std::array<uint32_t, 6>, 3> goldeneye_postprocess_fetches = {};
+  for (uint32_t fetch_index = 0; fetch_index < goldeneye_postprocess_fetches.size();
+       ++fetch_index) {
+    const xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(fetch_index);
+    goldeneye_postprocess_fetches[fetch_index] = {
+        fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5,
+    };
+  }
   bool goldeneye_postprocess_draw =
       pixel_shader &&
-      pixel_shader_hash == kGoldenEyePostprocessPixelShaderHash &&
-      vertex_shader.ucode_data_hash() ==
-          kGoldenEyePostprocessVertexShaderHash &&
-      prim_type == xenos::PrimitiveType::kTriangleList && index_count == 6 &&
-      goldeneye_postprocess_band != GoldenEyePostprocessBand::kNone &&
-      IsGoldenEyePostprocessConsumerTileMask(goldeneye_postprocess_band,
-                                             bin_mask_) &&
-      classify_goldeneye_fetch(0) ==
-          GoldenEyePostprocessConsumer::kColorRgba &&
-      classify_goldeneye_fetch(1) ==
-          GoldenEyePostprocessConsumer::kDepth24Stencil8 &&
-      classify_goldeneye_fetch(2) ==
-          GoldenEyePostprocessConsumer::kDepthRgba;
+      IsGoldenEyePostprocessConsumerDraw(vertex_shader.ucode_data_hash(), pixel_shader_hash,
+                                         prim_type, index_count, goldeneye_postprocess_band,
+                                         bin_mask_, goldeneye_postprocess_fetches);
   if (texture_cache_) {
     uint32_t used_texture_mask =
         vertex_shader.GetUsedTextureMaskAfterTranslation() |
@@ -12298,7 +14208,6 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
       while (rex::bit_scan_forward(textures_to_check, &texture_index)) {
         textures_to_check &= ~(UINT32_C(1) << texture_index);
         xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(texture_index);
-        RememberCompatibleExactResolvedSurfaceFetch(fetch);
         bool exact_color =
             GetExactResolvedSurfaceTextureForFetch(fetch, exact_resolved_textures[texture_index],
                                                    exact_resolved_texture_widths[texture_index],
@@ -12313,21 +14222,19 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
                                                exact_resolved_texture_signs[texture_index]);
         bool goldeneye_postprocess =
             !exact_color && !exact_depth && goldeneye_postprocess_draw &&
-            GetGoldenEyePostprocessTextureForFetch(
-                pixel_shader_hash, fetch,
-                exact_resolved_textures[texture_index],
-                exact_resolved_texture_widths[texture_index],
-                exact_resolved_texture_heights[texture_index],
-                exact_resolved_texture_swizzles[texture_index],
-                exact_resolved_texture_signs[texture_index]);
+            GetGoldenEyePostprocessTextureForFetch(pixel_shader_hash, fetch,
+                                                   exact_resolved_textures[texture_index],
+                                                   exact_resolved_texture_widths[texture_index],
+                                                   exact_resolved_texture_heights[texture_index],
+                                                   exact_resolved_texture_swizzles[texture_index],
+                                                   exact_resolved_texture_signs[texture_index]);
         if (exact_color || exact_depth || goldeneye_postprocess) {
           exact_resolved_texture_mask |= UINT32_C(1) << texture_index;
           if (exact_depth) {
             resolved_depth_texture_mask |= UINT32_C(1) << texture_index;
           }
           if (goldeneye_postprocess) {
-            goldeneye_postprocess_texture_mask |=
-                UINT32_C(1) << texture_index;
+            goldeneye_postprocess_texture_mask |= UINT32_C(1) << texture_index;
           }
           ++exact_binding_count;
         }
@@ -12354,18 +14261,14 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
         xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(texture_index);
         bool depth_snapshot = (resolved_depth_texture_mask & (UINT32_C(1) << texture_index)) != 0;
         bool goldeneye_postprocess =
-            (goldeneye_postprocess_texture_mask &
-             (UINT32_C(1) << texture_index)) != 0;
-        bool still_valid =
-            goldeneye_postprocess
-                ? GetGoldenEyePostprocessTextureForFetch(
-                      pixel_shader_hash, fetch,
-                      texture, width, height, swizzle, signs)
-                : depth_snapshot
-                      ? GetResolvedDepthSnapshotTextureForFetch(
-                            fetch, texture, width, height, swizzle, signs)
-                      : GetExactResolvedSurfaceTextureForFetch(
-                            fetch, texture, width, height, swizzle, signs);
+            (goldeneye_postprocess_texture_mask & (UINT32_C(1) << texture_index)) != 0;
+        bool still_valid = goldeneye_postprocess ? GetGoldenEyePostprocessTextureForFetch(
+                                                       pixel_shader_hash, fetch, texture, width,
+                                                       height, swizzle, signs)
+                           : depth_snapshot ? GetResolvedDepthSnapshotTextureForFetch(
+                                                  fetch, texture, width, height, swizzle, signs)
+                                            : GetExactResolvedSurfaceTextureForFetch(
+                                                  fetch, texture, width, height, swizzle, signs);
         if (!still_valid || texture != exact_resolved_textures[texture_index] ||
             width != exact_resolved_texture_widths[texture_index] ||
             height != exact_resolved_texture_heights[texture_index] ||
@@ -12390,19 +14293,15 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
             uint32_t(std::popcount(goldeneye_postprocess_texture_mask));
         if (goldeneye_postprocess_texture_mask) {
           static std::atomic<uint32_t> goldeneye_restore_binding_logs{0};
-          uint32_t binding_index = goldeneye_restore_binding_logs.fetch_add(
-                                       1, std::memory_order_relaxed) +
-                                   1;
+          uint32_t binding_index =
+              goldeneye_restore_binding_logs.fetch_add(1, std::memory_order_relaxed) + 1;
           if (ShouldLogMetalDiagnostic(binding_index, 12, 0xFF)) {
-            std::fprintf(
-                stderr,
-                "[metal] GoldenEye restore binding#%u draw=%u band=%u "
-                "mask=0x%08x textures=%u size=1280x720\n",
-                binding_index, draw_count_,
-                uint32_t(goldeneye_postprocess_band),
-                goldeneye_postprocess_texture_mask,
-                uint32_t(std::popcount(
-                    goldeneye_postprocess_texture_mask)));
+            std::fprintf(stderr,
+                         "[metal] GoldenEye restore binding#%u draw=%u band=%u "
+                         "mask=0x%08x textures=%u size=1280x720\n",
+                         binding_index, draw_count_, uint32_t(goldeneye_postprocess_band),
+                         goldeneye_postprocess_texture_mask,
+                         uint32_t(std::popcount(goldeneye_postprocess_texture_mask)));
             std::fflush(stderr);
           }
         }
@@ -12479,20 +14378,16 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
         uint32_t exact_resolved_texture_index =
             exact_resolved_texture_logs.fetch_add(1, std::memory_order_relaxed) + 1;
         if (ShouldLogMetalDiagnostic(exact_resolved_texture_index, 8, 0x3F)) {
-          std::fprintf(
-              stderr,
-              "[metal] direct resolved %s texture#%u %s shader=%016llx binding=%zu "
-              "fetch=%u signed_slot=%u size=%ux%u\n",
-              (goldeneye_postprocess_texture_mask &
-               (UINT32_C(1) << fetch_constant))
-                  ? "GoldenEye restore"
-                  : (resolved_depth_texture_mask &
-                     (UINT32_C(1) << fetch_constant))
-                        ? "depth"
-                        : "color",
-              exact_resolved_texture_index, stage,
-              static_cast<unsigned long long>(shader.ucode_data_hash()), i, fetch_constant,
-              binding_is_signed ? 1u : 0u, slots[i].width, slots[i].height);
+          std::fprintf(stderr,
+                       "[metal] direct resolved %s texture#%u %s shader=%016llx binding=%zu "
+                       "fetch=%u signed_slot=%u size=%ux%u\n",
+                       (goldeneye_postprocess_texture_mask & (UINT32_C(1) << fetch_constant))
+                           ? "GoldenEye restore"
+                       : (resolved_depth_texture_mask & (UINT32_C(1) << fetch_constant)) ? "depth"
+                                                                                         : "color",
+                       exact_resolved_texture_index, stage,
+                       static_cast<unsigned long long>(shader.ucode_data_hash()), i, fetch_constant,
+                       binding_is_signed ? 1u : 0u, slots[i].width, slots[i].height);
           std::fflush(stderr);
         }
         continue;
@@ -12903,15 +14798,26 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
     bool persistent_probe_ok =
         (!vertex_writes_shared_memory || vertex_buffer_bindings.shared_memory != UINT32_MAX) &&
         (!pixel_writes_shared_memory || fragment_shared_memory_buffer_index != UINT32_MAX);
-    if (persistent_probe_ok && host_render_target_debug &&
-        !PrepareCanonicalContextForUse(persistent_context, probe_width, probe_height,
-                                       &persistent_probe_error)) {
-      persistent_probe_ok = false;
+    if (persistent_probe_ok && host_render_target_debug) {
+      if (mrt_submission) {
+        for (uint32_t slot = 0; slot < xenos::kMaxColorRenderTargets; ++slot) {
+          if (!(mrt_pipeline_description->output_mask & (uint32_t(1) << slot))) {
+            continue;
+          }
+          if (!PrepareCanonicalContextForUse((*mrt_contexts)[slot], probe_width, probe_height,
+                                             &persistent_probe_error)) {
+            persistent_probe_ok = false;
+            break;
+          }
+        }
+      } else if (!PrepareCanonicalContextForUse(persistent_context, probe_width, probe_height,
+                                                &persistent_probe_error)) {
+        persistent_probe_ok = false;
+      }
     }
     if (!persistent_probe_ok) {
       if (persistent_probe_error.empty()) {
-        persistent_probe_error =
-            "shader writes shared memory but has no reflected stage binding";
+        persistent_probe_error = "shader writes shared memory but has no reflected stage binding";
       }
     }
     if (persistent_writes_shared_memory && persistent_probe_ok &&
@@ -12923,26 +14829,74 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
       profiling::ScopedCommandEvent draw_render_profile(
           profile_draw_sample ? &profile_window_ : nullptr,
           profiling::CommandEvent::kDrawRenderSample);
-      persistent_probe_ok = RenderPipelineProbeToContext(
-          persistent_context, pipeline_state, &probe_system_constants,
-          sizeof(probe_system_constants), vertex_float_constants_data, vertex_float_constants_size,
-          fetch_constants_.data(), fetch_constants_.size() * sizeof(uint32_t),
-          memory_->physical_membase(), size_t(0x20000000), resident_shared_memory_buffer,
-          vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data(),
-          vertex_texture_slots.size(), vertex_shader.GetSamplerBindingsAfterTranslation().size(),
-          fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
-          fragment_texture_slots.size(), fragment_sampler_count, probe_primitive_type,
-          probe_vertex_count, probe_width, probe_height, &persistent_probe_error,
-          vertex_buffer_bindings.shared_memory, vertex_buffer_bindings.float_constants,
-          vertex_buffer_bindings.fetch_constants, fragment_float_constants_data,
-          fragment_float_constants_size, fragment_float_constants_buffer_index,
-          fragment_fetch_constants_buffer_index,
-          vertex_sampler_slots.empty() ? nullptr : vertex_sampler_slots.data(),
-          fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
-          UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
-          vertex_buffer_bindings.bool_loop_constants, fragment_bool_loop_constants_buffer_index,
-          probe_index_buffer_ptr, &probe_rasterization_state, probe_depth_stencil_state_ptr,
-          fragment_shared_memory_buffer_index);
+      if (mrt_submission) {
+        PipelineProbeMrtDraw mrt_draw;
+        mrt_draw.system_constants = &probe_system_constants;
+        mrt_draw.system_constants_size = sizeof(probe_system_constants);
+        mrt_draw.vertex_float_constants = vertex_float_constants_data;
+        mrt_draw.vertex_float_constants_size = vertex_float_constants_size;
+        mrt_draw.fragment_float_constants = fragment_float_constants_data;
+        mrt_draw.fragment_float_constants_size = fragment_float_constants_size;
+        mrt_draw.fetch_constants = fetch_constants_.data();
+        mrt_draw.fetch_constants_size = fetch_constants_.size() * sizeof(uint32_t);
+        mrt_draw.bool_loop_constants = bool_loop_constants_.data();
+        mrt_draw.bool_loop_constants_size = bool_loop_constants_.size() * sizeof(uint32_t);
+        mrt_draw.shared_memory = memory_->physical_membase();
+        mrt_draw.shared_memory_size = size_t(0x20000000);
+        mrt_draw.shared_memory_metal_buffer = resident_shared_memory_buffer;
+        mrt_draw.vertex_textures =
+            vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data();
+        mrt_draw.vertex_texture_count = vertex_texture_slots.size();
+        mrt_draw.vertex_sampler_count = vertex_shader.GetSamplerBindingsAfterTranslation().size();
+        mrt_draw.fragment_textures =
+            fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data();
+        mrt_draw.fragment_texture_count = fragment_texture_slots.size();
+        mrt_draw.fragment_sampler_count = fragment_sampler_count;
+        mrt_draw.vertex_samplers =
+            vertex_sampler_slots.empty() ? nullptr : vertex_sampler_slots.data();
+        mrt_draw.fragment_samplers =
+            fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data();
+        mrt_draw.index_buffer = probe_index_buffer_ptr;
+        mrt_draw.rasterization_state = &probe_rasterization_state;
+        mrt_draw.depth_stencil_state = probe_depth_stencil_state_ptr;
+        mrt_draw.primitive_type = probe_primitive_type;
+        mrt_draw.vertex_count = probe_vertex_count;
+        mrt_draw.vertex_shared_memory_buffer_index = vertex_buffer_bindings.shared_memory;
+        mrt_draw.vertex_float_constants_buffer_index = vertex_buffer_bindings.float_constants;
+        mrt_draw.vertex_fetch_constants_buffer_index = vertex_buffer_bindings.fetch_constants;
+        mrt_draw.vertex_bool_loop_constants_buffer_index =
+            vertex_buffer_bindings.bool_loop_constants;
+        mrt_draw.fragment_shared_memory_buffer_index = fragment_shared_memory_buffer_index;
+        mrt_draw.fragment_float_constants_buffer_index = fragment_float_constants_buffer_index;
+        mrt_draw.fragment_fetch_constants_buffer_index = fragment_fetch_constants_buffer_index;
+        mrt_draw.fragment_bool_loop_constants_buffer_index =
+            fragment_bool_loop_constants_buffer_index;
+        persistent_probe_ok = RenderPipelineProbeMrtToContexts(
+            *mrt_contexts, *mrt_pipeline_description, pipeline_state, probe_width, probe_height,
+            mrt_draw, mrt_telemetry_out, &persistent_probe_error);
+      } else {
+        persistent_probe_ok = RenderPipelineProbeToContext(
+            persistent_context, pipeline_state, &probe_system_constants,
+            sizeof(probe_system_constants), vertex_float_constants_data,
+            vertex_float_constants_size, fetch_constants_.data(),
+            fetch_constants_.size() * sizeof(uint32_t), memory_->physical_membase(),
+            size_t(0x20000000), resident_shared_memory_buffer,
+            vertex_texture_slots.empty() ? nullptr : vertex_texture_slots.data(),
+            vertex_texture_slots.size(), vertex_shader.GetSamplerBindingsAfterTranslation().size(),
+            fragment_texture_slots.empty() ? nullptr : fragment_texture_slots.data(),
+            fragment_texture_slots.size(), fragment_sampler_count, probe_primitive_type,
+            probe_vertex_count, probe_width, probe_height, &persistent_probe_error,
+            vertex_buffer_bindings.shared_memory, vertex_buffer_bindings.float_constants,
+            vertex_buffer_bindings.fetch_constants, fragment_float_constants_data,
+            fragment_float_constants_size, fragment_float_constants_buffer_index,
+            fragment_fetch_constants_buffer_index,
+            vertex_sampler_slots.empty() ? nullptr : vertex_sampler_slots.data(),
+            fragment_sampler_slots.empty() ? nullptr : fragment_sampler_slots.data(), nullptr, 0,
+            UINT32_MAX, bool_loop_constants_.data(), bool_loop_constants_.size() * sizeof(uint32_t),
+            vertex_buffer_bindings.bool_loop_constants, fragment_bool_loop_constants_buffer_index,
+            probe_index_buffer_ptr, &probe_rasterization_state, probe_depth_stencil_state_ptr,
+            fragment_shared_memory_buffer_index, color_attachment_index);
+      }
     }
     ++pipeline_probe_draws_this_swap_;
     if (!persistent_probe_ok) {
@@ -12957,17 +14911,19 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
       }
       return false;
     }
-    if (host_render_target_debug) {
-      MarkCanonicalWritesForContext(
-          persistent_context, pixel_shader ? pixel_shader->writes_color_targets() : 0,
-          probe_depth_stencil_state_ptr);
+    if (host_render_target_debug && !mrt_submission) {
+      MarkCanonicalWritesForContext(persistent_context,
+                                    pixel_shader ? pixel_shader->writes_color_targets() : 0,
+                                    probe_depth_stencil_state_ptr);
     }
-    ++async_probe_submission_count_;
-    ++async_probe_submissions_since_global_wait_;
-    async_probe_max_pending_submission_count_ =
-        std::max(async_probe_max_pending_submission_count_,
-                 GetPipelineProbeContextPendingSubmissionCount(persistent_context));
-    if (persistent_writes_shared_memory &&
+    if (!mrt_submission) {
+      ++async_probe_submission_count_;
+      ++async_probe_submissions_since_global_wait_;
+      async_probe_max_pending_submission_count_ =
+          std::max(async_probe_max_pending_submission_count_,
+                   GetPipelineProbeContextPendingSubmissionCount(persistent_context));
+    }
+    if (!mrt_submission && persistent_writes_shared_memory &&
         !WaitForPipelineProbeSubmissions("shared-memory-writer")) {
       ++pipeline_probe_failure_count_;
       return false;
@@ -12996,7 +14952,8 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
         return false;
       }
     }
-    if (async_probe_submissions_since_global_wait_ >= kMaxAsyncProbeSubmissionsBetweenGlobalWaits &&
+    if (!mrt_submission &&
+        async_probe_submissions_since_global_wait_ >= kMaxAsyncProbeSubmissionsBetweenGlobalWaits &&
         !WaitForPipelineProbeSubmissions("global-cap")) {
       ++pipeline_probe_failure_count_;
       return false;
@@ -13005,10 +14962,11 @@ bool MetalCommandProcessor::TryRenderPipelineProbe(
     // Readback diagnostics can fall through to solid/fullscreen rerenders.
     // Never enter that path for a shader with memory side effects because a
     // diagnostic draw must not execute a guest-visible export a second time.
-    bool should_read = !persistent_writes_shared_memory && !host_render_target_debug &&
+    bool should_read = !mrt_submission && !persistent_writes_shared_memory &&
+                       !host_render_target_debug &&
                        (first_pipeline_probe || pipeline_probe_success_count_ <= 8 ||
                         (pipeline_probe_success_count_ & 0x3F) == 0);
-    if (!persistent_writes_shared_memory && host_render_target_debug &&
+    if (!mrt_submission && !persistent_writes_shared_memory && host_render_target_debug &&
         MetalHostRenderTargetDebugEnabled()) {
       should_read = first_pipeline_probe || pipeline_probe_success_count_ <= 8 ||
                     (pipeline_probe_success_count_ & 0x3F) == 0;

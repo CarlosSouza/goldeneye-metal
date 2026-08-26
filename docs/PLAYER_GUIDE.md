@@ -77,7 +77,8 @@ somewhere safe.
 
 After a crash or force-quit, reopen the launcher and choose **Start in Safe Mode** or **Play
 Normally**. To report a problem, choose **Export Diagnostic Bundle…** and send the resulting ZIP.
-It contains useful logs and crash information, not game data or saves.
+It contains useful logs and crash information, not game data or saves. GPU captures are excluded
+unless you explicitly select **Include GPU capture**; an included capture may contain game memory.
 
 ## Current limitations
 

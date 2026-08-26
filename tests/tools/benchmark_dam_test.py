@@ -32,9 +32,12 @@ def fake_game_source(*, crash: bool, spawn_child: bool = False) -> str:
         for index in range(2):
             start = index * 64 + 1
             end = start + 63
+            print(f"[metal-profile] presenter attempts={{start}}-{{end}} sources=64 unchanged_sources=0 drawable_nil=0 uploads=0 upload_bytes=0 commits=64", flush=True)
             print(f"[metal-profile] window swaps={{start}}-{{end}} elapsed_ns=1066666688 avg_frame_ns=16666667 fps=60.0", flush=True)
+            print(f"[metal-profile] gpu-chain swaps={{start}}-{{end}} wptr_attempts=128 wptr_accepted=128 wptr_rejected=0 ring_batches=64 ring_commit_rejected=0", flush=True)
             for event, calls, average in (("draw", 640, 10), ("copy", 768, 12), ("swap", 64, 1), ("wait_reg_mem", 64, 1)):
                 print(f"[metal-profile] command swaps={{start}}-{{end}} event={{event}} calls={{calls}} avg_calls_per_swap={{average}} total_ns=64000000 avg_ns_per_swap=1000000 max_call_ns=2000000 max_swap_ns=3000000", flush=True)
+            print(f"[metal-profile] command swaps={{start}}-{{end}} event=texture_fallback_decode calls=0 avg_calls_per_swap=0 total_ns=0 avg_ns_per_swap=0 max_call_ns=0 max_swap_ns=0", flush=True)
             print(f"[metal-profile] wait-reg-mem swaps={{start}}-{{end}} rank=1 source=memory calls=64 polls=64 total_ns=8000000 unmatched=0 timeouts=0", flush=True)
         {ending}
         """

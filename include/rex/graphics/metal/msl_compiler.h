@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -7,6 +8,7 @@
 #include <vector>
 
 #include <rex/graphics/metal/edram_snapshot.h>
+#include <rex/graphics/metal/color_target_storage.h>
 
 namespace rex::graphics::metal {
 
@@ -46,6 +48,10 @@ struct ProbeIndexBuffer {
   size_t size = 0;
   size_t offset = 0;
   uint8_t index_size = 0;
+  // Exact production draws may stage only host-owned bytes emitted by the
+  // primitive processor. Probe callers must not opt arbitrary CPU data into
+  // the production translation contract.
+  bool production_host_data_trusted = false;
 };
 
 enum class ProbeCullMode : uint8_t {
@@ -102,7 +108,60 @@ struct ProbeColorTargetState {
   uint8_t write_mask = 0xF;
   // Normalized RB_BLENDCONTROL value (reserved bits removed).
   uint32_t blend_control = 0x00010001;
+  // The Metal attachment format must match the guest render-target storage.
+  // Unsupported formats are rejected during pipeline creation.
+  xenos::ColorRenderTargetFormat color_format = xenos::ColorRenderTargetFormat::k_8_8_8_8;
+  // Kept explicit in the pipeline contract so a future guest-format mapping
+  // change can't alias an existing pipeline or binary-archive entry.
+  ColorTargetStorageKind metal_storage = ColorTargetStorageKind::kBgra8Unorm;
 };
+
+// Complete output-merger color state for one Metal render pipeline. The mask
+// is positional: bit N enables colorAttachments[N], including sparse layouts
+// such as RT0 + RT2. Inactive slots are ignored and must remain unbound.
+struct ProbeRenderPipelineDescription {
+  std::array<ProbeColorTargetState, xenos::kMaxColorRenderTargets> color_targets = {};
+  uint8_t output_mask = 0x1;
+};
+
+constexpr uint32_t kProbeRenderPipelineDescriptionVersion = 2;
+
+constexpr ProbeRenderPipelineDescription MakeSingleProbeRenderPipelineDescription(
+    const ProbeColorTargetState& color_target_state, uint32_t attachment_index = 0) {
+  ProbeRenderPipelineDescription description;
+  description.output_mask = attachment_index < xenos::kMaxColorRenderTargets
+                                ? uint8_t(uint32_t(1) << attachment_index)
+                                : uint8_t(0);
+  if (attachment_index < xenos::kMaxColorRenderTargets) {
+    description.color_targets[attachment_index] = color_target_state;
+  }
+  return description;
+}
+
+// Stable, padding-independent key material for the complete Metal color
+// descriptor. Every explicit per-slot field and the sample count participate.
+constexpr uint64_t GetProbeRenderPipelineDescriptionKey(
+    const ProbeRenderPipelineDescription& description, uint32_t sample_count) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  auto append_u32 = [&hash](uint32_t value) constexpr {
+    for (uint32_t byte = 0; byte < 4; ++byte) {
+      hash ^= uint8_t(value >> (byte * 8));
+      hash *= UINT64_C(1099511628211);
+    }
+  };
+  append_u32(kProbeRenderPipelineDescriptionVersion);
+  append_u32(sample_count);
+  append_u32(description.output_mask);
+  for (uint32_t index = 0; index < xenos::kMaxColorRenderTargets; ++index) {
+    const ProbeColorTargetState& target = description.color_targets[index];
+    append_u32(index);
+    append_u32(target.write_mask);
+    append_u32(target.blend_control);
+    append_u32(uint32_t(target.color_format));
+    append_u32(uint32_t(target.metal_storage));
+  }
+  return hash;
+}
 
 struct ProbeTiledResolveTarget {
   // Existing caller-owned resident id<MTLBuffer>. Submitted Metal command
@@ -175,6 +234,29 @@ struct PipelineProbeUploadStats {
   uint64_t suballocation_bytes = 0;
 };
 
+// Cumulative diagnostics for the bounded asynchronous draw queue. These make
+// it possible to distinguish useful CPU/GPU overlap from an actual blocking
+// backpressure wait without changing the synchronization contract.
+struct PipelineProbeSubmissionStats {
+  // Stable for the lifetime of one context and never derived from its address.
+  // This lets profile windows distinguish a newly allocated context even if
+  // the allocator reuses an old context's pointer.
+  uint64_t context_identity = 0;
+  uint64_t draw_command_buffer_commit_count = 0;
+  // Non-draw consumers using the same bounded queue (currently exact EDRAM
+  // resolve/copy/clear packets). Kept separate so draw batching diagnostics
+  // retain their original meaning.
+  uint64_t auxiliary_command_buffer_commit_count = 0;
+  uint64_t backpressure_check_count = 0;
+  uint64_t nonblocking_completed_command_buffer_reclamation_count = 0;
+  uint64_t blocking_backpressure_wait_count = 0;
+  uint64_t blocking_backpressure_wait_ns = 0;
+  uint32_t peak_committed_draw_command_buffer_count = 0;
+  uint32_t peak_pending_submission_count = 0;
+  uint32_t max_draws_per_command_buffer = 0;
+  uint32_t max_committed_draw_command_buffer_count = 0;
+};
+
 // Per-pipeline timing and outcome information for the optional persistent
 // MTLBinaryArchive path. A hit means Metal created the pipeline while
 // MTLPipelineOptionFailOnBinaryArchiveMiss was active. A miss always falls
@@ -217,12 +299,11 @@ void ReleaseMetalPipelineBinaryArchive(void* binary_archive);
 void* CreateMslLibrary(void* metal_device, const std::string& source, std::string* error_out);
 void ReleaseMslLibrary(void* metal_library);
 bool ValidateMslSource(void* metal_device, const std::string& source, std::string* error_out);
-void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* fragment_library,
-                                std::string* error_out,
-                                const ProbeColorTargetState* color_target_state = nullptr,
-                                void* binary_archive = nullptr,
-                                RenderPipelineCacheTelemetry* cache_telemetry_out = nullptr,
-                                uint32_t sample_count = 1);
+void* CreateRenderPipelineState(
+    void* metal_device, void* vertex_library, void* fragment_library, std::string* error_out,
+    const ProbeRenderPipelineDescription* pipeline_description = nullptr,
+    void* binary_archive = nullptr, RenderPipelineCacheTelemetry* cache_telemetry_out = nullptr,
+    uint32_t sample_count = 1);
 void ReleaseRenderPipelineState(void* pipeline_state);
 void* CreatePipelineProbeContext(void* metal_device, std::string* error_out);
 void* CreatePipelineProbeContext(void* metal_device, void* metal_command_queue,
@@ -242,13 +323,19 @@ bool SharePipelineProbeDepthStencilTarget(void* destination_context, void* sourc
 // targets; shared contexts are required to use the same count.
 bool SetPipelineProbeContextSampleCount(void* context, uint32_t sample_count,
                                         std::string* error_out);
+// Selects the persistent color target from the exact guest format. Formats
+// with proven native storage get a Metal attachment; all lossless sidecar
+// formats may still own canonical raw words, but raster APIs fail closed until
+// an exact output-merger implementation exists. Changing format drains and
+// invalidates both native and raw ownership.
+bool SetPipelineProbeContextColorFormat(void* context, xenos::ColorRenderTargetFormat color_format,
+                                        std::string* error_out);
 void* CreatePipelineProbeSnapshotTexture(void* metal_device, uint32_t width, uint32_t height,
                                          std::string* error_out);
 void* CreatePipelineProbeDepthSnapshotTexture(void* metal_device, uint32_t width, uint32_t height,
                                               std::string* error_out);
 void* CreatePipelineProbePackedDepthSnapshotTexture(void* metal_device, uint32_t width,
-                                                    uint32_t height,
-                                                    std::string* error_out);
+                                                    uint32_t height, std::string* error_out);
 void ReleasePipelineProbeSnapshotTexture(void* snapshot_texture);
 // Enqueues and commits a full rectangular texture copy on the supplied queue.
 // The source must be complete before a different queue is used.
@@ -279,6 +366,10 @@ uint32_t GetPipelineProbeContextPendingSubmissionCount(void* context);
 // Returns cumulative statistics for the reusable per-command-buffer upload
 // arenas used by persistent draws. Primarily useful for diagnostics and tests.
 bool GetPipelineProbeContextUploadStats(void* context, PipelineProbeUploadStats* stats_out);
+// Returns cumulative bounded-queue commit, reclamation, wait and high-water
+// statistics. A blocking wait is counted only when Metal still reports the
+// oldest command buffer as in flight after completed-prefix reclamation.
+bool GetPipelineProbeContextSubmissionStats(void* context, PipelineProbeSubmissionStats* stats_out);
 // Counts full-surface hardware resolves submitted for a multisampled context.
 // Draw command-buffer boundaries must not increment this; only consumers do.
 uint64_t GetPipelineProbeContextMultisampleResolveCount(void* context);
@@ -323,7 +414,92 @@ bool RenderPipelineProbeToContext(
     const ProbeIndexBuffer* index_buffer = nullptr,
     const ProbeRasterizationState* rasterization_state = nullptr,
     const ProbeDepthStencilState* depth_stencil_state = nullptr,
-    uint32_t fragment_shared_memory_buffer_index = UINT32_MAX);
+    uint32_t fragment_shared_memory_buffer_index = UINT32_MAX, uint32_t color_attachment_index = 0);
+
+struct PipelineProbeMrtTelemetry {
+  uint32_t bound_color_target_count = 0;
+  uint32_t encoded_draw_count = 0;
+  uint32_t depth_attachment_bind_count = 0;
+  uint32_t vertex_shared_memory_binding_count = 0;
+  uint32_t fragment_shared_memory_binding_count = 0;
+  uint32_t completed_command_buffer_count = 0;
+};
+
+#if defined(REX_METAL_MRT_PROBE_TESTING)
+// Standalone real-Metal probe only. The production graphics target does not
+// define REX_METAL_MRT_PROBE_TESTING, so neither this control nor its failure
+// injection exists in game/runtime binaries.
+enum class PipelineProbeMrtTestCompletion : uint8_t {
+  kNormal,
+  kReportNonCompletedAfterWait,
+};
+#endif
+
+// Complete input state for one correctness-first synchronous MRT draw. All
+// pointers are borrowed only until RenderPipelineProbeMrtToContexts returns.
+// Metal-backed buffers and textures are retained by the command buffer while
+// it executes; CPU data is copied into temporary shared buffers before submit.
+struct PipelineProbeMrtDraw {
+  const void* system_constants = nullptr;
+  size_t system_constants_size = 0;
+  const void* vertex_float_constants = nullptr;
+  size_t vertex_float_constants_size = 0;
+  const void* fragment_float_constants = nullptr;
+  size_t fragment_float_constants_size = 0;
+  const void* fetch_constants = nullptr;
+  size_t fetch_constants_size = 0;
+  const void* bool_loop_constants = nullptr;
+  size_t bool_loop_constants_size = 0;
+  void* shared_memory = nullptr;
+  size_t shared_memory_size = 0;
+  void* shared_memory_metal_buffer = nullptr;
+  const ProbeTextureSlot* vertex_textures = nullptr;
+  size_t vertex_texture_count = 0;
+  size_t vertex_sampler_count = 0;
+  const ProbeTextureSlot* fragment_textures = nullptr;
+  size_t fragment_texture_count = 0;
+  size_t fragment_sampler_count = 0;
+  const ProbeSamplerSlot* vertex_samplers = nullptr;
+  const ProbeSamplerSlot* fragment_samplers = nullptr;
+  const void* vertex_data = nullptr;
+  size_t vertex_data_size = 0;
+  const ProbeIndexBuffer* index_buffer = nullptr;
+  const ProbeRasterizationState* rasterization_state = nullptr;
+  const ProbeDepthStencilState* depth_stencil_state = nullptr;
+  uint32_t primitive_type = uint32_t(xenos::PrimitiveType::kTriangleList);
+  uint32_t vertex_count = 0;
+  uint32_t vertex_shared_memory_buffer_index = UINT32_MAX;
+  uint32_t vertex_float_constants_buffer_index = UINT32_MAX;
+  uint32_t vertex_fetch_constants_buffer_index = UINT32_MAX;
+  uint32_t vertex_bool_loop_constants_buffer_index = UINT32_MAX;
+  uint32_t vertex_data_buffer_index = UINT32_MAX;
+  uint32_t fragment_shared_memory_buffer_index = UINT32_MAX;
+  uint32_t fragment_float_constants_buffer_index = UINT32_MAX;
+  uint32_t fragment_fetch_constants_buffer_index = UINT32_MAX;
+  uint32_t fragment_bool_loop_constants_buffer_index = UINT32_MAX;
+#if defined(REX_METAL_MRT_PROBE_TESTING)
+  PipelineProbeMrtTestCompletion test_completion = PipelineProbeMrtTestCompletion::kNormal;
+#endif
+};
+
+// Submits the full guest draw exactly once to every active attachment and
+// waits for completion. This synchronous contract is intentionally slower,
+// but makes resource lifetimes, shared depth/stencil and memexport ordering
+// unambiguous while the production MRT path is brought up.
+bool RenderPipelineProbeMrtToContexts(
+    const std::array<void*, xenos::kMaxColorRenderTargets>& contexts,
+    const ProbeRenderPipelineDescription& pipeline_description, void* pipeline_state,
+    uint32_t width, uint32_t height, const PipelineProbeMrtDraw& draw,
+    PipelineProbeMrtTelemetry* telemetry_out, std::string* error_out);
+
+// Convenience wrapper used by integration tests. The fragment shader is
+// expected to generate a full-screen triangle from vertex_id. Production uses
+// RenderPipelineProbeMrtToContexts with the complete translated draw state.
+bool RenderPipelineProbeMrtTriangleToContexts(
+    const std::array<void*, xenos::kMaxColorRenderTargets>& contexts,
+    const ProbeRenderPipelineDescription& pipeline_description, void* pipeline_state,
+    uint32_t width, uint32_t height, const ProbeDepthStencilState* depth_stencil_state,
+    PipelineProbeMrtTelemetry* telemetry_out, std::string* error_out);
 bool ReadPipelineProbeContext(void* context, uint32_t width, uint32_t height,
                               std::vector<uint8_t>& bgra_out, std::string* error_out);
 // Reads a tightly packed BGRA rectangle. Like the full read, this is a fence:
@@ -370,23 +546,27 @@ bool ResolvePipelineProbeDepthStencilContextToXenosTiled(
 // Xenos color storage format. Depth transfer preserves the selected D24S8 or
 // D24FS8 word, including stencil, for every sample. These functions are
 // synchronous fences: on failure no caller may advertise a complete snapshot.
-bool ExportPipelineProbeColorToCanonicalEdram(
-    void* context, uint32_t width, uint32_t height,
-    const CanonicalEdramSurfaceLayout& layout, xenos::ColorRenderTargetFormat format,
-    void* canonical_edram, size_t canonical_edram_size, std::string* error_out);
-bool RestorePipelineProbeColorFromCanonicalEdram(
-    void* context, uint32_t width, uint32_t height,
-    const CanonicalEdramSurfaceLayout& layout, xenos::ColorRenderTargetFormat format,
-    const void* canonical_edram, size_t canonical_edram_size, std::string* error_out);
-bool ExportPipelineProbeDepthStencilToCanonicalEdram(
-    void* context, uint32_t width, uint32_t height,
-    const CanonicalEdramSurfaceLayout& layout, xenos::DepthRenderTargetFormat format,
-    bool float24_round, void* canonical_edram, size_t canonical_edram_size,
-    std::string* error_out);
+bool ExportPipelineProbeColorToCanonicalEdram(void* context, uint32_t width, uint32_t height,
+                                              const CanonicalEdramSurfaceLayout& layout,
+                                              xenos::ColorRenderTargetFormat format,
+                                              void* canonical_edram, size_t canonical_edram_size,
+                                              std::string* error_out);
+bool RestorePipelineProbeColorFromCanonicalEdram(void* context, uint32_t width, uint32_t height,
+                                                 const CanonicalEdramSurfaceLayout& layout,
+                                                 xenos::ColorRenderTargetFormat format,
+                                                 const void* canonical_edram,
+                                                 size_t canonical_edram_size,
+                                                 std::string* error_out);
+bool ExportPipelineProbeDepthStencilToCanonicalEdram(void* context, uint32_t width, uint32_t height,
+                                                     const CanonicalEdramSurfaceLayout& layout,
+                                                     xenos::DepthRenderTargetFormat format,
+                                                     bool float24_round, void* canonical_edram,
+                                                     size_t canonical_edram_size,
+                                                     std::string* error_out);
 bool RestorePipelineProbeDepthStencilFromCanonicalEdram(
-    void* context, uint32_t width, uint32_t height,
-    const CanonicalEdramSurfaceLayout& layout, xenos::DepthRenderTargetFormat format,
-    const void* canonical_edram, size_t canonical_edram_size, std::string* error_out);
+    void* context, uint32_t width, uint32_t height, const CanonicalEdramSurfaceLayout& layout,
+    xenos::DepthRenderTargetFormat format, const void* canonical_edram, size_t canonical_edram_size,
+    std::string* error_out);
 
 bool RenderPipelineProbe(
     void* metal_device, void* pipeline_state, const void* system_constants,

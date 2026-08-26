@@ -39,20 +39,23 @@ uint64_t BitStream::Peek(size_t num_bits) {
   assert_false(num_bits > 57);
   assert_false(offset_bits_ + num_bits > size_bits_);
 
+  if (num_bits == 0) {
+    return 0;
+  }
+
   size_t offset_bytes = offset_bits_ >> 3;
   size_t rel_offset_bits = offset_bits_ - (offset_bytes << 3);
 
-  // offset -->
-  // ..[junk]..| target bits |....[junk].............
-  uint64_t bits = *(uint64_t*)(buffer_ + offset_bytes);
+  // Assemble only the bytes containing the requested bits. Besides avoiding
+  // reads past the buffer, this works for buffers without uint64_t alignment.
+  const size_t byte_count = (rel_offset_bits + num_bits + 7) >> 3;
+  uint64_t bits = 0;
+  for (size_t i = 0; i < byte_count; ++i) {
+    bits = (bits << 8) | buffer_[offset_bytes + i];
+  }
 
-  // We need the data in little endian.
-  // TODO: Have a flag specifying endianness of data?
-  bits = rex::byte_swap(bits);
-
-  // Shift right
-  // .....[junk]........| target bits |
-  bits >>= 64 - (rel_offset_bits + num_bits);
+  const size_t trailing_bits = byte_count * 8 - (rel_offset_bits + num_bits);
+  bits >>= trailing_bits;
 
   // AND with mask
   // ...................| target bits |
@@ -68,36 +71,26 @@ uint64_t BitStream::Read(size_t num_bits) {
   return val;
 }
 
-// TODO: This is totally not tested!
 bool BitStream::Write(uint64_t val, size_t num_bits) {
-  assert_false(num_bits > 57);
-  assert_false(offset_bits_ + num_bits >= size_bits_);
+  const bool valid_count = num_bits <= 57;
+  const bool valid_range = offset_bits_ <= size_bits_ && num_bits <= size_bits_ - offset_bits_;
+  assert_true(valid_count);
+  assert_true(valid_range);
+  if (!valid_count || !valid_range) {
+    return false;
+  }
 
-  size_t offset_bytes = offset_bits_ >> 3;
-  size_t rel_offset_bits = offset_bits_ - (offset_bytes << 3);
-
-  // Construct a mask
-  uint64_t mask = (1ULL << num_bits) - 1;
-  mask <<= 64 - (rel_offset_bits + num_bits);
-  mask = ~mask;
-
-  // Shift the value left into position.
-  val <<= 64 - (rel_offset_bits + num_bits);
-
-  // offset ----->
-  // ....[junk]...| target bits w/ junk |....[junk]......
-  uint64_t bits = *(uint64_t*)(buffer_ + offset_bytes);
-
-  // AND with mask
-  // ....[junk]...| target bits (0) |........[junk]......
-  bits &= mask;
-
-  // OR with val
-  // ....[junk]...| target bits (val) |......[junk]......
-  bits |= val;
-
-  // Store into the bitstream.
-  *(uint64_t*)(buffer_ + offset_bytes) = bits;
+  for (size_t i = 0; i < num_bits; ++i) {
+    const size_t stream_bit = offset_bits_ + i;
+    const uint8_t stream_mask = uint8_t(1) << (7 - (stream_bit & 7));
+    const bool value_bit = ((val >> (num_bits - i - 1)) & 1) != 0;
+    uint8_t& stream_byte = buffer_[stream_bit >> 3];
+    if (value_bit) {
+      stream_byte |= stream_mask;
+    } else {
+      stream_byte &= uint8_t(~stream_mask);
+    }
+  }
 
   // Advance the bitstream forward.
   Advance(num_bits);

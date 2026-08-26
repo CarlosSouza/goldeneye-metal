@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <rex/graphics/xenos.h>
+
 namespace rex::graphics::metal {
 
 inline constexpr uint64_t kGoldenEyePostprocessPixelShaderHash = 0x5D448681EF02A235ull;
@@ -34,6 +36,9 @@ inline constexpr std::array<uint32_t, 6> kGoldenEyePostprocessColorRgbaFetch = {
 inline constexpr std::array<uint32_t, 6> kGoldenEyePostprocessDepthRgbaFetch = {
     0x80024802u, 0x1EBFD086u, 0x03FFDFFFu, 0x00A80C14u, 0x00000003u, 0x00000200u,
 };
+inline constexpr std::array<uint32_t, 6> kGoldenEyePostprocessDepthRgbaMultiplayerFetch = {
+    0x80004802u, 0x1EBFD086u, 0x03FFDFFFu, 0x01280C14u, 0x00000003u, 0x00000200u,
+};
 inline constexpr std::array<uint32_t, 6> kGoldenEyePostprocessDepth24Stencil8Fetch = {
     0x80024802u, 0x1EBFD096u, 0x03FFDFFFu, 0x00801690u, 0x00000000u, 0x00000200u,
 };
@@ -46,7 +51,8 @@ constexpr GoldenEyePostprocessConsumer ClassifyGoldenEyePostprocessConsumer(
   if (fetch_words == kGoldenEyePostprocessColorRgbaFetch) {
     return GoldenEyePostprocessConsumer::kColorRgba;
   }
-  if (fetch_words == kGoldenEyePostprocessDepthRgbaFetch) {
+  if (fetch_words == kGoldenEyePostprocessDepthRgbaFetch ||
+      fetch_words == kGoldenEyePostprocessDepthRgbaMultiplayerFetch) {
     return GoldenEyePostprocessConsumer::kDepthRgba;
   }
   if (fetch_words == kGoldenEyePostprocessDepth24Stencil8Fetch) {
@@ -118,14 +124,13 @@ constexpr GoldenEyePostprocessBand ClassifyGoldenEyePostprocessBand(
   return GoldenEyePostprocessBand::kNone;
 }
 
-constexpr bool IsGoldenEyePostprocessProducerTileMask(
-    GoldenEyePostprocessBand band, uint64_t bin_mask) {
-  return band != GoldenEyePostprocessBand::kNone &&
-         bin_mask == UINT64_C(0xFFFFFFFF);
+constexpr bool IsGoldenEyePostprocessProducerTileMask(GoldenEyePostprocessBand band,
+                                                      uint64_t bin_mask) {
+  return band != GoldenEyePostprocessBand::kNone && bin_mask == UINT64_C(0xFFFFFFFF);
 }
 
-constexpr bool IsGoldenEyePostprocessConsumerTileMask(
-    GoldenEyePostprocessBand band, uint64_t bin_mask) {
+constexpr bool IsGoldenEyePostprocessConsumerTileMask(GoldenEyePostprocessBand band,
+                                                      uint64_t bin_mask) {
   switch (band) {
     case GoldenEyePostprocessBand::kTop:
       return bin_mask == UINT64_C(0xFFFFFFFF);
@@ -135,6 +140,25 @@ constexpr bool IsGoldenEyePostprocessConsumerTileMask(
     default:
       return false;
   }
+}
+
+// A compatibility aggregate is valid only for the one known consumer draw.
+// Keep the complete identity in one pure predicate so every renderer route
+// applies the same shader, geometry, tile and three-fetch contract.
+constexpr bool IsGoldenEyePostprocessConsumerDraw(
+    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash, xenos::PrimitiveType primitive_type,
+    uint32_t index_count, GoldenEyePostprocessBand band, uint64_t bin_mask,
+    const std::array<std::array<uint32_t, 6>, 3>& fetch_words) {
+  return vertex_shader_hash == kGoldenEyePostprocessVertexShaderHash &&
+         pixel_shader_hash == kGoldenEyePostprocessPixelShaderHash &&
+         primitive_type == xenos::PrimitiveType::kTriangleList && index_count == 6 &&
+         IsGoldenEyePostprocessConsumerTileMask(band, bin_mask) &&
+         ClassifyGoldenEyePostprocessConsumer(pixel_shader_hash, fetch_words[0]) ==
+             GoldenEyePostprocessConsumer::kColorRgba &&
+         ClassifyGoldenEyePostprocessConsumer(pixel_shader_hash, fetch_words[1]) ==
+             GoldenEyePostprocessConsumer::kDepth24Stencil8 &&
+         ClassifyGoldenEyePostprocessConsumer(pixel_shader_hash, fetch_words[2]) ==
+             GoldenEyePostprocessConsumer::kDepthRgba;
 }
 
 // These signatures are deliberately semantic rather than raw register words.
@@ -189,12 +213,11 @@ constexpr bool IsGoldenEyePostprocessBandHeight(uint32_t height) {
 
 constexpr GoldenEyePostprocessProducerRole ClassifyGoldenEyePostprocessProducer(
     const GoldenEyePostprocessProducer& producer) {
-  if (producer.band == GoldenEyePostprocessBand::kNone ||
-      producer.source_x != 0 || producer.source_y != 0 || producer.x != 0 ||
-      producer.y != 0 ||
-      producer.width != 1280 || producer.height != GoldenEyePostprocessBandHeight(producer.band) ||
-      producer.raw_pitch != 0 || producer.raw_height != 8191 || producer.msaa != 2 ||
-      producer.sample != 0 || producer.endian != 2) {
+  if (producer.band == GoldenEyePostprocessBand::kNone || producer.source_x != 0 ||
+      producer.source_y != 0 || producer.x != 0 || producer.y != 0 || producer.width != 1280 ||
+      producer.height != GoldenEyePostprocessBandHeight(producer.band) || producer.raw_pitch != 0 ||
+      producer.raw_height != 8191 || producer.msaa != 2 || producer.sample != 0 ||
+      producer.endian != 2) {
     return GoldenEyePostprocessProducerRole::kNone;
   }
 

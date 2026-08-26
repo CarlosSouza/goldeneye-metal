@@ -68,8 +68,8 @@ LiveContainer, then import your legally owned game backup with the macOS launche
 copy the resulting `Game Data` folder into the app's Documents via the Files app. As with
 the macOS version, no game data is included or downloaded.
 
-**[Download v0.4.2 for macOS (.dmg)](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.4.2/GoldenEye-Metal-0.4.2-macos-arm64.dmg)** ·
-[Release notes](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.4.2) ·
+**[Download v0.5.0 for macOS (.dmg)](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.5.0/GoldenEye-Metal-0.5.0-macos-arm64.dmg)** ·
+[Release notes](https://github.com/ysrdevs/goldeneye-metal/releases/tag/v0.5.0) ·
 [Watch gameplay](https://youtu.be/VkbwbXw2tPw) ·
 [Discord](https://discord.gg/2AKEFgR7)
 
@@ -89,7 +89,7 @@ You need:
 
 To start playing:
 
-1. [Download the DMG](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.4.2/GoldenEye-Metal-0.4.2-macos-arm64.dmg).
+1. [Download the DMG](https://github.com/ysrdevs/goldeneye-metal/releases/download/v0.5.0/GoldenEye-Metal-0.5.0-macos-arm64.dmg).
 2. Open it and drag **GoldenEye Metal.app** into Applications.
 3. Launch the app. On first use, select your compatible local game backup and wait for the
    one-time import.
@@ -108,7 +108,9 @@ from the launcher later.
 
 If a game session does not close cleanly, the launcher offers **Start in Safe Mode** for one run or
 **Play Normally**. You can also choose **Export Diagnostic Bundle…** and send the resulting ZIP
-with a report; it excludes game data, saves, cache, and settings.
+with a report; by default it excludes game data, saves, cache, settings, and GPU captures. If you
+explicitly select **Include GPU capture**, the ZIP includes one frame trace that may contain game
+memory, so share it only when you intend to.
 
 Choose **Manage Saves…** to create a portable `.gesave` backup, restore a backup, or reset local
 progress. Restore and reset preserve the previous data so the action can be undone immediately.
@@ -181,7 +183,7 @@ the [native Metal technical status](docs/GOLDENEYE_NATIVE_METAL_PROJECT_STATUS.m
 
 | Platform | Status |
 | --- | --- |
-| Apple Silicon macOS | Active development; v0.4.2 reaches first-mission gameplay |
+| Apple Silicon macOS | Active development; v0.5.0 reaches first-mission gameplay |
 | Windows and Linux | Backend code exists, but this project's current changes are not verified there |
 
 ## Build and contribute

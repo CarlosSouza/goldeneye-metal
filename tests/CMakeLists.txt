@@ -11,6 +11,10 @@ if(UNIX)
         foreach(_tool_test IN ITEMS
                 metal_trace_dump_test
                 metal_profile_parser_test
+                diagnostic_privacy_test
+                gameplay_scenario_test
+                local_multiplayer_scenario_test
+                release_version_test
                 render_regression_test
                 stability_cycle_test)
             add_test(

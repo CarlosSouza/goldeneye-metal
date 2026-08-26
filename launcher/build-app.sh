@@ -5,10 +5,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-VERSION="${VERSION:-${APP_VERSION:-0.4.2}}"
-BUILD_NUMBER="${BUILD_NUMBER:-10}"
+RELEASE_MANIFEST="$REPO_ROOT/config/goldeneye-release.json"
 BUNDLE_IDENTIFIER="${BUNDLE_IDENTIFIER:-io.github.ysrdevs.goldeneye-metal}"
 MACOS_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-14.0}"
+RELEASE_BUILD_DIR="$REPO_ROOT/vendor/GoldenEye-Recomp/out/build/macos-arm64-release"
+RELEASE_REXGLUE_OUTPUT="$RELEASE_BUILD_DIR/rexglue-output"
 
 SPIRV_CROSS_TAG="vulkan-sdk-1.4.350.1"
 SPIRV_CROSS_ARCHIVE_NAME="SPIRV-Cross-${SPIRV_CROSS_TAG}.tar.gz"
@@ -16,7 +17,7 @@ SPIRV_CROSS_URL="https://github.com/KhronosGroup/SPIRV-Cross/archive/refs/tags/$
 SPIRV_CROSS_SHA256="21057934ede32fe90a63dc304fdce0f2a6cb4f0ca685a72ed36a73aac6f72ad5"
 SPIRV_CROSS_RECIPE_VERSION="1"
 
-APP="$REPO_ROOT/vendor/GoldenEye-Recomp/out/build/macos-arm64-release/dist/GoldenEye Metal.app"
+APP="$RELEASE_BUILD_DIR/dist/GoldenEye Metal.app"
 DOWNLOAD_TEMP=""
 AUDIT_TEMP=""
 
@@ -28,8 +29,8 @@ Usage:
   ./launcher/build-app.sh
 
 Optional environment variables:
-  VERSION                  App version (default: 0.4.2)
-  BUILD_NUMBER             Numeric bundle build number (default: 10)
+  VERSION                  App version (default: release manifest)
+  BUILD_NUMBER             Numeric bundle build number (default: release manifest)
   BUNDLE_IDENTIFIER        Reverse-DNS bundle ID
   MACOS_DEPLOYMENT_TARGET  Minimum macOS version (default: 14.0)
   BUILD_JOBS               Parallel build jobs (default: logical CPU count)
@@ -63,6 +64,12 @@ trap cleanup EXIT
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+release_manifest_value() {
+  key="$1"
+  /usr/bin/plutil -extract "$key" raw -o - "$RELEASE_MANIFEST" 2>/dev/null ||
+    fail "release manifest has no valid '$key' value: $RELEASE_MANIFEST"
 }
 
 archive_checksum_is_valid() {
@@ -192,14 +199,43 @@ build_pinned_spirv_cross() {
   SPIRV_CROSS_PREFIX_RESOLVED="$install_dir"
 }
 
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  usage
-  exit 0
-fi
-[ "$#" -eq 0 ] || fail "unknown argument: $1 (use --help)"
+PRINT_VERSION=0
+case "${1:-}" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  --print-version)
+    PRINT_VERSION=1
+    ;;
+  "") ;;
+  *) fail "unknown argument: $1 (use --help)" ;;
+esac
+[ "$#" -le 1 ] || fail "too many arguments (use --help)"
 
 [ "$(/usr/bin/uname -s)" = "Darwin" ] || fail "this script requires macOS"
 [ "$(/usr/bin/uname -m)" = "arm64" ] || fail "this release build requires Apple Silicon"
+
+require_command /usr/bin/plutil
+[ -f "$RELEASE_MANIFEST" ] || fail "release manifest is missing: $RELEASE_MANIFEST"
+/usr/bin/plutil -convert xml1 -o /dev/null "$RELEASE_MANIFEST" ||
+  fail "release manifest is invalid: $RELEASE_MANIFEST"
+MANIFEST_VERSION="$(release_manifest_value version)"
+MANIFEST_BUILD_NUMBER="$(release_manifest_value build)"
+VERSION="${VERSION:-${APP_VERSION:-$MANIFEST_VERSION}}"
+BUILD_NUMBER="${BUILD_NUMBER:-$MANIFEST_BUILD_NUMBER}"
+
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
+  fail "VERSION must contain two or three numeric components"
+[[ "$BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+)?(\.[0-9]+)?$ ]] ||
+  fail "BUILD_NUMBER must contain one to three numeric components"
+[[ "$MACOS_DEPLOYMENT_TARGET" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
+  fail "MACOS_DEPLOYMENT_TARGET must be a numeric macOS version"
+
+if [ "$PRINT_VERSION" -eq 1 ]; then
+  printf 'VERSION=%s\nBUILD_NUMBER=%s\n' "$VERSION" "$BUILD_NUMBER"
+  exit 0
+fi
 
 require_command cmake
 require_command git
@@ -208,13 +244,6 @@ require_command /usr/bin/curl
 require_command /usr/bin/shasum
 require_command /usr/bin/tar
 require_command /usr/bin/vtool
-
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
-  fail "VERSION must contain two or three numeric components"
-[[ "$BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+)?(\.[0-9]+)?$ ]] ||
-  fail "BUILD_NUMBER must contain one to three numeric components"
-[[ "$MACOS_DEPLOYMENT_TARGET" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
-  fail "MACOS_DEPLOYMENT_TARGET must be a numeric macOS version"
 
 if [ ! -f "$REPO_ROOT/vendor/GoldenEye-Recomp/generated/rexglue.cmake" ] ||
    [ ! -f "$REPO_ROOT/vendor/GoldenEye-Recomp/generated/sources.cmake" ]; then
@@ -281,17 +310,20 @@ SPIRV_CMAKE_ARGS=(
 )
 
 step "Configuring the GoldenEye app and native SDK"
+GOLDENEYE_VERSION_OVERRIDE="$VERSION" \
+GOLDENEYE_BUILD_NUMBER_OVERRIDE="$BUILD_NUMBER" \
 cmake -S vendor/GoldenEye-Recomp --preset macos-arm64-release \
   "-DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOS_DEPLOYMENT_TARGET" \
+  "-DREXGLUE_OUTPUT_DIRECTORY=$RELEASE_REXGLUE_OUTPUT" \
   "-DREXGLUE_ENABLE_INPUT_TEST_HARNESS=OFF" \
-  "-DGOLDENEYE_VERSION=$VERSION" \
-  "-DGOLDENEYE_BUILD_NUMBER=$BUILD_NUMBER" \
   "-DGOLDENEYE_BUNDLE_IDENTIFIER=$BUNDLE_IDENTIFIER" \
   "-DGOLDENEYE_SPIRV_CROSS_LICENSE=$SPIRV_LICENSE" \
   "${SPIRV_CMAKE_ARGS[@]}"
 
 step "Building and verifying the unsigned app"
-cmake --build vendor/GoldenEye-Recomp/out/build/macos-arm64-release \
+GOLDENEYE_VERSION_OVERRIDE="$VERSION" \
+GOLDENEYE_BUILD_NUMBER_OVERRIDE="$BUILD_NUMBER" \
+cmake --build "$RELEASE_BUILD_DIR" \
   --target goldeneye_macos_app_verify --parallel "$BUILD_JOBS"
 
 [ -d "$APP" ] || fail "the verified app was not created at $APP"

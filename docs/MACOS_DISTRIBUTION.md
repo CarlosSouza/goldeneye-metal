@@ -31,8 +31,8 @@ staples the app, creates the distributable ZIP from that stapled app, then
 creates, signs, notarizes, staples, and Gatekeeper-assesses the DMG. It writes:
 
 ```text
-release/GoldenEye-Metal-0.4.2-macos-arm64.zip
-release/GoldenEye-Metal-0.4.2-macos-arm64.dmg
+release/GoldenEye-Metal-0.5.0-macos-arm64.zip
+release/GoldenEye-Metal-0.5.0-macos-arm64.dmg
 ```
 
 The scripts accept `VERSION`, `BUILD_NUMBER`, `BUNDLE_IDENTIFIER`, and
@@ -54,9 +54,12 @@ invocations remain noninteractive.
 
 The same window exports one save-anywhere diagnostic ZIP containing bounded
 runtime logs, matching content-validated macOS crash reports, application build
-identity, and basic system information. It never copies game data, saves,
-cache, raw configuration, or remembered paths, and sanitizes private paths and
-persistent crash identifiers before archiving.
+identity, and basic system information. By default it never copies game data,
+saves, cache, raw configuration, remembered paths, or GPU captures, and it
+sanitizes private paths and persistent crash identifiers before archiving. A
+GPU capture is included only when the player explicitly selects it; that trace
+may contain game memory and is clearly marked as sensitive in the launcher and
+inside the exported ZIP.
 
 An interrupted game run is recorded with a private durable marker. On the next
 interactive launch, the player can start normally, export diagnostics, or use

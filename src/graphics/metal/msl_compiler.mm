@@ -1,5 +1,7 @@
 #include <rex/graphics/metal/msl_compiler.h>
 
+#include <rex/graphics/metal/raw_color_sidecar.h>
+
 #import <Metal/Metal.h>
 
 #include <algorithm>
@@ -8,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
@@ -27,6 +30,35 @@ static_assert(MTLStencilOperationKeep == 0 && MTLStencilOperationZero == 1 &&
               MTLStencilOperationReplace == 2 && MTLStencilOperationIncrementClamp == 3 &&
               MTLStencilOperationDecrementClamp == 4 && MTLStencilOperationInvert == 5 &&
               MTLStencilOperationIncrementWrap == 6 && MTLStencilOperationDecrementWrap == 7);
+
+bool GetMetalColorTargetPixelFormat(ColorTargetStorageKind storage,
+                                    MTLPixelFormat& pixel_format_out) {
+  switch (storage) {
+    case ColorTargetStorageKind::kBgra8Unorm:
+      pixel_format_out = MTLPixelFormatBGRA8Unorm;
+      return true;
+    case ColorTargetStorageKind::kRgb10A2Unorm:
+      pixel_format_out = MTLPixelFormatRGB10A2Unorm;
+      return true;
+    default:
+      pixel_format_out = MTLPixelFormatInvalid;
+      return false;
+  }
+}
+
+bool GetMetalColorTargetPixelFormat(xenos::ColorRenderTargetFormat format,
+                                    MTLPixelFormat& pixel_format_out) {
+  return GetMetalColorTargetPixelFormat(GetColorTargetStorageStrategy(format).kind,
+                                        pixel_format_out);
+}
+
+bool GetProbeColorTargetPixelFormat(const ProbeColorTargetState& state,
+                                    MTLPixelFormat& pixel_format_out) {
+  ColorTargetStorageKind required_storage =
+      GetColorTargetStorageStrategy(state.color_format).kind;
+  return state.metal_storage == required_storage &&
+         GetMetalColorTargetPixelFormat(state.metal_storage, pixel_format_out);
+}
 
 MTLPrimitiveType ToMetalPrimitiveType(uint32_t primitive_type) {
   switch (primitive_type) {
@@ -673,7 +705,7 @@ bool ValidateMslSource(void* metal_device, const std::string& source, std::strin
 
 void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* fragment_library,
                                 std::string* error_out,
-                                const ProbeColorTargetState* color_target_state,
+                                const ProbeRenderPipelineDescription* pipeline_description,
                                 void* binary_archive,
                                 RenderPipelineCacheTelemetry* cache_telemetry_out,
                                 uint32_t sample_count) {
@@ -714,10 +746,42 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
   descriptor.rasterSampleCount = sample_count;
   descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-  MTLRenderPipelineColorAttachmentDescriptor* color_attachment = descriptor.colorAttachments[0];
-  color_attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
-  if (color_target_state) {
-    uint32_t write_mask = color_target_state->write_mask & 0xF;
+  ProbeRenderPipelineDescription default_description;
+  const ProbeRenderPipelineDescription& color_description =
+      pipeline_description ? *pipeline_description : default_description;
+  if (!color_description.output_mask ||
+      (color_description.output_mask & ~((uint32_t(1) << xenos::kMaxColorRenderTargets) - 1))) {
+    [descriptor release];
+    [vertex_function release];
+    [fragment_function release];
+    if (error_out) {
+      *error_out = "Metal render-pipeline output mask is empty or out of range";
+    }
+    return nullptr;
+  }
+
+  for (uint32_t attachment_index = 0;
+       attachment_index < xenos::kMaxColorRenderTargets; ++attachment_index) {
+    if (!(color_description.output_mask & (uint32_t(1) << attachment_index))) {
+      continue;
+    }
+    const ProbeColorTargetState& color_target_state =
+        color_description.color_targets[attachment_index];
+    MTLRenderPipelineColorAttachmentDescriptor* color_attachment =
+        descriptor.colorAttachments[attachment_index];
+    MTLPixelFormat color_pixel_format = MTLPixelFormatInvalid;
+    if (!GetProbeColorTargetPixelFormat(color_target_state, color_pixel_format)) {
+      [descriptor release];
+      [vertex_function release];
+      [fragment_function release];
+      if (error_out) {
+        *error_out = "Metal render-pipeline color slot has an unsupported or mismatched "
+                     "guest/storage format";
+      }
+      return nullptr;
+    }
+    color_attachment.pixelFormat = color_pixel_format;
+    uint32_t write_mask = color_target_state.write_mask & 0xF;
     MTLColorWriteMask metal_write_mask = MTLColorWriteMaskNone;
     if (write_mask & 0x1) {
       metal_write_mask |= MTLColorWriteMaskRed;
@@ -733,7 +797,7 @@ void* CreateRenderPipelineState(void* metal_device, void* vertex_library, void* 
     }
     color_attachment.writeMask = metal_write_mask;
 
-    uint32_t blend_control = color_target_state->blend_control & 0x1FFF1FFF;
+    uint32_t blend_control = color_target_state.blend_control & 0x1FFF1FFF;
     uint32_t color_source = blend_control & 0x1F;
     uint32_t color_operation = (blend_control >> 5) & 0x7;
     uint32_t color_destination = (blend_control >> 8) & 0x1F;
@@ -825,11 +889,53 @@ void ReleaseRenderPipelineState(void* pipeline_state) {
 
 namespace {
 
-constexpr uint32_t kMaxProbeDrawsPerCommandBuffer = 64;
+// Keep the number of Metal command buffers and upload arenas fixed. The draw
+// batch is selectable only in the developer harness for controlled performance
+// comparisons; the short allow-list keeps the queue bound and matrix explicit.
+constexpr uint32_t kDefaultMaxProbeDrawsPerCommandBuffer = 128;
 constexpr uint32_t kMaxCommittedProbeCommandBuffers = 4;
 constexpr size_t kProbeUploadAlignment = 256;
 constexpr size_t kProbeUploadChunkSize = 1 << 20;
 constexpr uint32_t kInvalidProbeUploadArena = UINT32_MAX;
+std::atomic<uint64_t> g_next_probe_context_identity{1};
+
+uint32_t GetMaxProbeDrawsPerCommandBuffer() {
+  static const uint32_t value = []() {
+    uint32_t selected = kDefaultMaxProbeDrawsPerCommandBuffer;
+    const char* source = "release-default";
+#if defined(REXGLUE_ENABLE_INPUT_TEST_HARNESS)
+    source = "harness-default";
+    const char* configured =
+        std::getenv("GOLDENEYE_METAL_PROBE_DRAWS_PER_COMMAND_BUFFER");
+    if (configured && configured[0]) {
+      char* end = nullptr;
+      errno = 0;
+      unsigned long parsed = std::strtoul(configured, &end, 10);
+      if (!errno && end && !end[0] &&
+          (parsed == 64 || parsed == 128 || parsed == 256)) {
+        selected = uint32_t(parsed);
+        source = "harness-environment";
+      } else {
+        source = "harness-invalid-defaulted";
+      }
+    }
+#else
+    if (const char* configured =
+            std::getenv("GOLDENEYE_METAL_PROBE_DRAWS_PER_COMMAND_BUFFER");
+        configured && configured[0]) {
+      source = "release-environment-ignored";
+    }
+#endif
+    std::fprintf(stderr,
+                 "[metal] probe submission configuration "
+                 "draws_per_command_buffer=%u committed_command_buffer_cap=%u "
+                 "source=%s\n",
+                 selected, kMaxCommittedProbeCommandBuffers, source);
+    std::fflush(stderr);
+    return selected;
+  }();
+  return value;
+}
 
 uint32_t GetTiledRgba8Offset(uint32_t x, uint32_t y, uint32_t pitch) {
   pitch = (pitch + 31u) & ~31u;
@@ -922,6 +1028,13 @@ struct PipelineProbeContext {
   id<MTLTexture> depth_resolve_dummy_snapshot_texture = nil;
   id<MTLTexture> depth_resolve_dummy_packed_snapshot_texture = nil;
   MTLStorageMode storage_mode = MTLStorageModeShared;
+  xenos::ColorRenderTargetFormat color_format =
+      xenos::ColorRenderTargetFormat::k_8_8_8_8;
+  MTLPixelFormat color_pixel_format = MTLPixelFormatBGRA8Unorm;
+  // Exact guest words live independently of the native render texture. Raw-
+  // only formats can be restored and exported through this owner, but are not
+  // rasterizable until an exact Xenos output-merger path exists.
+  RawColorSidecar raw_color_sidecar;
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t sample_count = 1;
@@ -933,6 +1046,7 @@ struct PipelineProbeContext {
   // valid across RenderPipelineProbeToContext's per-call autorelease pools.
   id<MTLCommandBuffer> open_command_buffer = nil;
   id<MTLRenderCommandEncoder> open_render_encoder = nil;
+  uint32_t open_color_attachment_index = 0;
   uint32_t open_draw_submission_count = 0;
   uint32_t open_upload_arena_index = kInvalidProbeUploadArena;
   // Bindings persist within an encoder. Track everything optional so each draw
@@ -951,7 +1065,41 @@ struct PipelineProbeContext {
   // and bound by offset without allocating an MTLBuffer for every argument.
   ProbeUploadArena upload_arenas[kMaxCommittedProbeCommandBuffers];
   PipelineProbeUploadStats upload_stats;
+  PipelineProbeSubmissionStats submission_stats;
 };
+
+bool ConvertProbeRawColorToBgra(const PipelineProbeContext* context,
+                                std::vector<uint8_t>& bytes, std::string* error_out) {
+  if (!context || (bytes.size() & 3)) {
+    if (error_out) {
+      *error_out = "invalid raw probe color byte stream";
+    }
+    return false;
+  }
+  switch (GetColorTargetStorageStrategy(context->color_format).kind) {
+    case ColorTargetStorageKind::kBgra8Unorm:
+      return true;
+    case ColorTargetStorageKind::kRgb10A2Unorm:
+      for (size_t offset = 0; offset < bytes.size(); offset += 4) {
+        uint32_t packed;
+        std::memcpy(&packed, bytes.data() + offset, sizeof(packed));
+        uint32_t red = packed & 0x3FF;
+        uint32_t green = (packed >> 10) & 0x3FF;
+        uint32_t blue = (packed >> 20) & 0x3FF;
+        uint32_t alpha = packed >> 30;
+        bytes[offset + 0] = uint8_t((blue * 255 + 511) / 1023);
+        bytes[offset + 1] = uint8_t((green * 255 + 511) / 1023);
+        bytes[offset + 2] = uint8_t((red * 255 + 511) / 1023);
+        bytes[offset + 3] = uint8_t((alpha * 255 + 1) / 3);
+      }
+      return true;
+    default:
+      if (error_out) {
+        *error_out = "raw probe color conversion has no supported storage strategy";
+      }
+      return false;
+  }
+}
 
 ProbeDepthStencilTarget* CreateProbeDepthStencilTarget(PipelineProbeContext* context) {
   if (!context || !context->device || !context->command_queue) {
@@ -1014,6 +1162,7 @@ void InvalidateProbeContextTargets(PipelineProbeContext* context) {
   }
   context->initialized = false;
   context->color_resolve_dirty = false;
+  context->raw_color_sidecar.Invalidate();
   if (context->depth_stencil_target) {
     context->depth_stencil_target->initialized = false;
   }
@@ -1025,6 +1174,56 @@ void InvalidateProbeContextColorTarget(PipelineProbeContext* context) {
   }
   context->initialized = false;
   context->color_resolve_dirty = false;
+  context->raw_color_sidecar.Invalidate();
+}
+
+void RecordProbeContextNativeColorWrite(PipelineProbeContext* context) {
+  if (context) {
+    context->raw_color_sidecar.RecordNativeWrite();
+  }
+}
+
+bool GetProbeMsaaSamples(uint32_t sample_count, xenos::MsaaSamples& msaa_samples_out) {
+  switch (sample_count) {
+    case 1:
+      msaa_samples_out = xenos::MsaaSamples::k1X;
+      return true;
+    case 2:
+      msaa_samples_out = xenos::MsaaSamples::k2X;
+      return true;
+    case 4:
+      msaa_samples_out = xenos::MsaaSamples::k4X;
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool EnsureProbeRawColorSidecar(PipelineProbeContext* context, uint32_t width,
+                                uint32_t height, std::string* error_out) {
+  xenos::MsaaSamples msaa_samples;
+  if (!context || !width || !height ||
+      !CanRawColorSidecarStoreCanonicalLosslessly(context->color_format) ||
+      !GetProbeMsaaSamples(context->sample_count, msaa_samples)) {
+    if (error_out) {
+      *error_out = "persistent color target has no lossless raw sidecar layout";
+    }
+    return false;
+  }
+  const RawColorSidecarKey expected = {
+      context->color_format, msaa_samples, width, height};
+  if (context->raw_color_sidecar.configured() &&
+      context->raw_color_sidecar.key() == expected) {
+    return true;
+  }
+  if (!context->raw_color_sidecar.Configure(context->color_format, width, height,
+                                             msaa_samples)) {
+    if (error_out) {
+      *error_out = "persistent color target raw sidecar extent is invalid or aliases itself";
+    }
+    return false;
+  }
+  return true;
 }
 
 struct TiledResolveConstants {
@@ -1045,6 +1244,7 @@ struct MultisampleSelectResolveConstants {
   uint32_t copy_height;
   uint32_t destination_row_pitch;
   uint32_t host_sample_mask;
+  uint32_t storage_kind;
 };
 
 struct DepthTiledResolveConstants {
@@ -1083,8 +1283,9 @@ void ConfigureProbeDepthStencilPass(MTLRenderPassDescriptor* pass,
 }
 
 void ConfigureProbeColorPass(MTLRenderPassDescriptor* pass, PipelineProbeContext* context,
-                             MTLLoadAction load_action, MTLClearColor clear_color) {
-  MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[0];
+                             MTLLoadAction load_action, MTLClearColor clear_color,
+                             uint32_t attachment_index = 0) {
+  MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[attachment_index];
   color.texture =
       context->sample_count > 1 ? context->multisample_render_texture : context->render_texture;
   color.loadAction = load_action;
@@ -1324,6 +1525,7 @@ struct MultisampleSelectResolveConstants {
   uint copy_height;
   uint destination_row_pitch;
   uint host_sample_mask;
+  uint storage_kind;
 };
 
 kernel void resolve_selected_color_samples(
@@ -1343,12 +1545,22 @@ kernel void resolve_selected_color_samples(
     }
   }
   rgba /= float(max(selected_count, 1u));
-  uchar4 bgra = uchar4(clamp(rint(rgba.zyxw * 255.0f), 0.0f, 255.0f));
   uint destination_offset = position.y * constants.destination_row_pitch + position.x * 4u;
-  destination[destination_offset] = bgra.x;
-  destination[destination_offset + 1u] = bgra.y;
-  destination[destination_offset + 2u] = bgra.z;
-  destination[destination_offset + 3u] = bgra.w;
+  if (constants.storage_kind == 2u) {  // ColorTargetStorageKind::kRgb10A2Unorm.
+    uint4 unorm = uint4(clamp(rint(rgba * float4(1023.0f, 1023.0f, 1023.0f, 3.0f)),
+                             0.0f, float4(1023.0f, 1023.0f, 1023.0f, 3.0f)));
+    uint packed = unorm.x | (unorm.y << 10u) | (unorm.z << 20u) | (unorm.w << 30u);
+    destination[destination_offset] = uchar(packed);
+    destination[destination_offset + 1u] = uchar(packed >> 8u);
+    destination[destination_offset + 2u] = uchar(packed >> 16u);
+    destination[destination_offset + 3u] = uchar(packed >> 24u);
+  } else {
+    uchar4 bgra = uchar4(clamp(rint(rgba.zyxw * 255.0f), 0.0f, 255.0f));
+    destination[destination_offset] = bgra.x;
+    destination[destination_offset + 1u] = bgra.y;
+    destination[destination_offset + 2u] = bgra.z;
+    destination[destination_offset + 3u] = bgra.w;
+  }
 }
 )MSL";
 
@@ -1926,6 +2138,18 @@ uint32_t GetCommittedProbeDrawCommandBufferCount(const PipelineProbeContext* con
   return command_buffer_count;
 }
 
+void UpdateProbeSubmissionHighWatermarks(PipelineProbeContext* context) {
+  if (!context) {
+    return;
+  }
+  context->submission_stats.peak_committed_draw_command_buffer_count = std::max(
+      context->submission_stats.peak_committed_draw_command_buffer_count,
+      GetCommittedProbeDrawCommandBufferCount(context));
+  context->submission_stats.peak_pending_submission_count =
+      std::max(context->submission_stats.peak_pending_submission_count,
+               GetPendingProbeSubmissionCount(context));
+}
+
 bool FinalizeOpenPipelineProbeCommandBuffer(PipelineProbeContext* context, std::string* error_out) {
   if (!context->open_command_buffer && !context->open_render_encoder) {
     ReleaseOpenProbeDepthStencilOwnership(context);
@@ -1969,6 +2193,8 @@ bool FinalizeOpenPipelineProbeCommandBuffer(PipelineProbeContext* context, std::
   ResetOpenProbeBindingTracking(context);
   context->committed_command_buffers.push_back(committed);
   [committed.command_buffer commit];
+  ++context->submission_stats.draw_command_buffer_commit_count;
+  UpdateProbeSubmissionHighWatermarks(context);
   [encoder release];
   return true;
 }
@@ -2079,6 +2305,28 @@ bool ConsumeOldestPipelineProbeCommand(PipelineProbeContext* context, std::strin
   return succeeded;
 }
 
+bool ReclaimCompletedPipelineProbeCommands(PipelineProbeContext* context,
+                                           std::string* error_out) {
+  if (!context) {
+    if (error_out) {
+      *error_out = "missing probe context";
+    }
+    return false;
+  }
+  while (!context->committed_command_buffers.empty()) {
+    MTLCommandBufferStatus status =
+        [context->committed_command_buffers.front().command_buffer status];
+    if (status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError) {
+      break;
+    }
+    if (!ConsumeOldestPipelineProbeCommand(context, error_out)) {
+      return false;
+    }
+    ++context->submission_stats.nonblocking_completed_command_buffer_reclamation_count;
+  }
+  return true;
+}
+
 bool WaitOldestPipelineProbeCommand(PipelineProbeContext* context, std::string* error_out) {
   if (!context) {
     if (error_out) {
@@ -2093,8 +2341,43 @@ bool WaitOldestPipelineProbeCommand(PipelineProbeContext* context, std::string* 
   if (context->committed_command_buffers.empty()) {
     return true;
   }
+  // Completion may race the completed-prefix poll at the backpressure call
+  // site. Recheck immediately before measuring a blocking wait so telemetry
+  // doesn't classify a no-op waitUntilCompleted as render-thread blocking.
+  MTLCommandBufferStatus oldest_status =
+      [context->committed_command_buffers.front().command_buffer status];
+  if (oldest_status == MTLCommandBufferStatusCompleted ||
+      oldest_status == MTLCommandBufferStatusError) {
+    bool succeeded = ConsumeOldestPipelineProbeCommand(context, error_out);
+    if (succeeded) {
+      ++context->submission_stats.nonblocking_completed_command_buffer_reclamation_count;
+    }
+    return succeeded;
+  }
+  ++context->submission_stats.blocking_backpressure_wait_count;
+  uint64_t wait_start_ns = PipelineCacheNowNs();
   [context->committed_command_buffers.front().command_buffer waitUntilCompleted];
+  context->submission_stats.blocking_backpressure_wait_ns +=
+      PipelineCacheNowNs() - wait_start_ns;
   return ConsumeOldestPipelineProbeCommand(context, error_out);
+}
+
+bool RelievePipelineProbeBackpressure(PipelineProbeContext* context, std::string* error_out) {
+  if (!context) {
+    if (error_out) {
+      *error_out = "missing probe context";
+    }
+    return false;
+  }
+  ++context->submission_stats.backpressure_check_count;
+  if (!ReclaimCompletedPipelineProbeCommands(context, error_out)) {
+    return false;
+  }
+  if (GetCommittedProbeDrawCommandBufferCount(context) <
+      kMaxCommittedProbeCommandBuffers) {
+    return true;
+  }
+  return WaitOldestPipelineProbeCommand(context, error_out);
 }
 
 bool WaitPendingPipelineProbeCommands(PipelineProbeContext* context, std::string* error_out,
@@ -2223,15 +2506,29 @@ bool EnsureProbeDepthStencilTexture(PipelineProbeContext* context, uint32_t widt
   return true;
 }
 
-bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* error_out) {
-  if (context->open_command_buffer && context->open_render_encoder) {
-    if (context->depth_stencil_target && context->depth_stencil_target->open_owner == context) {
-      return true;
-    }
+bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* error_out,
+                                    uint32_t color_attachment_index = 0) {
+  if (color_attachment_index >= xenos::kMaxColorRenderTargets) {
     if (error_out) {
-      *error_out = "persistent probe encoder lost shared depth/stencil ownership";
+      *error_out = "persistent probe color attachment index is out of range";
     }
     return false;
+  }
+  if (context->open_command_buffer && context->open_render_encoder) {
+    if (context->depth_stencil_target && context->depth_stencil_target->open_owner == context &&
+        context->open_color_attachment_index == color_attachment_index) {
+      return true;
+    }
+    if (context->open_color_attachment_index != color_attachment_index) {
+      if (!FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
+        return false;
+      }
+    } else {
+      if (error_out) {
+        *error_out = "persistent probe encoder lost shared depth/stencil ownership";
+      }
+      return false;
+    }
   }
   if (context->open_command_buffer || context->open_render_encoder) {
     FinalizeOpenPipelineProbeCommandBuffer(context, error_out);
@@ -2239,11 +2536,18 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
   }
 
   uint32_t upload_arena_index = AcquireProbeUploadArena(context);
+  if (upload_arena_index == kInvalidProbeUploadArena &&
+      !ReclaimCompletedPipelineProbeCommands(context, error_out)) {
+    return false;
+  }
+  if (upload_arena_index == kInvalidProbeUploadArena) {
+    upload_arena_index = AcquireProbeUploadArena(context);
+  }
   while (upload_arena_index == kInvalidProbeUploadArena &&
          !context->committed_command_buffers.empty()) {
-    // Keep three command buffers in flight while recycling only the oldest
-    // draw arena. Auxiliary resolve buffers don't own arenas, so consume
-    // completed queue entries until an actual draw arena becomes reusable.
+    // Auxiliary resolve buffers don't own arenas, so consume ordered queue
+    // entries until an actual draw arena becomes reusable. Reuse still waits
+    // for completion when the completed-prefix poll above could not free one.
     if (!WaitOldestPipelineProbeCommand(context, error_out)) {
       return false;
     }
@@ -2274,7 +2578,7 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
   MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
   ConfigureProbeColorPass(pass, context,
                           context->initialized ? MTLLoadActionLoad : MTLLoadActionClear,
-                          MTLClearColorMake(0.0, 0.0, 0.0, 1.0));
+                          MTLClearColorMake(0.0, 0.0, 0.0, 1.0), color_attachment_index);
   ProbeDepthStencilTarget* depth_stencil_target = context->depth_stencil_target;
   ConfigureProbeDepthStencilPass(
       pass, depth_stencil_target->texture,
@@ -2293,6 +2597,7 @@ bool EnsureOpenPipelineProbeEncoder(PipelineProbeContext* context, std::string* 
   context->open_render_encoder = [encoder retain];
   context->open_draw_submission_count = 0;
   context->open_upload_arena_index = upload_arena_index;
+  context->open_color_attachment_index = color_attachment_index;
   ResetOpenProbeBindingTracking(context);
   return true;
 }
@@ -2383,6 +2688,14 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
     }
     return false;
   }
+  if (context->color_pixel_format == MTLPixelFormatInvalid ||
+      !IsNativeColorTargetStorageSupported(context->color_format)) {
+    if (error_out) {
+      *error_out =
+          "persistent color format has exact raw storage but no exact Metal raster path";
+    }
+    return false;
+  }
   if (!EnsureProbeDepthStencilTexture(context, width, height, error_out)) {
     return false;
   }
@@ -2394,6 +2707,9 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
   if (!WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
     return false;
   }
+  // Replacing native storage makes any native-authoritative raw cache stale.
+  // Canonical restore configures and fills the sidecar after this step.
+  context->raw_color_sidecar.Invalidate();
   if (context->render_texture) {
     [context->render_texture release];
     context->render_texture = nil;
@@ -2403,7 +2719,7 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
     context->multisample_render_texture = nil;
   }
   MTLTextureDescriptor* texture_descriptor =
-      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:context->color_pixel_format
                                                          width:width
                                                         height:height
                                                      mipmapped:NO];
@@ -2413,7 +2729,7 @@ bool EnsureProbeContextTexture(PipelineProbeContext* context, uint32_t width, ui
   context->render_texture = [context->device newTextureWithDescriptor:texture_descriptor];
   if (context->render_texture && context->sample_count > 1) {
     MTLTextureDescriptor* multisample_descriptor =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:context->color_pixel_format
                                                            width:width
                                                           height:height
                                                        mipmapped:NO];
@@ -2510,7 +2826,7 @@ fragment float4 rex_clear_fragment(constant ClearConstants& constants [[buffer(0
   descriptor.vertexFunction = vertex_function;
   descriptor.fragmentFunction = fragment_function;
   descriptor.rasterSampleCount = context->sample_count;
-  descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  descriptor.colorAttachments[0].pixelFormat = context->color_pixel_format;
   descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   context->clear_pipeline_state = [context->device newRenderPipelineStateWithDescriptor:descriptor
@@ -2577,7 +2893,7 @@ fragment float4 rex_depth_clear_fragment() {
   descriptor.vertexFunction = vertex_function;
   descriptor.fragmentFunction = fragment_function;
   descriptor.rasterSampleCount = context->sample_count;
-  descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  descriptor.colorAttachments[0].pixelFormat = context->color_pixel_format;
   descriptor.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
   descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
   descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
@@ -2617,6 +2933,8 @@ void* CreatePersistentRenderContext(void* metal_device, void* metal_command_queu
     return nullptr;
   }
   auto* context = new PipelineProbeContext();
+  context->submission_stats.context_identity =
+      g_next_probe_context_identity.fetch_add(1, std::memory_order_relaxed);
   context->committed_command_buffers.reserve(kMaxCommittedProbeCommandBuffers);
   context->device = [(id<MTLDevice>)metal_device retain];
   context->storage_mode = storage_mode;
@@ -2792,11 +3110,72 @@ bool SetPipelineProbeContextSampleCount(void* opaque_context, uint32_t sample_co
     context->height = 0;
     context->initialized = false;
     context->color_resolve_dirty = false;
+    context->raw_color_sidecar.Reset();
     target->sample_count = sample_count;
     target->width = 0;
     target->height = 0;
     target->initialized = false;
     target->extent_locked = false;
+    return true;
+  }
+}
+
+bool SetPipelineProbeContextColorFormat(void* opaque_context,
+                                        xenos::ColorRenderTargetFormat color_format,
+                                        std::string* error_out) {
+  @autoreleasepool {
+    auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+    MTLPixelFormat pixel_format = MTLPixelFormatInvalid;
+    if (!context || !context->device) {
+      if (error_out) {
+        *error_out = "missing persistent probe context";
+      }
+      return false;
+    }
+    const bool has_native_storage =
+        GetMetalColorTargetPixelFormat(color_format, pixel_format) &&
+        IsNativeColorTargetStorageSupported(color_format);
+    const bool has_raw_storage =
+        CanRawColorSidecarStoreCanonicalLosslessly(color_format);
+    if (!has_native_storage && !has_raw_storage) {
+      if (error_out) {
+        *error_out = "unsupported Xenos color format for native or raw Metal target storage";
+      }
+      return false;
+    }
+    if (!has_native_storage) {
+      pixel_format = MTLPixelFormatInvalid;
+    }
+    if (context->color_format == color_format &&
+        context->color_pixel_format == pixel_format) {
+      return true;
+    }
+    if (!WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
+      return false;
+    }
+    if (context->render_texture) {
+      [context->render_texture release];
+      context->render_texture = nil;
+    }
+    if (context->multisample_render_texture) {
+      [context->multisample_render_texture release];
+      context->multisample_render_texture = nil;
+    }
+    if (context->clear_pipeline_state) {
+      [context->clear_pipeline_state release];
+      context->clear_pipeline_state = nil;
+    }
+    if (context->depth_clear_pipeline_state) {
+      [context->depth_clear_pipeline_state release];
+      context->depth_clear_pipeline_state = nil;
+    }
+    context->color_format = color_format;
+    context->color_pixel_format = pixel_format;
+    context->width = 0;
+    context->height = 0;
+    context->initialized = false;
+    context->color_resolve_dirty = false;
+    context->raw_color_sidecar.Reset();
     return true;
   }
 }
@@ -2977,6 +3356,20 @@ bool GetPipelineProbeContextUploadStats(void* opaque_context, PipelineProbeUploa
   return true;
 }
 
+bool GetPipelineProbeContextSubmissionStats(void* opaque_context,
+                                            PipelineProbeSubmissionStats* stats_out) {
+  auto* context = static_cast<PipelineProbeContext*>(opaque_context);
+  if (!context || !stats_out) {
+    return false;
+  }
+  *stats_out = context->submission_stats;
+  stats_out->max_draws_per_command_buffer =
+      GetMaxProbeDrawsPerCommandBuffer();
+  stats_out->max_committed_draw_command_buffer_count =
+      kMaxCommittedProbeCommandBuffers;
+  return true;
+}
+
 uint64_t GetPipelineProbeContextMultisampleResolveCount(void* opaque_context) {
   auto* context = static_cast<PipelineProbeContext*>(opaque_context);
   return context ? context->multisample_resolve_count : 0;
@@ -3151,10 +3544,14 @@ bool ClearPipelineProbeContext(void* opaque_context, uint32_t width, uint32_t he
     if (succeeded) {
       context->initialized = true;
       context->color_resolve_dirty = context->sample_count > 1;
+      RecordProbeContextNativeColorWrite(context);
       context->depth_stencil_target->initialized = true;
-    } else if (error_out) {
-      NSError* error = [command_buffer error];
-      *error_out = error ? [[error localizedDescription] UTF8String] : "command buffer failed";
+    } else {
+      InvalidateProbeContextTargets(context);
+      if (error_out) {
+        NSError* error = [command_buffer error];
+        *error_out = error ? [[error localizedDescription] UTF8String] : "command buffer failed";
+      }
     }
     return succeeded;
   }
@@ -3241,10 +3638,14 @@ bool ClearPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_
     if (succeeded) {
       context->initialized = true;
       context->color_resolve_dirty = context->sample_count > 1;
+      RecordProbeContextNativeColorWrite(context);
       context->depth_stencil_target->initialized = true;
-    } else if (error_out) {
-      NSError* error = [command_buffer error];
-      *error_out = error ? [[error localizedDescription] UTF8String] : "command buffer failed";
+    } else {
+      InvalidateProbeContextTargets(context);
+      if (error_out) {
+        NSError* error = [command_buffer error];
+        *error_out = error ? [[error localizedDescription] UTF8String] : "command buffer failed";
+      }
     }
     [constants_buffer release];
     return succeeded;
@@ -3315,14 +3716,16 @@ bool QueuePipelineProbeContextClearRect(void* opaque_context, uint32_t width, ui
     ++context->open_draw_submission_count;
     context->initialized = true;
     context->color_resolve_dirty = context->sample_count > 1;
+    RecordProbeContextNativeColorWrite(context);
     context->depth_stencil_target->initialized = true;
 
-    if (context->open_draw_submission_count >= kMaxProbeDrawsPerCommandBuffer &&
+    if (context->open_draw_submission_count >=
+            GetMaxProbeDrawsPerCommandBuffer() &&
         !FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
       return false;
     }
     if (GetCommittedProbeDrawCommandBufferCount(context) >= kMaxCommittedProbeCommandBuffers) {
-      return WaitOldestPipelineProbeCommand(context, error_out);
+      return RelievePipelineProbeBackpressure(context, error_out);
     }
     return true;
   }
@@ -3402,14 +3805,16 @@ bool QueuePipelineProbeContextDepthStencilClearRect(void* opaque_context, uint32
     // attachment through the render pass clear. Make that deterministic black
     // initialization visible to any immediate single-sample read or resolve.
     context->color_resolve_dirty = context->sample_count > 1;
+    RecordProbeContextNativeColorWrite(context);
     context->depth_stencil_target->initialized = true;
 
-    if (context->open_draw_submission_count >= kMaxProbeDrawsPerCommandBuffer &&
+    if (context->open_draw_submission_count >=
+            GetMaxProbeDrawsPerCommandBuffer() &&
         !FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
       return false;
     }
     if (GetCommittedProbeDrawCommandBufferCount(context) >= kMaxCommittedProbeCommandBuffers) {
-      return WaitOldestPipelineProbeCommand(context, error_out);
+      return RelievePipelineProbeBackpressure(context, error_out);
     }
     return true;
   }
@@ -3434,7 +3839,7 @@ bool RenderPipelineProbeToContext(
     uint32_t fragment_bool_loop_constants_buffer_index, const ProbeIndexBuffer* index_buffer,
     const ProbeRasterizationState* rasterization_state,
     const ProbeDepthStencilState* depth_stencil_state,
-    uint32_t fragment_shared_memory_buffer_index) {
+    uint32_t fragment_shared_memory_buffer_index, uint32_t color_attachment_index) {
   @autoreleasepool {
     auto* context = static_cast<PipelineProbeContext*>(opaque_context);
     if (!context || !pipeline_state || !system_constants || !system_constants_size || !width ||
@@ -3467,7 +3872,7 @@ bool RenderPipelineProbeToContext(
       return false;
     }
 
-    if (!EnsureOpenPipelineProbeEncoder(context, error_out)) {
+    if (!EnsureOpenPipelineProbeEncoder(context, error_out, color_attachment_index)) {
       return false;
     }
 
@@ -3706,6 +4111,7 @@ bool RenderPipelineProbeToContext(
     ++context->open_draw_submission_count;
     context->initialized = true;
     context->color_resolve_dirty = context->sample_count > 1;
+    RecordProbeContextNativeColorWrite(context);
     context->depth_stencil_target->initialized = true;
 
     // Normal command buffers retain every encoded resource. Release resources
@@ -3719,7 +4125,8 @@ bool RenderPipelineProbeToContext(
     bool raw_nocopy_buffer_bound = !shared_memory_metal_buffer && shared_memory &&
                                    (vertex_shared_memory_buffer_index != UINT32_MAX ||
                                     fragment_shared_memory_buffer_index != UINT32_MAX);
-    if (context->open_draw_submission_count >= kMaxProbeDrawsPerCommandBuffer &&
+    if (context->open_draw_submission_count >=
+            GetMaxProbeDrawsPerCommandBuffer() &&
         !FinalizeOpenPipelineProbeCommandBuffer(context, error_out)) {
       return false;
     }
@@ -3729,15 +4136,562 @@ bool RenderPipelineProbeToContext(
       return WaitPendingPipelineProbeCommands(context, error_out, nullptr);
     }
     if (committed_limit_reached) {
-      return WaitOldestPipelineProbeCommand(context, error_out);
+      return RelievePipelineProbeBackpressure(context, error_out);
     }
     return true;
   }
 }
 
-bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t height, uint32_t x,
-                                  uint32_t y, uint32_t read_width, uint32_t read_height,
-                                  std::vector<uint8_t>& bgra_out, std::string* error_out) {
+bool RenderPipelineProbeMrtToContexts(
+    const std::array<void*, xenos::kMaxColorRenderTargets>& opaque_contexts,
+    const ProbeRenderPipelineDescription& pipeline_description, void* opaque_pipeline_state,
+    uint32_t width, uint32_t height, const PipelineProbeMrtDraw& draw,
+    PipelineProbeMrtTelemetry* telemetry_out, std::string* error_out) {
+  @autoreleasepool {
+    if (telemetry_out) {
+      *telemetry_out = {};
+    }
+    if (error_out) {
+      error_out->clear();
+    }
+    const uint32_t valid_output_mask =
+        (uint32_t(1) << xenos::kMaxColorRenderTargets) - 1;
+    uint32_t output_mask = pipeline_description.output_mask;
+    auto reject = [&](const char* message) {
+      if (error_out) {
+        *error_out = message;
+      }
+      return false;
+    };
+    if (!opaque_pipeline_state || !width || !height || !draw.vertex_count || !output_mask ||
+        (output_mask & ~valid_output_mask)) {
+      return reject("missing MRT pipeline, draw, target dimensions, or valid output mask");
+    }
+    if (!IsProbeIndexBufferValid(draw.index_buffer, draw.vertex_count)) {
+      return reject("invalid MRT index buffer");
+    }
+    if (!IsProbeRasterizationStateValid(draw.rasterization_state, width, height)) {
+      return reject("invalid MRT rasterization state");
+    }
+    if (!IsProbeDepthStencilStateValid(draw.depth_stencil_state)) {
+      return reject("invalid MRT depth/stencil state");
+    }
+    auto optional_data_valid = [](const void* data, size_t size) {
+      return (data != nullptr) == (size != 0);
+    };
+    if (!optional_data_valid(draw.system_constants, draw.system_constants_size) ||
+        !optional_data_valid(draw.vertex_float_constants,
+                             draw.vertex_float_constants_size) ||
+        !optional_data_valid(draw.fragment_float_constants,
+                             draw.fragment_float_constants_size) ||
+        !optional_data_valid(draw.fetch_constants, draw.fetch_constants_size) ||
+        !optional_data_valid(draw.bool_loop_constants, draw.bool_loop_constants_size) ||
+        !optional_data_valid(draw.vertex_data, draw.vertex_data_size) ||
+        !optional_data_valid(draw.shared_memory, draw.shared_memory_size)) {
+      return reject("MRT draw contains an incomplete CPU data span");
+    }
+
+    std::array<PipelineProbeContext*, xenos::kMaxColorRenderTargets> contexts = {};
+    PipelineProbeContext* first_context = nullptr;
+    uint32_t active_count = 0;
+    for (uint32_t slot = 0; slot < xenos::kMaxColorRenderTargets; ++slot) {
+      bool active = (output_mask & (uint32_t(1) << slot)) != 0;
+      auto* context = static_cast<PipelineProbeContext*>(opaque_contexts[slot]);
+      if (active != (context != nullptr)) {
+        return reject(active ? "MRT output slot has no persistent color context"
+                             : "inactive MRT output slot has an unexpected color context");
+      }
+      if (!active) {
+        continue;
+      }
+      for (uint32_t previous = 0; previous < slot; ++previous) {
+        if (contexts[previous] == context) {
+          return reject("MRT color context aliases another output slot");
+        }
+      }
+      contexts[slot] = context;
+      ++active_count;
+      if (!context->device || !context->command_queue || !context->depth_stencil_target) {
+        return reject("MRT color context is missing its Metal device, queue, or depth target");
+      }
+      MTLPixelFormat expected_pixel_format = MTLPixelFormatInvalid;
+      const ProbeColorTargetState& target_state = pipeline_description.color_targets[slot];
+      if (!GetProbeColorTargetPixelFormat(target_state, expected_pixel_format) ||
+          context->color_format != target_state.color_format ||
+          context->color_pixel_format != expected_pixel_format) {
+        return reject("MRT context color format does not match its pipeline slot");
+      }
+      if ((context->width && context->width != width) ||
+          (context->height && context->height != height)) {
+        return reject("MRT context dimensions do not match the requested render extent");
+      }
+      if (!first_context) {
+        first_context = context;
+      } else {
+        if (context->device != first_context->device) {
+          return reject("MRT contexts belong to different Metal devices");
+        }
+        if (context->command_queue != first_context->command_queue) {
+          return reject("MRT contexts belong to different Metal command queues");
+        }
+        if (context->sample_count != first_context->sample_count) {
+          return reject("MRT contexts use different raster sample counts");
+        }
+        if (context->depth_stencil_target != first_context->depth_stencil_target) {
+          return reject("MRT contexts do not share exactly one depth/stencil target");
+        }
+      }
+    }
+    if (!first_context || !active_count ||
+        first_context->depth_stencil_target->sample_count != first_context->sample_count) {
+      return reject("MRT context sample count and shared depth target are inconsistent");
+    }
+    if ([(id<MTLRenderPipelineState>)opaque_pipeline_state device] != first_context->device) {
+      return reject("MRT pipeline belongs to a different Metal device");
+    }
+    if (draw.shared_memory_metal_buffer &&
+        [(id<MTLBuffer>)draw.shared_memory_metal_buffer device] != first_context->device) {
+      return reject("MRT shared-memory buffer belongs to a different Metal device");
+    }
+    if (draw.shared_memory_metal_buffer && draw.shared_memory_size &&
+        [(id<MTLBuffer>)draw.shared_memory_metal_buffer length] < draw.shared_memory_size) {
+      return reject("MRT shared-memory buffer is smaller than its declared span");
+    }
+    if (draw.index_buffer && draw.index_buffer->metal_buffer) {
+      id<MTLBuffer> metal_index_buffer =
+          (id<MTLBuffer>)draw.index_buffer->metal_buffer;
+      if ([metal_index_buffer device] != first_context->device ||
+          [metal_index_buffer length] < draw.index_buffer->size) {
+        return reject("MRT index buffer device or declared span is invalid");
+      }
+    }
+    auto external_textures_match_device = [&](const ProbeTextureSlot* slots,
+                                              size_t slot_count) {
+      for (size_t slot = 0; slots && slot < slot_count; ++slot) {
+        if (slots[slot].metal_texture &&
+            [(id<MTLTexture>)slots[slot].metal_texture device] != first_context->device) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!external_textures_match_device(draw.vertex_textures,
+                                        draw.vertex_texture_count) ||
+        !external_textures_match_device(draw.fragment_textures,
+                                        draw.fragment_texture_count)) {
+      return reject("MRT sampled texture belongs to a different Metal device");
+    }
+
+    // This path is synchronous by design. Drain every participating context
+    // before borrowing its textures outside the normal per-context encoder.
+    for (PipelineProbeContext* context : contexts) {
+      if (context && !WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
+        return false;
+      }
+    }
+    for (PipelineProbeContext* context : contexts) {
+      if (context && !EnsureProbeContextTexture(context, width, height, error_out)) {
+        return false;
+      }
+    }
+
+    ProbeDepthStencilTarget* shared_depth = first_context->depth_stencil_target;
+    if (!shared_depth || !shared_depth->texture || shared_depth->width != width ||
+        shared_depth->height != height || shared_depth->sample_count != first_context->sample_count ||
+        shared_depth->open_owner) {
+      return reject("MRT shared depth/stencil attachment is incomplete or mismatched");
+    }
+    std::array<id<MTLTexture>, xenos::kMaxColorRenderTargets> bound_textures = {};
+    for (uint32_t slot = 0; slot < xenos::kMaxColorRenderTargets; ++slot) {
+      PipelineProbeContext* context = contexts[slot];
+      if (!context) {
+        continue;
+      }
+      id<MTLTexture> texture = context->sample_count > 1
+                                   ? context->multisample_render_texture
+                                   : context->render_texture;
+      if (!texture) {
+        return reject("MRT color attachment texture is unavailable");
+      }
+      for (uint32_t previous = 0; previous < slot; ++previous) {
+        if (bound_textures[previous] == texture) {
+          return reject("MRT color attachment texture aliases another output slot");
+        }
+      }
+      bound_textures[slot] = texture;
+    }
+    auto sampled_texture_aliases_attachment =
+        [&](const ProbeTextureSlot* slots, size_t slot_count) {
+          for (size_t sampled_slot = 0; slots && sampled_slot < slot_count;
+               ++sampled_slot) {
+            id<MTLTexture> sampled_texture =
+                (id<MTLTexture>)slots[sampled_slot].metal_texture;
+            if (!sampled_texture) {
+              continue;
+            }
+            if (sampled_texture == shared_depth->texture) {
+              return true;
+            }
+            for (id<MTLTexture> color_texture : bound_textures) {
+              if (sampled_texture == color_texture) {
+                return true;
+              }
+            }
+          }
+          return false;
+        };
+    if (sampled_texture_aliases_attachment(draw.vertex_textures,
+                                           draw.vertex_texture_count) ||
+        sampled_texture_aliases_attachment(draw.fragment_textures,
+                                           draw.fragment_texture_count)) {
+      return reject("MRT sampled texture aliases a color or depth render attachment");
+    }
+
+    if (!EnsureDummyProbeResources(first_context, error_out)) {
+      return false;
+    }
+
+    id<MTLDepthStencilState> metal_depth_stencil_state = nil;
+    if (!GetCachedProbeDepthStencilState(first_context, draw.depth_stencil_state,
+                                         metal_depth_stencil_state, error_out)) {
+      return false;
+    }
+
+    id<MTLDevice> device = first_context->device;
+    auto make_buffer = [device](const void* data, size_t size) -> id<MTLBuffer> {
+      return data && size ? [device newBufferWithBytes:data
+                                               length:size
+                                              options:MTLResourceStorageModeShared]
+                          : nil;
+    };
+    id<MTLBuffer> system_buffer =
+        make_buffer(draw.system_constants, draw.system_constants_size);
+    id<MTLBuffer> vertex_float_buffer =
+        make_buffer(draw.vertex_float_constants, draw.vertex_float_constants_size);
+    id<MTLBuffer> fragment_float_buffer =
+        make_buffer(draw.fragment_float_constants, draw.fragment_float_constants_size);
+    id<MTLBuffer> fetch_buffer = make_buffer(draw.fetch_constants, draw.fetch_constants_size);
+    id<MTLBuffer> bool_loop_buffer =
+        make_buffer(draw.bool_loop_constants, draw.bool_loop_constants_size);
+    id<MTLBuffer> vertex_data_buffer = make_buffer(draw.vertex_data, draw.vertex_data_size);
+    id<MTLBuffer> uploaded_index_buffer = nil;
+    id<MTLBuffer> index_buffer_object = nil;
+    NSUInteger index_buffer_offset = 0;
+    if (draw.index_buffer) {
+      if (draw.index_buffer->metal_buffer) {
+        index_buffer_object = (id<MTLBuffer>)draw.index_buffer->metal_buffer;
+      } else {
+        uploaded_index_buffer = make_buffer(draw.index_buffer->data, draw.index_buffer->size);
+        index_buffer_object = uploaded_index_buffer;
+      }
+      index_buffer_offset = NSUInteger(draw.index_buffer->offset);
+    }
+    id<MTLBuffer> shared_memory_buffer = nil;
+    bool owns_shared_memory_buffer = false;
+    if (draw.shared_memory_metal_buffer) {
+      shared_memory_buffer = (id<MTLBuffer>)draw.shared_memory_metal_buffer;
+    } else if (draw.shared_memory && draw.shared_memory_size) {
+      shared_memory_buffer = [device newBufferWithBytesNoCopy:draw.shared_memory
+                                                       length:draw.shared_memory_size
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+      owns_shared_memory_buffer = shared_memory_buffer != nil;
+    }
+    auto release_buffers = [&]() {
+      if (system_buffer) {
+        [system_buffer release];
+      }
+      if (vertex_float_buffer) {
+        [vertex_float_buffer release];
+      }
+      if (fragment_float_buffer) {
+        [fragment_float_buffer release];
+      }
+      if (fetch_buffer) {
+        [fetch_buffer release];
+      }
+      if (bool_loop_buffer) {
+        [bool_loop_buffer release];
+      }
+      if (vertex_data_buffer) {
+        [vertex_data_buffer release];
+      }
+      if (uploaded_index_buffer) {
+        [uploaded_index_buffer release];
+      }
+      if (owns_shared_memory_buffer) {
+        [shared_memory_buffer release];
+      }
+    };
+    bool missing_argument_buffer =
+        (draw.system_constants_size && !system_buffer) ||
+        (draw.vertex_float_constants_size && !vertex_float_buffer) ||
+        (draw.fragment_float_constants_size && !fragment_float_buffer) ||
+        (draw.fetch_constants_size && !fetch_buffer) ||
+        (draw.bool_loop_constants_size && !bool_loop_buffer) ||
+        (draw.vertex_data_size && !vertex_data_buffer) ||
+        (draw.index_buffer && !index_buffer_object) ||
+        ((draw.vertex_shared_memory_buffer_index != UINT32_MAX ||
+          draw.fragment_shared_memory_buffer_index != UINT32_MAX) &&
+         !shared_memory_buffer);
+    if (missing_argument_buffer) {
+      release_buffers();
+      return reject("failed to create one or more synchronous MRT argument buffers");
+    }
+
+    id<MTLTexture> dummy_texture = first_context->dummy_texture;
+    id<MTLSamplerState> dummy_sampler = first_context->dummy_sampler;
+    std::vector<id<MTLTexture>> vertex_texture_objects;
+    std::vector<id<MTLTexture>> fragment_texture_objects;
+    std::vector<id<MTLSamplerState>> vertex_sampler_objects;
+    std::vector<id<MTLSamplerState>> fragment_sampler_objects;
+    CreateProbeTextures(device, draw.vertex_textures, draw.vertex_texture_count, dummy_texture,
+                        vertex_texture_objects, false);
+    CreateProbeTextures(device, draw.fragment_textures, draw.fragment_texture_count, dummy_texture,
+                        fragment_texture_objects, false);
+    CreateCachedProbeSamplers(first_context, draw.vertex_samplers, draw.vertex_sampler_count,
+                              dummy_sampler, vertex_sampler_objects);
+    CreateCachedProbeSamplers(first_context, draw.fragment_samplers, draw.fragment_sampler_count,
+                              dummy_sampler, fragment_sampler_objects);
+    auto release_submission_resources = [&]() {
+      ReleaseOwnedProbeTextures(vertex_texture_objects, dummy_texture, draw.vertex_textures);
+      ReleaseOwnedProbeTextures(fragment_texture_objects, dummy_texture,
+                                draw.fragment_textures);
+      vertex_sampler_objects.clear();
+      fragment_sampler_objects.clear();
+      release_buffers();
+    };
+
+    id<MTLCommandBuffer> command_buffer = [first_context->command_queue commandBuffer];
+    if (!command_buffer) {
+      release_submission_resources();
+      return reject("failed to create synchronous MRT command buffer");
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    for (uint32_t slot = 0; slot < xenos::kMaxColorRenderTargets; ++slot) {
+      PipelineProbeContext* context = contexts[slot];
+      if (!context) {
+        continue;
+      }
+      ConfigureProbeColorPass(pass, context,
+                              context->initialized ? MTLLoadActionLoad : MTLLoadActionClear,
+                              MTLClearColorMake(0.0, 0.0, 0.0, 1.0), slot);
+    }
+    ConfigureProbeDepthStencilPass(
+        pass, shared_depth->texture,
+        shared_depth->initialized ? MTLLoadActionLoad : MTLLoadActionClear);
+    id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) {
+      release_submission_resources();
+      return reject("failed to create synchronous MRT render encoder");
+    }
+    [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)opaque_pipeline_state];
+    MTLViewport viewport;
+    MTLScissorRect scissor;
+    double blend_red = 0.0;
+    double blend_green = 0.0;
+    double blend_blue = 0.0;
+    double blend_alpha = 0.0;
+    if (draw.rasterization_state) {
+      viewport = {draw.rasterization_state->viewport_x,
+                  draw.rasterization_state->viewport_y,
+                  draw.rasterization_state->viewport_width,
+                  draw.rasterization_state->viewport_height,
+                  draw.rasterization_state->viewport_z_min,
+                  draw.rasterization_state->viewport_z_max};
+      scissor = {draw.rasterization_state->scissor_x,
+                 draw.rasterization_state->scissor_y,
+                 draw.rasterization_state->scissor_width,
+                 draw.rasterization_state->scissor_height};
+      blend_red = draw.rasterization_state->blend_red;
+      blend_green = draw.rasterization_state->blend_green;
+      blend_blue = draw.rasterization_state->blend_blue;
+      blend_alpha = draw.rasterization_state->blend_alpha;
+    } else {
+      viewport = {0.0, 0.0, double(width), double(height), 0.0, 1.0};
+      scissor = {0, 0, width, height};
+    }
+    [encoder setViewport:viewport];
+    [encoder setScissorRect:scissor];
+    [encoder setCullMode:ToMetalCullMode(draw.rasterization_state
+                                            ? draw.rasterization_state->cull_mode
+                                            : ProbeCullMode::kNone)];
+    [encoder setFrontFacingWinding:draw.rasterization_state &&
+                                           draw.rasterization_state->front_face_clockwise
+                                       ? MTLWindingClockwise
+                                       : MTLWindingCounterClockwise];
+    [encoder setDepthBias:draw.rasterization_state ? draw.rasterization_state->depth_bias : 0.0
+               slopeScale:draw.rasterization_state
+                              ? draw.rasterization_state->depth_bias_slope_scale
+                              : 0.0
+                    clamp:0.0];
+    [encoder setDepthClipMode:draw.rasterization_state &&
+                                       draw.rasterization_state->depth_clamp_enabled
+                                  ? MTLDepthClipModeClamp
+                                  : MTLDepthClipModeClip];
+    [encoder setDepthStencilState:metal_depth_stencil_state];
+    [encoder
+        setStencilFrontReferenceValue:draw.depth_stencil_state
+                                          ? draw.depth_stencil_state->front.reference
+                                          : 0
+                   backReferenceValue:draw.depth_stencil_state
+                                          ? draw.depth_stencil_state->back.reference
+                                          : 0];
+    [encoder setBlendColorRed:blend_red
+                        green:blend_green
+                         blue:blend_blue
+                        alpha:blend_alpha];
+    if (system_buffer) {
+      [encoder setVertexBuffer:system_buffer offset:0 atIndex:0];
+      [encoder setFragmentBuffer:system_buffer offset:0 atIndex:0];
+    }
+    if (fetch_buffer) {
+      if (draw.vertex_fetch_constants_buffer_index != UINT32_MAX) {
+        [encoder setVertexBuffer:fetch_buffer
+                          offset:0
+                         atIndex:draw.vertex_fetch_constants_buffer_index];
+      }
+      if (draw.fragment_fetch_constants_buffer_index != UINT32_MAX) {
+        [encoder setFragmentBuffer:fetch_buffer
+                            offset:0
+                           atIndex:draw.fragment_fetch_constants_buffer_index];
+      }
+    }
+    if (bool_loop_buffer) {
+      if (draw.vertex_bool_loop_constants_buffer_index != UINT32_MAX) {
+        [encoder setVertexBuffer:bool_loop_buffer
+                          offset:0
+                         atIndex:draw.vertex_bool_loop_constants_buffer_index];
+      }
+      if (draw.fragment_bool_loop_constants_buffer_index != UINT32_MAX) {
+        [encoder setFragmentBuffer:bool_loop_buffer
+                            offset:0
+                           atIndex:draw.fragment_bool_loop_constants_buffer_index];
+      }
+    }
+    if (vertex_float_buffer && draw.vertex_float_constants_buffer_index != UINT32_MAX) {
+      [encoder setVertexBuffer:vertex_float_buffer
+                        offset:0
+                       atIndex:draw.vertex_float_constants_buffer_index];
+    }
+    id<MTLBuffer> fragment_constants_to_bind =
+        fragment_float_buffer ? fragment_float_buffer : vertex_float_buffer;
+    if (fragment_constants_to_bind &&
+        draw.fragment_float_constants_buffer_index != UINT32_MAX) {
+      [encoder setFragmentBuffer:fragment_constants_to_bind
+                          offset:0
+                         atIndex:draw.fragment_float_constants_buffer_index];
+    }
+    if (shared_memory_buffer) {
+      if (draw.vertex_shared_memory_buffer_index != UINT32_MAX) {
+        [encoder setVertexBuffer:shared_memory_buffer
+                          offset:0
+                         atIndex:draw.vertex_shared_memory_buffer_index];
+      }
+      if (draw.fragment_shared_memory_buffer_index != UINT32_MAX) {
+        [encoder setFragmentBuffer:shared_memory_buffer
+                            offset:0
+                           atIndex:draw.fragment_shared_memory_buffer_index];
+      }
+    }
+    if (vertex_data_buffer && draw.vertex_data_buffer_index != UINT32_MAX) {
+      [encoder setVertexBuffer:vertex_data_buffer
+                        offset:0
+                       atIndex:draw.vertex_data_buffer_index];
+    }
+    BindProbeTextures(encoder, vertex_texture_objects, true);
+    BindProbeTextures(encoder, fragment_texture_objects, false);
+    BindProbeSamplers(encoder, vertex_sampler_objects, true);
+    BindProbeSamplers(encoder, fragment_sampler_objects, false);
+    if (index_buffer_object) {
+      [encoder drawIndexedPrimitives:ToMetalPrimitiveType(draw.primitive_type)
+                          indexCount:draw.vertex_count
+                           indexType:draw.index_buffer->index_size == 2 ? MTLIndexTypeUInt16
+                                                                       : MTLIndexTypeUInt32
+                         indexBuffer:index_buffer_object
+                   indexBufferOffset:index_buffer_offset];
+    } else {
+      [encoder drawPrimitives:ToMetalPrimitiveType(draw.primitive_type)
+                  vertexStart:0
+                  vertexCount:draw.vertex_count];
+    }
+    [encoder endEncoding];
+    if (telemetry_out) {
+      telemetry_out->bound_color_target_count = active_count;
+      telemetry_out->encoded_draw_count = 1;
+      telemetry_out->depth_attachment_bind_count = 1;
+      telemetry_out->vertex_shared_memory_binding_count =
+          shared_memory_buffer && draw.vertex_shared_memory_buffer_index != UINT32_MAX ? 1 : 0;
+      telemetry_out->fragment_shared_memory_binding_count =
+          shared_memory_buffer && draw.fragment_shared_memory_buffer_index != UINT32_MAX ? 1 : 0;
+    }
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+#if defined(REX_METAL_MRT_PROBE_TESTING)
+    bool test_report_non_completed =
+        draw.test_completion ==
+        PipelineProbeMrtTestCompletion::kReportNonCompletedAfterWait;
+    if (test_report_non_completed ||
+        [command_buffer status] != MTLCommandBufferStatusCompleted) {
+#else
+    if ([command_buffer status] != MTLCommandBufferStatusCompleted) {
+#endif
+      for (PipelineProbeContext* context : contexts) {
+        if (context) {
+          InvalidateProbeContextTargets(context);
+        }
+      }
+      NSError* command_error = [command_buffer error];
+      if (error_out) {
+#if defined(REX_METAL_MRT_PROBE_TESTING)
+        if (test_report_non_completed) {
+          *error_out =
+              "TEST-ONLY injected non-completed synchronous MRT command buffer";
+        } else {
+          *error_out = NSErrorDescription(
+              command_error, "synchronous MRT command buffer failed");
+        }
+#else
+        *error_out = NSErrorDescription(command_error, "synchronous MRT command buffer failed");
+#endif
+      }
+      release_submission_resources();
+      return false;
+    }
+
+    for (PipelineProbeContext* context : contexts) {
+      if (!context) {
+        continue;
+      }
+      context->initialized = true;
+      context->color_resolve_dirty = context->sample_count > 1;
+      RecordProbeContextNativeColorWrite(context);
+    }
+    shared_depth->initialized = true;
+    if (telemetry_out) {
+      telemetry_out->completed_command_buffer_count = 1;
+    }
+    release_submission_resources();
+    return true;
+  }
+}
+
+bool RenderPipelineProbeMrtTriangleToContexts(
+    const std::array<void*, xenos::kMaxColorRenderTargets>& contexts,
+    const ProbeRenderPipelineDescription& pipeline_description, void* pipeline_state,
+    uint32_t width, uint32_t height, const ProbeDepthStencilState* depth_stencil_state,
+    PipelineProbeMrtTelemetry* telemetry_out, std::string* error_out) {
+  PipelineProbeMrtDraw draw;
+  draw.vertex_count = 3;
+  draw.depth_stencil_state = depth_stencil_state;
+  return RenderPipelineProbeMrtToContexts(contexts, pipeline_description, pipeline_state, width,
+                                          height, draw, telemetry_out, error_out);
+}
+
+bool ReadPipelineProbeContextRectRaw(void* opaque_context, uint32_t width, uint32_t height,
+                                     uint32_t x, uint32_t y, uint32_t read_width,
+                                     uint32_t read_height, std::vector<uint8_t>& raw_out,
+                                     std::string* error_out) {
   @autoreleasepool {
     auto* context = static_cast<PipelineProbeContext*>(opaque_context);
     if (!context) {
@@ -3769,7 +4723,7 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
       }
       return false;
     }
-    bgra_out.resize(size_t(read_width) * read_height * 4);
+    raw_out.resize(size_t(read_width) * read_height * 4);
     if (context->storage_mode == MTLStorageModePrivate) {
       // The readback blit is submitted to the same queue as the render work.
       // Commit pending draws without a separate CPU wait; waiting for the blit
@@ -3828,10 +4782,10 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
       const uint8_t* source = static_cast<const uint8_t*>([readback_buffer contents]);
       size_t tight_row_pitch = size_t(read_width) * 4;
       if (row_pitch == tight_row_pitch) {
-        std::memcpy(bgra_out.data(), source, tight_row_pitch * read_height);
+        std::memcpy(raw_out.data(), source, tight_row_pitch * read_height);
       } else {
         for (uint32_t row = 0; row < read_height; ++row) {
-          std::memcpy(bgra_out.data() + size_t(row) * tight_row_pitch,
+          std::memcpy(raw_out.data() + size_t(row) * tight_row_pitch,
                       source + size_t(row) * row_pitch, tight_row_pitch);
         }
       }
@@ -3842,7 +4796,7 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
       return false;
     }
     MTLRegion region = MTLRegionMake2D(x, y, read_width, read_height);
-    [context->render_texture getBytes:bgra_out.data()
+    [context->render_texture getBytes:raw_out.data()
                           bytesPerRow:size_t(read_width) * 4
                            fromRegion:region
                           mipmapLevel:0];
@@ -3850,15 +4804,24 @@ bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t
   }
 }
 
-bool ReadPipelineProbeContextRectSampleSelected(void* opaque_context, uint32_t width,
-                                                uint32_t height, uint32_t x, uint32_t y,
-                                                uint32_t read_width, uint32_t read_height,
-                                                uint32_t color_sample_select,
-                                                std::vector<uint8_t>& bgra_out,
-                                                std::string* error_out) {
+bool ReadPipelineProbeContextRect(void* opaque_context, uint32_t width, uint32_t height, uint32_t x,
+                                  uint32_t y, uint32_t read_width, uint32_t read_height,
+                                  std::vector<uint8_t>& bgra_out, std::string* error_out) {
+  if (!ReadPipelineProbeContextRectRaw(opaque_context, width, height, x, y, read_width,
+                                       read_height, bgra_out, error_out)) {
+    return false;
+  }
+  return ConvertProbeRawColorToBgra(static_cast<PipelineProbeContext*>(opaque_context), bgra_out,
+                                    error_out);
+}
+
+bool ReadPipelineProbeContextRectSampleSelectedRaw(
+    void* opaque_context, uint32_t width, uint32_t height, uint32_t x, uint32_t y,
+    uint32_t read_width, uint32_t read_height, uint32_t color_sample_select,
+    std::vector<uint8_t>& raw_out, std::string* error_out) {
   @autoreleasepool {
     auto* context = static_cast<PipelineProbeContext*>(opaque_context);
-    bgra_out.clear();
+    raw_out.clear();
     if (!context) {
       if (error_out) {
         *error_out = "missing probe context";
@@ -3890,8 +4853,8 @@ bool ReadPipelineProbeContextRectSampleSelected(void* opaque_context, uint32_t w
     }
     uint32_t full_host_sample_mask = (uint32_t(1) << context->sample_count) - 1;
     if (host_sample_mask == full_host_sample_mask) {
-      return ReadPipelineProbeContextRect(opaque_context, width, height, x, y, read_width,
-                                          read_height, bgra_out, error_out);
+      return ReadPipelineProbeContextRectRaw(opaque_context, width, height, x, y, read_width,
+                                             read_height, raw_out, error_out);
     }
     if (!context->multisample_render_texture) {
       return reject_and_drain("persistent multisample probe texture is unavailable");
@@ -3927,7 +4890,14 @@ bool ReadPipelineProbeContextRectSampleSelected(void* opaque_context, uint32_t w
       return reject_and_drain("failed to create selected-sample read compute encoder");
     }
     MultisampleSelectResolveConstants constants = {
-        x, y, read_width, read_height, uint32_t(row_pitch), host_sample_mask};
+        x,
+        y,
+        read_width,
+        read_height,
+        uint32_t(row_pitch),
+        host_sample_mask,
+        uint32_t(GetColorTargetStorageStrategy(context->color_format).kind),
+    };
     id<MTLComputePipelineState> pipeline_state = context->multisample_select_resolve_pipeline_state;
     [encoder setComputePipelineState:pipeline_state];
     [encoder setTexture:context->multisample_render_texture atIndex:0];
@@ -3969,18 +4939,33 @@ bool ReadPipelineProbeContextRectSampleSelected(void* opaque_context, uint32_t w
     }
 
     size_t tight_row_pitch = size_t(read_width) * 4;
-    bgra_out.resize(tight_row_pitch * read_height);
+    raw_out.resize(tight_row_pitch * read_height);
     const uint8_t* source = static_cast<const uint8_t*>([readback_buffer contents]);
     if (row_pitch == tight_row_pitch) {
-      std::memcpy(bgra_out.data(), source, tight_row_pitch * read_height);
+      std::memcpy(raw_out.data(), source, tight_row_pitch * read_height);
     } else {
       for (uint32_t row = 0; row < read_height; ++row) {
-        std::memcpy(bgra_out.data() + size_t(row) * tight_row_pitch,
+        std::memcpy(raw_out.data() + size_t(row) * tight_row_pitch,
                     source + size_t(row) * row_pitch, tight_row_pitch);
       }
     }
     return true;
   }
+}
+
+bool ReadPipelineProbeContextRectSampleSelected(void* opaque_context, uint32_t width,
+                                                uint32_t height, uint32_t x, uint32_t y,
+                                                uint32_t read_width, uint32_t read_height,
+                                                uint32_t color_sample_select,
+                                                std::vector<uint8_t>& bgra_out,
+                                                std::string* error_out) {
+  if (!ReadPipelineProbeContextRectSampleSelectedRaw(
+          opaque_context, width, height, x, y, read_width, read_height, color_sample_select,
+          bgra_out, error_out)) {
+    return false;
+  }
+  return ConvertProbeRawColorToBgra(static_cast<PipelineProbeContext*>(opaque_context), bgra_out,
+                                    error_out);
 }
 
 bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t width, uint32_t height,
@@ -4013,6 +4998,12 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
       }
       return false;
     };
+
+    if (GetColorTargetStorageStrategy(context->color_format).kind !=
+        ColorTargetStorageKind::kBgra8Unorm) {
+      return reject_and_drain(
+          "direct Xenos tiled color resolve is not implemented for this Metal storage format");
+    }
 
     bool texture_valid = context->render_texture && context->initialized && width && height &&
                          context->width == width && context->height == height;
@@ -4129,7 +5120,8 @@ bool ResolvePipelineProbeContextToXenosTiled(void* opaque_context, uint32_t widt
         return reject_and_drain("failed to create multisample select resolve encoder");
       }
       MultisampleSelectResolveConstants sample_resolve_constants = {
-          source_x, source_y, resolve_width, resolve_height, uint32_t(row_pitch), host_sample_mask};
+          source_x, source_y, resolve_width, resolve_height, uint32_t(row_pitch), host_sample_mask,
+          uint32_t(ColorTargetStorageKind::kBgra8Unorm)};
       id<MTLComputePipelineState> sample_resolve_pipeline_state =
           context->multisample_select_resolve_pipeline_state;
       [sample_resolve_encoder setComputePipelineState:sample_resolve_pipeline_state];
@@ -4603,6 +5595,82 @@ bool ReadPipelineProbeContext(void* opaque_context, uint32_t width, uint32_t hei
                                       error_out);
 }
 
+namespace {
+
+bool SynchronizeProbeRawColorSidecarFromNative(PipelineProbeContext* context,
+                                               uint32_t width, uint32_t height,
+                                               std::string* error_out) {
+  if (!context || !context->initialized || !context->render_texture ||
+      !IsNativeColorTargetStorageSupported(context->color_format)) {
+    if (error_out) {
+      *error_out = "native color target cannot synchronize an exact raw sidecar";
+    }
+    return false;
+  }
+  if (!EnsureProbeRawColorSidecar(context, width, height, error_out)) {
+    return false;
+  }
+  const RawColorSidecarStorageLayout& storage_layout =
+      context->raw_color_sidecar.storage_layout();
+  std::vector<uint32_t> words(storage_layout.word_count);
+  for (uint32_t sample = 0; sample < storage_layout.sample_count; ++sample) {
+    std::vector<uint8_t> raw;
+    std::string read_error;
+    if (!ReadPipelineProbeContextRectSampleSelectedRaw(
+            context, width, height, 0, 0, width, height, sample, raw,
+            &read_error) ||
+        raw.size() != size_t(width) * height * 4) {
+      if (error_out) {
+        *error_out = "native color sample read failed while synchronizing raw sidecar";
+        if (!read_error.empty()) {
+          error_out->append(": ");
+          error_out->append(read_error);
+        }
+      }
+      return false;
+    }
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const uint8_t* pixel = raw.data() + (size_t(y) * width + x) * 4;
+        uint32_t guest_word = 0;
+        if (context->color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+          // MTLPixelFormatBGRA8Unorm memory is B,G,R,A; Xenos stores R,G,B,A.
+          guest_word = uint32_t(pixel[2]) | (uint32_t(pixel[1]) << 8) |
+                       (uint32_t(pixel[0]) << 16) | (uint32_t(pixel[3]) << 24);
+        } else if (context->color_format ==
+                   xenos::ColorRenderTargetFormat::k_2_10_10_10) {
+          std::memcpy(&guest_word, pixel, sizeof(guest_word));
+        } else {
+          if (error_out) {
+            *error_out = "native color format has no proven byte-exact raw mapping";
+          }
+          return false;
+        }
+        const size_t index =
+            GetRawColorSidecarWordIndex(storage_layout, x, y, sample, 0);
+        if (index == SIZE_MAX) {
+          if (error_out) {
+            *error_out = "raw color sidecar index is outside its validated layout";
+          }
+          return false;
+        }
+        words[index] = guest_word;
+      }
+    }
+  }
+  // The two native formats accepted above have direct byte mappings, so this
+  // complete readback establishes fresh raw authority without a float path.
+  if (!context->raw_color_sidecar.ReplaceRawWords(words)) {
+    if (error_out) {
+      *error_out = "native color readback did not match the validated raw-sidecar layout";
+    }
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
 bool ExportPipelineProbeColorToCanonicalEdram(
     void* opaque_context, uint32_t width, uint32_t height,
     const CanonicalEdramSurfaceLayout& layout, xenos::ColorRenderTargetFormat format,
@@ -4617,12 +5685,15 @@ bool ExportPipelineProbeColorToCanonicalEdram(
     }
     return false;
   }
-  // The current native target is BGRA8Unorm. Other guest formats need a
-  // format-capable target (or raw blend sidecar) before they can be exported
-  // without inventing precision that the private target never retained.
-  if (!IsCanonicalEdramColorFormatSupportedByMetal(format)) {
+  if (!CanRawColorSidecarStoreCanonicalLosslessly(format)) {
     if (error_out) {
-      *error_out = "Metal BGRA8 private targets cannot canonically export this Xenos color format";
+      *error_out = "Xenos color format has no lossless canonical raw sidecar";
+    }
+    return false;
+  }
+  if (context->color_format != format) {
+    if (error_out) {
+      *error_out = "canonical color export format does not match the private target";
     }
     return false;
   }
@@ -4633,43 +5704,29 @@ bool ExportPipelineProbeColorToCanonicalEdram(
     }
     return false;
   }
-  std::span<uint8_t> edram(static_cast<uint8_t*>(canonical_edram), canonical_edram_size);
-  for (uint32_t sample = 0; sample < sample_count; ++sample) {
-    std::vector<uint8_t> bgra;
-    std::string read_error;
-    if (!ReadPipelineProbeContextRectSampleSelected(opaque_context, width, height, 0, 0, width,
-                                                    height, sample, bgra, &read_error)) {
-      if (error_out) {
-        *error_out = "canonical color sample read failed";
-        if (!read_error.empty()) {
-          error_out->append(": ");
-          error_out->append(read_error);
-        }
-      }
+  if (context->width != width || context->height != height) {
+    if (error_out) {
+      *error_out = "canonical color export dimensions do not match the private target";
+    }
+    return false;
+  }
+  if (!EnsureProbeRawColorSidecar(context, width, height, error_out)) {
+    return false;
+  }
+  if (!context->raw_color_sidecar.can_export_canonical()) {
+    if (!SynchronizeProbeRawColorSidecarFromNative(context, width, height,
+                                                   error_out)) {
       return false;
     }
-    if (bgra.size() != size_t(width) * height * 4) {
-      if (error_out) {
-        *error_out = "canonical color sample read returned an invalid byte count";
-      }
-      return false;
+  }
+  if (!context->raw_color_sidecar.ExportCanonical(
+          std::span<uint8_t>(static_cast<uint8_t*>(canonical_edram),
+                             canonical_edram_size),
+          layout)) {
+    if (error_out) {
+      *error_out = "canonical color raw-sidecar export rejected the surface layout";
     }
-    for (uint32_t y = 0; y < height; ++y) {
-      for (uint32_t x = 0; x < width; ++x) {
-        const uint8_t* pixel = bgra.data() + (size_t(y) * width + x) * 4;
-        std::array<float, 4> rgba = {
-            float(pixel[2]) * (1.0f / 255.0f), float(pixel[1]) * (1.0f / 255.0f),
-            float(pixel[0]) * (1.0f / 255.0f), float(pixel[3]) * (1.0f / 255.0f)};
-        std::array<uint32_t, 2> words;
-        if (!PackCanonicalEdramColor(rgba, format, words) ||
-            !WriteCanonicalEdramSample(edram, layout, x, y, sample, words)) {
-          if (error_out) {
-            *error_out = "canonical color packing failed";
-          }
-          return false;
-        }
-      }
-    }
+    return false;
   }
   return true;
 }
@@ -4689,18 +5746,65 @@ bool RestorePipelineProbeColorFromCanonicalEdram(
       }
       return false;
     }
-    if (!IsCanonicalEdramColorFormatSupportedByMetal(format)) {
+    if (!CanRawColorSidecarStoreCanonicalLosslessly(format)) {
       if (error_out) {
-        *error_out =
-            "Metal BGRA8 private targets cannot canonically restore this Xenos color format";
+        *error_out = "Xenos color format has no lossless canonical raw sidecar";
       }
       return false;
     }
     const uint32_t sample_count = GetCanonicalEdramSampleCount(layout.msaa_samples);
-    if (context->sample_count != sample_count ||
-        !WaitPendingPipelineProbeCommands(context, error_out, nullptr) ||
-        !EnsureProbeContextTexture(context, width, height, error_out)) {
+    if (!SetPipelineProbeContextColorFormat(opaque_context, format, error_out) ||
+        context->sample_count != sample_count ||
+        !WaitPendingPipelineProbeCommands(context, error_out, nullptr)) {
       return false;
+    }
+    const bool has_exact_native_storage = IsNativeColorTargetStorageSupported(format);
+    const CanonicalEdramSurfaceLayoutClass layout_class =
+        ClassifyCanonicalEdramSurfaceLayout(layout, width, height);
+    if (layout_class == CanonicalEdramSurfaceLayoutClass::kInvalid) {
+      if (error_out) {
+        *error_out = "canonical color restore surface layout is invalid";
+      }
+      return false;
+    }
+    const bool aliases_physical_edram =
+        layout_class == CanonicalEdramSurfaceLayoutClass::kSelfAliasing;
+
+    // Build the exact owner transactionally. A bad wrap/layout must not erase
+    // the context's last complete raw image for the same format and sample
+    // count. A native target may hydrate a self-aliasing logical surface by
+    // reading the wrapping physical EDRAM image directly. It deliberately gets
+    // no raw sidecar: after a native write, exporting multiple logical samples
+    // that address the same physical word would be ambiguous and must remain
+    // fail-closed.
+    RawColorSidecar restored_sidecar;
+    bool has_restored_sidecar =
+        restored_sidecar.Configure(format, width, height, layout.msaa_samples) &&
+        restored_sidecar.RestoreCanonical(
+            std::span<const uint8_t>(static_cast<const uint8_t*>(canonical_edram),
+                                     canonical_edram_size),
+            layout);
+    if (!has_restored_sidecar && !(has_exact_native_storage && aliases_physical_edram)) {
+      if (error_out) {
+        *error_out = restored_sidecar.configured()
+                         ? "canonical color raw-sidecar restore rejected the surface layout"
+                         : "persistent color target raw sidecar extent is invalid or aliases "
+                           "itself";
+      }
+      return false;
+    }
+    if (has_exact_native_storage && !EnsureProbeContextTexture(context, width, height, error_out)) {
+      return false;
+    }
+    if (!has_exact_native_storage) {
+      // The exact words are now owned by the context, but exposing them as a
+      // raster texture would change Xenos output-merger semantics.
+      context->raw_color_sidecar = std::move(restored_sidecar);
+      context->width = width;
+      context->height = height;
+      context->initialized = false;
+      context->color_resolve_dirty = false;
+      return true;
     }
 
     static constexpr char kCanonicalColorRestoreMsl[] = R"MSL(
@@ -4736,13 +5840,13 @@ fragment CanonicalColorResult canonical_color_fragment(
     descriptor.vertexFunction = vertex;
     descriptor.fragmentFunction = fragment;
     descriptor.rasterSampleCount = sample_count;
-    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    descriptor.colorAttachments[0].pixelFormat = context->color_pixel_format;
     descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     id<MTLRenderPipelineState> pipeline =
-        vertex && fragment ? [context->device newRenderPipelineStateWithDescriptor:descriptor
-                                                                              error:&error]
-                           : nil;
+        vertex && fragment
+            ? [context->device newRenderPipelineStateWithDescriptor:descriptor error:&error]
+            : nil;
     [descriptor release];
     [vertex release];
     [fragment release];
@@ -4755,37 +5859,41 @@ fragment CanonicalColorResult canonical_color_fragment(
       return false;
     }
 
-    std::span<const uint8_t> edram(static_cast<const uint8_t*>(canonical_edram),
-                                   canonical_edram_size);
     std::vector<id<MTLTexture>> sample_textures;
     sample_textures.reserve(sample_count);
     bool textures_ok = true;
     for (uint32_t sample = 0; sample < sample_count; ++sample) {
-      std::vector<uint8_t> bgra(size_t(width) * height * 4);
+      std::vector<uint8_t> raw(size_t(width) * height * 4);
       for (uint32_t y = 0; y < height && textures_ok; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
           std::array<uint32_t, 2> words;
-          std::array<float, 4> rgba;
-          if (!ReadCanonicalEdramSample(edram, layout, x, y, sample, words) ||
-              !UnpackCanonicalEdramColor(words, format, rgba)) {
+          const bool read_sample =
+              has_restored_sidecar
+                  ? restored_sidecar.ReadRawSample(x, y, sample, words)
+                  : ReadCanonicalEdramSample(
+                        std::span<const uint8_t>(static_cast<const uint8_t*>(canonical_edram),
+                                                 canonical_edram_size),
+                        layout, x, y, sample, words);
+          if (!read_sample) {
             textures_ok = false;
             break;
           }
-          auto to_byte = [](float value) {
-            if (std::isnan(value)) {
-              value = 0.0f;
-            }
-            return uint8_t(std::clamp(std::floor(value * 255.0f + 0.5f), 0.0f, 255.0f));
-          };
-          uint8_t* pixel = bgra.data() + (size_t(y) * width + x) * 4;
-          pixel[0] = to_byte(rgba[2]);
-          pixel[1] = to_byte(rgba[1]);
-          pixel[2] = to_byte(rgba[0]);
-          pixel[3] = to_byte(rgba[3]);
+          uint8_t* pixel = raw.data() + (size_t(y) * width + x) * 4;
+          if (format == xenos::ColorRenderTargetFormat::k_2_10_10_10) {
+            std::memcpy(pixel, &words[0], sizeof(uint32_t));
+          } else if (format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+            pixel[0] = uint8_t(words[0] >> 16);
+            pixel[1] = uint8_t(words[0] >> 8);
+            pixel[2] = uint8_t(words[0]);
+            pixel[3] = uint8_t(words[0] >> 24);
+          } else {
+            textures_ok = false;
+            break;
+          }
         }
       }
       MTLTextureDescriptor* source_descriptor =
-          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:context->color_pixel_format
                                                              width:width
                                                             height:height
                                                          mipmapped:NO];
@@ -4796,7 +5904,7 @@ fragment CanonicalColorResult canonical_color_fragment(
       if (source) {
         [source replaceRegion:MTLRegionMake2D(0, 0, width, height)
                   mipmapLevel:0
-                    withBytes:bgra.data()
+                    withBytes:raw.data()
                   bytesPerRow:size_t(width) * 4];
         sample_textures.push_back(source);
       } else {
@@ -4822,8 +5930,7 @@ fragment CanonicalColorResult canonical_color_fragment(
         break;
       }
       MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-      ConfigureProbeColorPass(pass, context,
-                              sample ? MTLLoadActionLoad : MTLLoadActionClear,
+      ConfigureProbeColorPass(pass, context, sample ? MTLLoadActionLoad : MTLLoadActionClear,
                               MTLClearColorMake(0.0, 0.0, 0.0, 0.0));
       ConfigureProbeDepthStencilPass(
           pass, context->depth_stencil_target->texture,
@@ -4842,8 +5949,7 @@ fragment CanonicalColorResult canonical_color_fragment(
       }
       [encoder setRenderPipelineState:pipeline];
       [encoder setFragmentTexture:sample_textures[sample] atIndex:0];
-      [encoder setFragmentBytes:&host_sample_mask length:sizeof(host_sample_mask)
-                        atIndex:0];
+      [encoder setFragmentBytes:&host_sample_mask length:sizeof(host_sample_mask) atIndex:0];
       [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       [encoder endEncoding];
     }
@@ -4857,7 +5963,13 @@ fragment CanonicalColorResult canonical_color_fragment(
     }
     [pipeline release];
     if (!encoded) {
-      if (error_out && error_out->empty()) {
+      // If present, the local raw owner still contains the exact canonical
+      // source, but the partially executed native target and shared depth
+      // state are unknown.
+      context->initialized = false;
+      context->color_resolve_dirty = false;
+      context->depth_stencil_target->initialized = false;
+      if (error_out) {
         NSError* command_error = command_buffer ? [command_buffer error] : nil;
         *error_out = command_error ? [[command_error localizedDescription] UTF8String]
                                    : "canonical color restore command failed";
@@ -4866,6 +5978,20 @@ fragment CanonicalColorResult canonical_color_fragment(
     }
     context->initialized = true;
     context->color_resolve_dirty = sample_count > 1;
+    if (has_restored_sidecar) {
+      context->raw_color_sidecar = std::move(restored_sidecar);
+      if (!context->raw_color_sidecar.RecordNativeSynchronizedFromRaw()) {
+        context->initialized = false;
+        context->color_resolve_dirty = false;
+        if (error_out) {
+          *error_out =
+              "canonical color restore lost raw/native authority synchronization";
+        }
+        return false;
+      }
+    } else {
+      context->raw_color_sidecar.Reset();
+    }
     // The import render pass loads the existing shared depth target, or
     // deterministically initializes a previously absent one to 1/0.
     context->depth_stencil_target->initialized = true;
@@ -5079,7 +6205,7 @@ fragment RestoreResult canonical_depth_fragment(
     pipeline_descriptor.vertexFunction = vertex;
     pipeline_descriptor.fragmentFunction = fragment;
     pipeline_descriptor.rasterSampleCount = sample_count;
-    pipeline_descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pipeline_descriptor.colorAttachments[0].pixelFormat = context->color_pixel_format;
     pipeline_descriptor.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
     pipeline_descriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     pipeline_descriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
@@ -5181,6 +6307,7 @@ fragment RestoreResult canonical_depth_fragment(
     }
     context->initialized = true;
     context->color_resolve_dirty = sample_count > 1;
+    RecordProbeContextNativeColorWrite(context);
     context->depth_stencil_target->initialized = true;
     return true;
   }

@@ -4,6 +4,8 @@ add_executable(unit_tests
     memory/heap_allocation_test.cpp
     memory/physical_host_offset_test.cpp
     graphics/command_ring_state_test.cpp
+    graphics/resolve_route_test.cpp
+    graphics/trace_capture_test.cpp
     graphics/trace_reader_test.cpp
     graphics/metal_profile_test.cpp
     kernel/critical_section_ledger_test.cpp
@@ -44,11 +46,15 @@ endif()
 if(REXGLUE_USE_METAL)
     target_sources(unit_tests PRIVATE
         ${PROJECT_SOURCE_DIR}/src/graphics/metal/edram_snapshot.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/metal/raw_color_sidecar.cpp
         graphics/metal_completion_packet_test.cpp
         graphics/metal_edram_snapshot_test.cpp
+        graphics/metal_exact_output_merger_state_test.cpp
+        graphics/metal_raw_color_sidecar_test.cpp
         graphics/metal_depth_float24_test.mm
         graphics/metal_exact_resolved_surface_test.cpp
         graphics/metal_goldeneye_postprocess_alias_test.cpp
+        graphics/metal_mrt_route_test.cpp
         graphics/metal_shared_memory_test.mm
         graphics/metal_sampler_util_test.cpp
         graphics/metal_texture_cache_depth_test.mm

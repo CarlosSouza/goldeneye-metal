@@ -1,5 +1,7 @@
 #include <rex/graphics/metal/edram_snapshot.h>
 
+#include <rex/graphics/metal/color_target_storage.h>
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -63,11 +65,7 @@ int16_t Float32ToFixed16(float value) {
 }  // namespace
 
 bool IsCanonicalEdramColorFormatSupportedByMetal(xenos::ColorRenderTargetFormat format) {
-  format = xenos::GetStorageColorFormat(format);
-  // Gamma storage is not exact through an 8-bit linear BGRA target: decoding
-  // and re-encoding can collapse dark raw codes. It remains available to the
-  // CPU conversion helpers, but cannot be advertised for canonical replay.
-  return format == xenos::ColorRenderTargetFormat::k_8_8_8_8;
+  return IsNativeColorTargetStorageSupported(format);
 }
 
 bool IsCanonicalEdramDepthFormatSupportedByMetal(xenos::DepthRenderTargetFormat format) {
@@ -76,17 +74,58 @@ bool IsCanonicalEdramDepthFormatSupportedByMetal(xenos::DepthRenderTargetFormat 
 }
 
 bool IsCanonicalEdramMsaaSupportedByMetal(xenos::MsaaSamples msaa_samples) {
-  return msaa_samples == xenos::MsaaSamples::k1X ||
-         msaa_samples == xenos::MsaaSamples::k2X ||
+  return msaa_samples == xenos::MsaaSamples::k1X || msaa_samples == xenos::MsaaSamples::k2X ||
          msaa_samples == xenos::MsaaSamples::k4X;
+}
+
+CanonicalEdramSurfaceLayoutClass ClassifyCanonicalEdramSurfaceLayout(
+    const CanonicalEdramSurfaceLayout& layout, uint32_t width, uint32_t height) {
+  if (!width || !height || !layout.pitch_tiles || layout.base_tiles >= xenos::kEdramTileCount ||
+      layout.pitch_tiles >= (uint32_t(1) << xenos::kEdramPitchTilesBits) ||
+      (layout.is_depth && layout.is_64bpp) ||
+      width >= (uint32_t(1) << xenos::kEdramPitchPixelsBits) ||
+      !IsCanonicalEdramMsaaSupportedByMetal(layout.msaa_samples)) {
+    return CanonicalEdramSurfaceLayoutClass::kInvalid;
+  }
+
+  const uint32_t sample_x_log2 = uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k4X);
+  const uint32_t sample_y_log2 = uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k2X);
+  const uint64_t word_width = (uint64_t(width) << sample_x_log2) * (layout.is_64bpp ? 2u : 1u);
+  const uint64_t sample_height = uint64_t(height) << sample_y_log2;
+  const uint64_t tile_columns =
+      (word_width + xenos::kEdramTileWidthSamples - 1) / xenos::kEdramTileWidthSamples;
+  const uint64_t tile_rows =
+      (sample_height + xenos::kEdramTileHeightSamples - 1) / xenos::kEdramTileHeightSamples;
+  if (!tile_columns || !tile_rows || tile_columns > layout.pitch_tiles) {
+    return CanonicalEdramSurfaceLayoutClass::kInvalid;
+  }
+  const uint64_t logical_tile_count = tile_rows * tile_columns;
+  if (logical_tile_count > xenos::kEdramTileCount) {
+    return CanonicalEdramSurfaceLayoutClass::kSelfAliasing;
+  }
+  std::array<bool, xenos::kEdramTileCount> visited_tiles = {};
+  for (uint64_t tile_y = 0; tile_y < tile_rows; ++tile_y) {
+    for (uint64_t tile_x = 0; tile_x < tile_columns; ++tile_x) {
+      const uint32_t physical_tile =
+          uint32_t(uint64_t(layout.base_tiles) + tile_y * layout.pitch_tiles + tile_x) &
+          (xenos::kEdramTileCount - 1);
+      if (visited_tiles[physical_tile]) {
+        return CanonicalEdramSurfaceLayoutClass::kSelfAliasing;
+      }
+      visited_tiles[physical_tile] = true;
+    }
+  }
+  return CanonicalEdramSurfaceLayoutClass::kNonAliasing;
+}
+
+bool ShouldContainCanonicalEdramNativeAlias(bool target_hydration_enabled, bool exact_gpu_current) {
+  return target_hydration_enabled || exact_gpu_current;
 }
 
 size_t GetCanonicalEdramDwordIndex(const CanonicalEdramSurfaceLayout& layout, uint32_t x,
                                    uint32_t y, uint32_t sample, uint32_t dword) {
-  const uint32_t sample_x_log2 =
-      uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k4X);
-  const uint32_t sample_y_log2 =
-      uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k2X);
+  const uint32_t sample_x_log2 = uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k4X);
+  const uint32_t sample_y_log2 = uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k2X);
   const uint32_t sample_count = GetCanonicalEdramSampleCount(layout.msaa_samples);
   const uint32_t words_per_sample = layout.is_64bpp ? 2 : 1;
   if (!layout.pitch_tiles || sample >= sample_count || dword >= words_per_sample ||
@@ -94,10 +133,13 @@ size_t GetCanonicalEdramDwordIndex(const CanonicalEdramSurfaceLayout& layout, ui
     return SIZE_MAX;
   }
 
-  const uint32_t sample_x =
-      (x << sample_x_log2) +
-      (sample_x_log2 ? (sample & ((uint32_t(1) << sample_x_log2) - 1)) : 0);
-  const uint32_t sample_y = (y << sample_y_log2) + (sample >> sample_x_log2);
+  // Xenos stores 4x samples in TL, BL, TR, BR order. This differs from the
+  // row-major TL, TR, BL, BR ordering used by the host coverage mask before
+  // the shader translator remaps it.
+  const uint32_t sample_x = (x << sample_x_log2) + (sample_x_log2 ? (sample >> sample_y_log2) : 0);
+  const uint32_t sample_y =
+      (y << sample_y_log2) +
+      (sample_y_log2 ? (sample & ((uint32_t(1) << sample_y_log2) - 1)) : 0);
   const uint32_t word_x = sample_x * words_per_sample + std::min(dword, words_per_sample - 1);
   const uint32_t tile_x = word_x / xenos::kEdramTileWidthSamples;
   const uint32_t tile_y = sample_y / xenos::kEdramTileHeightSamples;
@@ -301,6 +343,11 @@ void CanonicalEdramAuthorityState::RecordRestore() {
   target_hydration_enabled_ = true;
 }
 
+void CanonicalEdramAuthorityState::RecordExactDraw() {
+  has_snapshot_ = true;
+  target_hydration_enabled_ = true;
+}
+
 uint64_t CanonicalEdramTileOwnership::MarkSurface(const CanonicalEdramSurfaceLayout& layout,
                                                   uint32_t width, uint32_t height,
                                                   CanonicalEdramOwnerKind kind,
@@ -310,30 +357,55 @@ uint64_t CanonicalEdramTileOwnership::MarkSurface(const CanonicalEdramSurfaceLay
     return sequence_;
   }
   ++sequence_;
-  const uint32_t sample_width =
-      width << uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k4X);
-  const uint32_t sample_height =
-      height << uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k2X);
+  const uint32_t sample_width = width << uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k4X);
+  const uint32_t sample_height = height << uint32_t(layout.msaa_samples >= xenos::MsaaSamples::k2X);
   const uint32_t word_width = sample_width * (layout.is_64bpp ? 2 : 1);
   const uint32_t tile_columns =
       (word_width + xenos::kEdramTileWidthSamples - 1) / xenos::kEdramTileWidthSamples;
   const uint32_t tile_rows =
       (sample_height + xenos::kEdramTileHeightSamples - 1) / xenos::kEdramTileHeightSamples;
   const CanonicalEdramTileOwner new_owner = {kind, target_key, sequence_};
-  for (uint32_t tile_y = 0; tile_y < tile_rows; ++tile_y) {
-    for (uint32_t tile_x = 0; tile_x < tile_columns; ++tile_x) {
-      const uint32_t tile =
-          (layout.base_tiles + tile_y * layout.pitch_tiles + tile_x) &
-          (xenos::kEdramTileCount - 1);
-      owners_[tile] = new_owner;
+
+  // Every tile in a row has the same owner, so update the physical array in
+  // contiguous spans instead of performing a wrapping modulo and a
+  // three-field assignment for every logical tile. When the logical rows are
+  // tightly packed, they are one continuous wrapping span as well. This is
+  // particularly important for full-frame multisampled targets, which may
+  // visit the 2048 physical tiles more than once per draw.
+  auto fill_wrapping_span = [&](uint64_t first_tile, uint64_t tile_count) {
+    if (!tile_count) {
+      return;
     }
+    if (tile_count >= xenos::kEdramTileCount) {
+      owners_.fill(new_owner);
+      return;
+    }
+    const uint32_t physical_first = uint32_t(first_tile) & (xenos::kEdramTileCount - 1);
+    const size_t first_count =
+        std::min<size_t>(size_t(tile_count), xenos::kEdramTileCount - physical_first);
+    std::fill_n(owners_.begin() + physical_first, first_count, new_owner);
+    const size_t wrapped_count = size_t(tile_count) - first_count;
+    if (wrapped_count) {
+      std::fill_n(owners_.begin(), wrapped_count, new_owner);
+    }
+  };
+
+  if (tile_columns == layout.pitch_tiles) {
+    fill_wrapping_span(layout.base_tiles, uint64_t(tile_rows) * tile_columns);
+    return sequence_;
+  }
+  for (uint32_t tile_y = 0; tile_y < tile_rows; ++tile_y) {
+    fill_wrapping_span(uint64_t(layout.base_tiles) + uint64_t(tile_y) * layout.pitch_tiles,
+                       tile_columns);
   }
   return sequence_;
 }
 
-bool CanonicalEdramTileOwnership::SurfaceNeedsHydration(
-    const CanonicalEdramSurfaceLayout& layout, uint32_t width, uint32_t height,
-    CanonicalEdramOwnerKind kind, uint64_t target_key, uint64_t hydrated_sequence) const {
+bool CanonicalEdramTileOwnership::SurfaceNeedsHydration(const CanonicalEdramSurfaceLayout& layout,
+                                                        uint32_t width, uint32_t height,
+                                                        CanonicalEdramOwnerKind kind,
+                                                        uint64_t target_key,
+                                                        uint64_t hydrated_sequence) const {
   if (!layout.pitch_tiles || !width || !height || !target_key) {
     return true;
   }

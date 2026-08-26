@@ -22,6 +22,7 @@
 #include <thread>
 
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/trace_capture.h>
 #include <rex/kernel.h>
 #include <rex/memory.h>
 #include <rex/system/interfaces/graphics.h>
@@ -84,6 +85,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
                                bool blocking);
 
   void RequestFrameTrace();
+  uint64_t RequestPrivateFrameTrace(
+      const std::filesystem::path& safe_root,
+      uint64_t byte_budget = FrameTraceCaptureSlot::kDefaultByteBudget);
+  uint64_t ReportPrivateFrameTraceFailure(std::string reason);
+  FrameTraceCaptureStatus GetPrivateFrameTraceStatus() const;
+  bool DeletePrivateFrameTrace(const std::filesystem::path& safe_root,
+                               std::string* reason_out = nullptr);
   void BeginTracing();
   void EndTracing();
 

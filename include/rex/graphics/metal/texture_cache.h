@@ -33,6 +33,7 @@ class MetalTextureCache final : public TextureCache {
   void* GetActiveTexture(uint32_t fetch_constant_index, bool is_signed = false);
   uint32_t GetActiveTextureWidth(uint32_t fetch_constant_index) const;
   uint32_t GetActiveTextureHeight(uint32_t fetch_constant_index) const;
+  uint32_t GetActiveTextureArrayLength(uint32_t fetch_constant_index, bool is_signed = false) const;
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;

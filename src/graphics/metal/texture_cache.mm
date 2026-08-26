@@ -199,6 +199,19 @@ uint32_t MetalTextureCache::GetActiveTextureHeight(uint32_t fetch_constant_index
   return binding ? binding->key.GetHeight() : 0;
 }
 
+uint32_t MetalTextureCache::GetActiveTextureArrayLength(uint32_t fetch_constant_index,
+                                                        bool is_signed) const {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return 0;
+  }
+  Texture* texture =
+      is_signed && binding->texture_signed ? binding->texture_signed : binding->texture;
+  id<MTLTexture> metal_texture =
+      texture ? (id<MTLTexture>)static_cast<MetalTexture*>(texture)->texture() : nil;
+  return metal_texture ? uint32_t(metal_texture.arrayLength) : 0;
+}
+
 bool MetalTextureCache::IsSignedVersionSeparateForFormat(TextureKey key) const {
   switch (key.format) {
     case xenos::TextureFormat::k_8:
