@@ -219,13 +219,14 @@ void ImportProgressTrampoline(void* ctx, const char* message, unsigned long long
   }
   last_message = message ? message : "";
   last_reported = completed;
-  NSString* status;
+  // %s in NSString formats is not UTF-8 aware and mangles the engine's "…"
+  // suffixes; decode explicitly.
+  NSString* text = [NSString stringWithUTF8String:last_message.c_str()] ?: @"";
+  NSString* status = text;
   if (total > 0) {
-    status = [NSString stringWithFormat:@"%s\n%.0f / %.0f MB", last_message.c_str(),
+    status = [NSString stringWithFormat:@"%@\n%.0f / %.0f MB", text,
                                         double(completed) / (1024.0 * 1024.0),
                                         double(total) / (1024.0 * 1024.0)];
-  } else {
-    status = [NSString stringWithUTF8String:last_message.c_str()];
   }
   RexIOSAppDelegate* delegate = (RexIOSAppDelegate*)ctx;
   dispatch_async(dispatch_get_main_queue(), ^{
