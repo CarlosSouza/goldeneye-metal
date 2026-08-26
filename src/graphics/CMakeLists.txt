@@ -203,7 +203,9 @@ if(REXGLUE_USE_METAL)
     )
     if(SPIRV_CROSS_INCLUDE_DIR AND SPIRV_CROSS_MSL_LIBRARY AND
        SPIRV_CROSS_GLSL_LIBRARY AND SPIRV_CROSS_CORE_LIBRARY)
-        target_include_directories(rexgraphics PRIVATE ${SPIRV_CROSS_INCLUDE_DIR})
+        # SYSTEM (-isystem) so a Homebrew fmt/spdlog in the same prefix can
+        # never shadow the vendored thirdparty headers this build links.
+        target_include_directories(rexgraphics SYSTEM PRIVATE ${SPIRV_CROSS_INCLUDE_DIR})
         target_link_libraries(rexgraphics PRIVATE
             ${SPIRV_CROSS_MSL_LIBRARY}
             ${SPIRV_CROSS_GLSL_LIBRARY}

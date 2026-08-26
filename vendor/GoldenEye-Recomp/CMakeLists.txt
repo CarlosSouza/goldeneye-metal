@@ -39,6 +39,7 @@ include(generated/rexglue.cmake)
 set(GE_SOURCES
     src/main.cpp
     src/ge_game_data.cpp
+    src/ge_gpu_capture.cpp
     src/ge_host_pause.cpp
     src/ge_hooks.cpp
     src/ge_menu.cpp
@@ -51,7 +52,6 @@ set(GE_SOURCES
 
 if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(APPEND GE_SOURCES
-        src/ge_gpu_capture.cpp
         src/ge_launch_recovery.cpp
         src/ge_launcher_macos.mm
     )
